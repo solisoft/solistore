@@ -40,6 +40,12 @@ impl Kind {
     }
 }
 
+/// The 8 bytes that end an internal key.
+pub fn trailer_bytes(seq: u64, kind: Kind) -> [u8; TRAILER_LEN] {
+    debug_assert!(seq <= MAX_SEQ);
+    ((seq << 8) | kind as u64).to_le_bytes()
+}
+
 pub fn encode_into(buf: &mut Vec<u8>, cf: u32, user_key: &[u8], seq: u64, kind: Kind) {
     debug_assert!(seq <= MAX_SEQ);
     buf.reserve(MIN_LEN + user_key.len());

@@ -44,10 +44,10 @@ use crate::error::{Error, Result};
 use crate::flush;
 use crate::fs::{Fs, StdFs, WritableFile};
 use crate::iter::{DbIterator, IteratorMode, ReadOptions};
-use crate::key::{Kind, MAX_SEQ};
-use crate::log::{encode_record_parts, read_records};
+use crate::key::{self, Kind, MAX_SEQ};
+use crate::log::{self, encode_record_parts, read_records};
 use crate::manifest::{self, file_no_u32, Edit, ManifestState, ManifestWriter, DEFAULT_CF};
-use crate::memtable::Memtable;
+use crate::memtable::{self, Memtable};
 use crate::sst::BlockCache;
 use crate::version::{by_smallest, table_name, SuperVersion, TableFile, Version, NUM_LEVELS};
 
@@ -102,6 +102,9 @@ pub struct Options {
     pub max_background_jobs: usize,
     /// Bytes of decoded data blocks kept in memory, shared by every table.
     pub block_cache_size: u64,
+    /// Dead WAL files kept to be written over instead of creating new ones
+    /// (RocksDB's `recycle_log_file_num`; SoliDB's profile sets 3).
+    pub recycle_wal_files: usize,
 }
 
 impl Default for Options {
@@ -125,6 +128,7 @@ impl Default for Options {
             max_background_compactions: 3,
             max_background_jobs: 6,
             block_cache_size: 512 << 20,
+            recycle_wal_files: 3,
         }
     }
 }
@@ -151,6 +155,7 @@ impl fmt::Debug for Options {
             )
             .field("max_background_jobs", &self.max_background_jobs)
             .field("block_cache_size", &self.block_cache_size)
+            .field("recycle_wal_files", &self.recycle_wal_files)
             .finish()
     }
 }
@@ -331,6 +336,9 @@ struct Inner {
     /// Wakes writers waiting for `visible_seq` to reach their group.
     publish: Mutex<()>,
     publish_cv: Condvar,
+    /// Numbers of dead WAL files kept for reuse, and how many to keep.
+    recycled_wals: Mutex<Vec<u64>>,
+    recycle_wal_files: usize,
     /// The WAL being written, for the eventual-mode syncer.
     current_wal: Mutex<Arc<WalFile>>,
     /// A write, fsync or flush failed; see [`Error::Poisoned`].
@@ -480,8 +488,13 @@ impl Db {
             .filter_map(|name| parse_wal_name(name))
             .collect();
         wals.sort_unstable();
+        let mut recycled = Vec::new();
         for no in wals.iter().filter(|no| **no < state.log_number) {
-            fs.remove(&dir.join(wal_name(*no))).ok();
+            if recycled.len() < opts.recycle_wal_files {
+                recycled.push(*no);
+            } else {
+                fs.remove(&dir.join(wal_name(*no))).ok();
+            }
         }
         wals.retain(|no| *no >= state.log_number);
         if let Some(last) = wals.last() {
@@ -603,6 +616,8 @@ impl Db {
             last_group: AtomicUsize::new(1),
             publish: Mutex::new(()),
             publish_cv: Condvar::new(),
+            recycled_wals: Mutex::new(recycled),
+            recycle_wal_files: opts.recycle_wal_files,
             current_wal: Mutex::new(wal),
             poisoned: AtomicBool::new(false),
             bg: Mutex::new(Background::default()),
@@ -1044,10 +1059,17 @@ impl Drop for Handle {
         for thread in self.threads.lock().drain(..) {
             thread.join().ok();
         }
-        // A clean close leaves nothing for the next open to lose.
+        // A clean close leaves nothing for the next open to lose, and ends
+        // the WAL with an end record.
         let wal = self.inner.current_wal.lock().clone();
-        if !self.inner.poisoned.load(Ordering::Acquire) && wal.dirty.load(Ordering::Acquire) {
-            wal.file.sync().ok();
+        if !self.inner.poisoned.load(Ordering::Acquire) {
+            let mut end = Vec::new();
+            if let Ok(no) = file_no_u32(wal.number) {
+                log::encode_end(&mut end, no);
+                if wal.file.append(&end).is_ok() {
+                    wal.file.sync().ok();
+                }
+            }
         }
     }
 }
@@ -1100,22 +1122,48 @@ fn tidy(change: &mut VersionChange) {
     change.sv.version = Arc::new(version);
 }
 
+/// One put or delete of a batch: sequence, column family, key, kind, value.
+type Entry<'a> = (u64, u32, &'a [u8], Kind, &'a [u8]);
+
 /// Apply decoded ops to a memtable, numbering them from `first_seq`.
 fn apply(mem: &Memtable, ops: Vec<BatchOp<'_>>, first_seq: u64, live: impl Fn(u32) -> bool) {
+    // One arena copy for the whole batch: encoded keys and values, back to back.
+    let entries: Vec<Entry<'_>> = (first_seq..)
+        .zip(&ops)
+        .filter_map(|(seq, op)| match *op {
+            BatchOp::Put { cf, key, value } if live(cf) => Some((seq, cf, key, Kind::Put, value)),
+            BatchOp::Delete { cf, key } if live(cf) => Some((seq, cf, key, Kind::Delete, &b""[..])),
+            _ => None,
+        })
+        .collect();
+    let total: usize = entries
+        .iter()
+        .map(|e| key::MIN_LEN + e.2.len() + e.4.len())
+        .sum();
+    let buf = memtable::arena_copy(total, |out| {
+        for &(seq, cf, k, kind, v) in &entries {
+            out.extend_from_slice(&cf.to_be_bytes());
+            out.extend_from_slice(k);
+            out.extend_from_slice(&key::trailer_bytes(seq, kind));
+            out.extend_from_slice(v);
+        }
+    });
     let mut bytes = 0;
+    let mut at = 0;
+    for &(_, _, k, _, v) in &entries {
+        let key_end = at + key::MIN_LEN + k.len();
+        bytes += mem.insert_shared(
+            buf.slice(at..key_end),
+            buf.slice(key_end..key_end + v.len()),
+        );
+        at = key_end + v.len();
+    }
     let mut last = 0;
     for (seq, op) in (first_seq..).zip(ops) {
-        match op {
-            BatchOp::Put { cf, key, value } if live(cf) => {
-                bytes += mem.insert_entry(cf, key, seq, Kind::Put, value)
+        if let BatchOp::DeleteRange { cf, start, end } = op {
+            if live(cf) {
+                mem.insert_range_tombstone(cf, start, end, seq);
             }
-            BatchOp::Delete { cf, key } if live(cf) => {
-                bytes += mem.insert_entry(cf, key, seq, Kind::Delete, b"")
-            }
-            BatchOp::DeleteRange { cf, start, end } if live(cf) => {
-                mem.insert_range_tombstone(cf, start, end, seq)
-            }
-            _ => {} // a column family dropped before the crash
         }
         last = seq;
     }
@@ -1399,11 +1447,29 @@ impl Inner {
         // Everything in the old WAL must be durable before anything lands in
         // the new one: a crash may not keep a later write and lose an
         // earlier one.
+        // The old WAL is closed with an end record, so its reused file's old
+        // bytes are not mistaken for a torn write when it is replayed.
+        let mut end = Vec::new();
+        log::encode_end(&mut end, file_no_u32(commit.wal.number)?);
+        self.io(|| Ok(commit.wal.file.append(&end)?))?;
+        commit.wal.dirty.store(true, Ordering::Release);
         if commit.wal.dirty.swap(false, Ordering::AcqRel) {
             self.io(|| Ok(commit.wal.file.sync()?))?;
         }
         let number = self.allocate_file();
-        let file = self.io(|| Ok(self.fs.create(&self.dir.join(wal_name(number)))?))?;
+        let new_path = self.dir.join(wal_name(number));
+        // The recycled list stays locked until the file is renamed: a flush
+        // lists the directory under the same lock, and seeing the old name
+        // after it left the list would put it back.
+        let file = {
+            let mut recycled = self.recycled_wals.lock();
+            match recycled.pop() {
+                Some(old) => {
+                    self.io(|| Ok(self.fs.reuse(&self.dir.join(wal_name(old)), &new_path)?))?
+                }
+                None => self.io(|| Ok(self.fs.create(&new_path)?))?,
+            }
+        };
         self.io(|| Ok(self.fs.sync_dir(&self.dir)?))?;
         let wal = Arc::new(WalFile {
             file,
@@ -1571,8 +1637,17 @@ impl Inner {
             // The LogNumber edit is durable: the old WALs can go, before the
             // new version is visible to anyone waiting for this flush.
             || {
+                let mut recycled = self.recycled_wals.lock();
                 for name in self.fs.list(&self.dir).unwrap_or_default() {
-                    if parse_wal_name(&name).is_some_and(|no| no < next_wal) {
+                    let Some(no) = parse_wal_name(&name).filter(|no| *no < next_wal) else {
+                        continue;
+                    };
+                    if recycled.contains(&no) {
+                        continue;
+                    }
+                    if recycled.len() < self.recycle_wal_files {
+                        recycled.push(no);
+                    } else {
                         self.fs.remove(&self.dir.join(&name)).ok();
                     }
                 }

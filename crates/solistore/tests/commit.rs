@@ -224,7 +224,7 @@ fn reopening_replays_the_log_quickly() {
 }
 
 #[test]
-fn flushed_data_survives_reopen_and_old_wals_are_deleted() {
+fn flushed_data_survives_reopen_and_dead_wals_are_not_replayed() {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
         write_buffer_size: 64 << 10,
@@ -250,7 +250,12 @@ fn flushed_data_survives_reopen_and_old_wals_are_deleted() {
             db.delete(&cf, i.to_be_bytes()).unwrap();
         }
         db.flush().unwrap();
-        assert!(db.files_per_level()[0] > 2, "{:?}", db.files_per_level());
+        // Several tables, wherever compaction has put them by now.
+        assert!(
+            db.files_per_level().iter().sum::<usize>() > 2,
+            "{:?}",
+            db.files_per_level()
+        );
         assert_eq!(db.memtable_bytes(), 0);
         let wals = std::fs::read_dir(dir.path())
             .unwrap()
@@ -262,7 +267,12 @@ fn flushed_data_survives_reopen_and_old_wals_are_deleted() {
                     .ends_with(".wal")
             })
             .count();
-        assert_eq!(wals, 1, "only the live WAL remains after a full flush");
+        // The live WAL, plus at most three dead ones kept to be written
+        // over (recycle_wal_files); none of them is replayed (checked below).
+        assert!(
+            (1..=4).contains(&wals),
+            "{wals} WAL files after a full flush"
+        );
     }
     let db = Db::open(dir.path(), opts).unwrap();
     assert_eq!(db.recovery_report().batches, 0, "nothing left to replay");

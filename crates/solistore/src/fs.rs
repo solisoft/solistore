@@ -51,6 +51,12 @@ pub trait Fs: Send + Sync + fmt::Debug {
     fn list(&self, dir: &Path) -> io::Result<Vec<String>>;
     fn exists(&self, path: &Path) -> bool;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Rename `from` to `to` and open it to be written again from its first
+    /// byte. What is not overwritten keeps its old bytes. Overwriting blocks
+    /// a file already owns changes neither its size nor its extents, so an
+    /// fdatasync of it flushes data and no file system metadata (RocksDB's
+    /// `recycle_log_file_num`).
+    fn reuse(&self, from: &Path, to: &Path) -> io::Result<Arc<dyn WritableFile>>;
     /// Make `to` name the same file as `from` (a hard link), or a copy of
     /// it where the file system cannot link (another device). The bytes of
     /// `to` are durable when this returns; its name is not until `sync_dir`.
@@ -170,6 +176,12 @@ impl Fs for StdFs {
         std::fs::rename(from, to)
     }
 
+    fn reuse(&self, from: &Path, to: &Path) -> io::Result<Arc<dyn WritableFile>> {
+        std::fs::rename(from, to)?;
+        let file = OpenOptions::new().write(true).open(to)?;
+        Ok(Arc::new(StdFile(file)))
+    }
+
     fn link(&self, from: &Path, to: &Path) -> io::Result<()> {
         if std::fs::hard_link(from, to).is_ok() {
             return Ok(());
@@ -275,6 +287,9 @@ struct FaultFile {
     node: NodeRef,
     state: Arc<Mutex<State>>,
     generation: u64,
+    /// Where the next append writes: past the end for a new file, over old
+    /// bytes for a reused one.
+    pos: Mutex<usize>,
 }
 
 fn crashed() -> io::Error {
@@ -290,7 +305,14 @@ impl WritableFile for FaultFile {
             }
             tick_countdown(&mut state)?;
         }
-        self.node.lock().data.extend_from_slice(data);
+        let mut pos = self.pos.lock();
+        let mut node = self.node.lock();
+        let end = *pos + data.len();
+        if node.data.len() < end {
+            node.data.resize(end, 0);
+        }
+        node.data[*pos..end].copy_from_slice(data);
+        *pos = end;
         Ok(())
     }
 
@@ -311,8 +333,9 @@ impl WritableFile for FaultFile {
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
+        let pos = *self.pos.lock();
         let mut node = self.node.lock();
-        node.synced = node.data.len();
+        node.synced = node.synced.max(pos);
         Ok(())
     }
 }
@@ -479,6 +502,7 @@ impl Fs for FaultFs {
             node,
             state: self.state.clone(),
             generation: state.generation,
+            pos: Mutex::new(0),
         }))
     }
 
@@ -513,6 +537,25 @@ impl Fs for FaultFs {
             .ok_or_else(|| Self::not_found(from))?;
         state.live.insert(to.to_path_buf(), node);
         Ok(())
+    }
+
+    fn reuse(&self, from: &Path, to: &Path) -> io::Result<Arc<dyn WritableFile>> {
+        let mut state = self.state.lock();
+        self.tick(&mut state)?;
+        let node = state
+            .live
+            .remove(from)
+            .ok_or_else(|| Self::not_found(from))?;
+        // Nothing written from here on is durable until synced; the stale
+        // bytes behind it may or may not survive a crash.
+        node.lock().synced = 0;
+        state.live.insert(to.to_path_buf(), node.clone());
+        Ok(Arc::new(FaultFile {
+            node,
+            state: self.state.clone(),
+            generation: state.generation,
+            pos: Mutex::new(0),
+        }))
     }
 
     fn link(&self, from: &Path, to: &Path) -> io::Result<()> {

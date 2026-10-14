@@ -152,7 +152,9 @@ impl Model {
 /// multi-file levels within a few dozen writes.
 fn open(fs: &FaultFs, write_buffer_size: usize) -> Db {
     let opts = Options {
-        fs: Arc::new(fs.clone()),
+        // A process handle: after a crash, nothing the dead process's
+        // threads still try reaches the file system.
+        fs: Arc::new(fs.process()),
         write_buffer_size,
         max_immutable_memtables: 2,
         target_file_size: 512,
@@ -190,6 +192,10 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
     let fs = FaultFs::new();
     let open = |fs: &FaultFs| open(fs, buffer);
     let mut db = open(&fs);
+    // Bytes an earlier crash left unreadable at the end of a WAL are counted
+    // at every open until that WAL is flushed and retired; a clean close
+    // must never add to them.
+    let mut torn_before = 0;
     let mut model = Model::new();
 
     for op in ops {
@@ -272,11 +278,13 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
             Op::Reopen => {
                 drop(db);
                 db = open(&fs);
-                prop_assert_eq!(
-                    db.recovery_report().discarded_bytes,
-                    0,
-                    "a clean close tears nothing"
+                let torn = db.recovery_report().discarded_bytes;
+                prop_assert!(
+                    torn <= torn_before,
+                    "a clean close tore {} bytes",
+                    torn - torn_before
                 );
+                torn_before = torn;
                 prop_assert_eq!(&dump(&db), &model);
             }
             Op::Flush => {
@@ -287,6 +295,7 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
                 fs.crash(Torn::Seeded(seed));
                 drop(db);
                 db = open(&fs);
+                torn_before = db.recovery_report().discarded_bytes;
                 prop_assert_eq!(&dump(&db), &model, "lost an acknowledged write");
             }
         }

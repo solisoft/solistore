@@ -23,12 +23,35 @@ use crate::error::Result;
 use crate::iter::InternalIterator;
 use crate::key::{self, KeyRef, Kind, MemKey};
 
-/// Memory an entry costs on top of its key and value bytes: the skiplist
-/// node (links, two `Bytes` handles), the allocation of the encoded key with
-/// its 12-byte prefix and trailer, and allocator rounding. Counting 80 here
-/// made a "64 MiB" memtable of SoliDB's small index entries hold ~90 MiB,
-/// and put peak RSS over RocksDB's, whose arenas count exactly.
-const ENTRY_OVERHEAD: usize = 176;
+/// Memory an entry costs on top of its key and value bytes: its skiplist
+/// node (links and two `Bytes` handles), rounded by the allocator. Keys and
+/// values themselves live in a writer's arena chunk (see [`arena_copy`]),
+/// so they cost exactly their length.
+const ENTRY_OVERHEAD: usize = 112;
+
+/// Size of the chunks writers copy keys and values into.
+const ARENA_CHUNK: usize = 1 << 20;
+
+thread_local! {
+    static ARENA: std::cell::RefCell<bytes::BytesMut> = std::cell::RefCell::new(bytes::BytesMut::new());
+}
+
+/// Copy `len` bytes, written by `fill`, into this thread's arena chunk and
+/// return them as one shared buffer. Entries are then slices of it: one
+/// allocation per megabyte instead of two per entry. Allocations were most
+/// of a memtable's real size for SoliDB's small index entries, which made
+/// memtables flush with little data in them and level 0 compact over and
+/// over.
+pub fn arena_copy(len: usize, fill: impl FnOnce(&mut bytes::BytesMut)) -> Bytes {
+    ARENA.with(|arena| {
+        let mut arena = arena.borrow_mut();
+        if arena.capacity() - arena.len() < len {
+            *arena = bytes::BytesMut::with_capacity(len.max(ARENA_CHUNK));
+        }
+        fill(&mut arena);
+        arena.split().freeze()
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeTombstone {
@@ -113,10 +136,19 @@ impl Memtable {
     /// returns the bytes to [`Memtable::account`] for. Writers inserting a
     /// batch account once for all of it: eight writers bumping the same two
     /// atomics for every entry would bounce their cache line between cores.
+    #[cfg(test)]
     pub fn insert_entry(&self, cf: u32, key: &[u8], seq: u64, kind: Kind, value: &[u8]) -> usize {
         let encoded = MemKey(Bytes::from(key::encode(cf, key, seq, kind)));
         self.map.insert(encoded, Bytes::copy_from_slice(value));
         key.len() + value.len() + ENTRY_OVERHEAD
+    }
+
+    /// Insert an entry whose encoded key and value are already slices of an
+    /// arena buffer; returns its size for [`Memtable::account`].
+    pub fn insert_shared(&self, encoded_key: Bytes, value: Bytes) -> usize {
+        let bytes = encoded_key.len() + value.len() + ENTRY_OVERHEAD;
+        self.map.insert(MemKey(encoded_key), value);
+        bytes
     }
 
     pub fn account(&self, bytes: usize, max_seq: u64) {

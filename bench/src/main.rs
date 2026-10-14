@@ -301,6 +301,9 @@ mod soli {
             if let Some(mb) = t.buffer_mb {
                 opts.write_buffer_size = mb << 20;
             }
+            if let Some(n) = t.compactions {
+                opts.max_background_compactions = n;
+            }
             let db = Db::open(dir, opts).expect("open solistore");
             let cf = |name: &str| db.cf_handle(name).unwrap_or_else(|| db.create_cf(name).unwrap());
             let (meta, shared) = (cf(META), cf(SHARED));
@@ -396,6 +399,8 @@ mod soli {
 struct SoliTuning {
     /// Memtable size; small values make flushes frequent (crash tests).
     buffer_mb: Option<usize>,
+    /// Compactions allowed to run at once.
+    compactions: Option<usize>,
 }
 
 /// RocksDB settings under test on top of the prod profile.
@@ -494,6 +499,7 @@ impl Params {
                 "--rx-wbm-mb" => p.rocks.wbm_mb = Some(value.parse().unwrap()),
                 "--rx-hcc" => p.rocks.hyper_clock = value == "1",
                 "--sx-buffer-mb" => p.soli.buffer_mb = Some(value.parse().unwrap()),
+                "--sx-compactions" => p.soli.compactions = Some(value.parse().unwrap()),
                 flag => panic!("unknown flag {flag}"),
             }
             i += 2;
@@ -521,6 +527,9 @@ impl Params {
         }
         if let Some(mb) = self.soli.buffer_mb {
             args.extend(["--sx-buffer-mb".to_string(), mb.to_string()]);
+        }
+        if let Some(n) = self.soli.compactions {
+            args.extend(["--sx-compactions".to_string(), n.to_string()]);
         }
         args
     }
