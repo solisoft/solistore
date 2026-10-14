@@ -95,6 +95,8 @@ pub struct Options {
     pub level_multiplier: u64,
     /// Ranges a compaction is split into and merged in parallel.
     pub max_subcompactions: usize,
+    /// Compactions that may run at once, on disjoint files.
+    pub max_background_compactions: usize,
     /// Bytes of decoded data blocks kept in memory, shared by every table.
     pub block_cache_size: u64,
 }
@@ -107,7 +109,9 @@ impl Default for Options {
             durability: Durability::Full,
             fs: Arc::new(StdFs),
             write_buffer_size: 64 << 20,
-            max_immutable_memtables: 4,
+            // Three memtables at most, as SoliDB's RocksDB profile
+            // (max_write_buffer_number = 3).
+            max_immutable_memtables: 2,
             target_file_size: 64 << 20,
             level0_compaction_trigger: 4,
             level0_slowdown_trigger: 20,
@@ -115,6 +119,7 @@ impl Default for Options {
             max_bytes_for_level_base: 512 << 20,
             level_multiplier: 10,
             max_subcompactions: 4,
+            max_background_compactions: 3,
             block_cache_size: 512 << 20,
         }
     }
@@ -136,6 +141,10 @@ impl fmt::Debug for Options {
             .field("max_bytes_for_level_base", &self.max_bytes_for_level_base)
             .field("level_multiplier", &self.level_multiplier)
             .field("max_subcompactions", &self.max_subcompactions)
+            .field(
+                "max_background_compactions",
+                &self.max_background_compactions,
+            )
             .field("block_cache_size", &self.block_cache_size)
             .finish()
     }
@@ -299,8 +308,8 @@ struct Inner {
     sv: ArcSwap<SuperVersion>,
     /// Serialises building and installing a new super version.
     sv_lock: Mutex<()>,
-    /// One compaction at a time, background or requested.
-    compaction_lock: Mutex<()>,
+    /// Table files some compaction is working on; others leave them alone.
+    compacting: Mutex<HashSet<u64>>,
     /// The highest sequence number a reader may see.
     visible_seq: AtomicU64,
     commit: Mutex<CommitState>,
@@ -570,7 +579,7 @@ impl Db {
                 version: Arc::new(version),
             }),
             sv_lock: Mutex::new(()),
-            compaction_lock: Mutex::new(()),
+            compacting: Mutex::new(HashSet::new()),
             visible_seq: AtomicU64::new(last_seq),
             commit: Mutex::new(CommitState {
                 wal: wal.clone(),
@@ -601,13 +610,15 @@ impl Db {
                 .spawn(move || flusher.flush_loop())
                 .map_err(Error::from)?,
         );
-        let compactor = inner.clone();
-        threads.push(
-            std::thread::Builder::new()
-                .name("solistore-compact".into())
-                .spawn(move || compactor.compaction_loop())
-                .map_err(Error::from)?,
-        );
+        for i in 0..opts.max_background_compactions.max(1) {
+            let compactor = inner.clone();
+            threads.push(
+                std::thread::Builder::new()
+                    .name(format!("solistore-compact-{i}"))
+                    .spawn(move || compactor.compaction_loop())
+                    .map_err(Error::from)?,
+            );
+        }
         if let Durability::Eventual { sync_interval } = opts.durability {
             let syncer = inner.clone();
             threads.push(
@@ -827,14 +838,30 @@ impl Db {
                 .checked_add(1)
                 .map_or_else(|| vec![0xff; 5], |next| next.to_be_bytes().to_vec()),
         };
-        let _one_at_a_time = inner.compaction_lock.lock();
+        let wanted = |v: &Version, busy: compaction::Busy<'_>| {
+            compaction::pick_for_tombstones(v, busy)
+                .or_else(|| compaction::pick_level0_overlapping(v, &lo, &hi, busy))
+        };
         // Bounded: writes arriving meanwhile could otherwise keep it going.
         for _ in 0..10_000 {
-            let version = inner.sv.load().version.clone();
-            let picked = compaction::pick_for_tombstones(&version)
-                .or_else(|| compaction::pick_level0_overlapping(&version, &lo, &hi));
-            let Some(c) = picked else { break };
-            inner.compact(&c, &version)?;
+            match inner.claim(wanted) {
+                Some((c, version)) => {
+                    let outcome = inner.compact(&c, &version);
+                    inner.release(&c);
+                    outcome?;
+                }
+                None => {
+                    // Done, unless what is left is held by a background
+                    // compaction: wait for it.
+                    let version = inner.sv.load().version.clone();
+                    if wanted(&version, &|_| false).is_none() {
+                        break;
+                    }
+                    inner.check()?;
+                    let mut bg = inner.bg.lock();
+                    inner.bg_cv.wait_for(&mut bg, Duration::from_millis(10));
+                }
+            }
         }
         Ok(())
     }
@@ -1550,27 +1577,47 @@ impl Inner {
         Ok(())
     }
 
+    /// Pick a compaction with `choose` and reserve its files, atomically
+    /// with respect to every other compaction.
+    fn claim(
+        &self,
+        choose: impl FnOnce(&Version, compaction::Busy<'_>) -> Option<compaction::Compaction>,
+    ) -> Option<(compaction::Compaction, Arc<Version>)> {
+        let mut busy = self.compacting.lock();
+        let version = self.sv.load().version.clone();
+        let picked = choose(&version, &|n| busy.contains(&n))?;
+        busy.extend(picked.all_inputs().map(|(_, f)| f.number));
+        Some((picked, version))
+    }
+
+    fn release(&self, c: &compaction::Compaction) {
+        let mut busy = self.compacting.lock();
+        for (_, f) in c.all_inputs() {
+            busy.remove(&f.number);
+        }
+        drop(busy);
+        self.notify_background();
+    }
+
     fn compaction_loop(&self) {
         loop {
-            let picked = {
+            let (picked, version) = {
                 let mut bg = self.bg.lock();
                 loop {
                     if bg.shutdown || self.poisoned.load(Ordering::Acquire) {
                         return;
                     }
-                    let version = self.sv.load().version.clone();
                     let cursors = self.cursors.lock().clone();
-                    if let Some(c) = compaction::pick(&version, &cursors, &self.compaction) {
-                        break (c, version);
+                    if let Some(claimed) =
+                        self.claim(|v, busy| compaction::pick(v, &cursors, &self.compaction, busy))
+                    {
+                        break claimed;
                     }
                     self.bg_cv.wait(&mut bg);
                 }
             };
-            let (picked, version) = picked;
-            let outcome = {
-                let _one_at_a_time = self.compaction_lock.lock();
-                self.compact(&picked, &version)
-            };
+            let outcome = self.compact(&picked, &version);
+            self.release(&picked);
             if let Err(e) = outcome {
                 self.poison();
                 self.bg.lock().flush_error = Some(e);
@@ -1580,9 +1627,9 @@ impl Inner {
         }
     }
 
-    /// Run one compaction picked from `version`. Called with the compaction
-    /// lock held. If the inputs changed meanwhile (a range delete dropped
-    /// one), the result is discarded.
+    /// Run one compaction picked from `version`, its files reserved. If the
+    /// inputs changed meanwhile (a range delete dropped one), the result is
+    /// discarded.
     fn compact(&self, c: &compaction::Compaction, version: &Version) -> Result<()> {
         let start = Instant::now();
         let output_level = c.output_level;

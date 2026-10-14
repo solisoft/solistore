@@ -299,7 +299,11 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+    // PROPTEST_CASES raises it for a stress run.
+    #![proptest_config(ProptestConfig {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(512),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn the_database_matches_the_model_across_reopens_and_crashes(

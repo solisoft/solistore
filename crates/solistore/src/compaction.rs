@@ -141,27 +141,45 @@ pub fn fully_covered(f: &TableFile, t: &RangeTombstone) -> bool {
             .is_some_and(|(cf, lo, hi)| cf == t.cf && lo >= &t.start[..] && hi < &t.end[..])
 }
 
-/// The compaction most needed now, if any.
-pub fn pick(version: &Version, cursors: &[Vec<u8>], cfg: &Config) -> Option<Compaction> {
-    pick_for_tombstones(version).or_else(|| pick_by_size(version, cursors, cfg))
+/// Whether a file is already being compacted. Compactions run concurrently
+/// on disjoint files; a candidate touching a busy file is passed over.
+pub type Busy<'a> = &'a dyn Fn(u64) -> bool;
+
+impl Compaction {
+    pub fn is_free(&self, busy: Busy<'_>) -> bool {
+        self.all_inputs().all(|(_, f)| !busy(f.number))
+    }
+}
+
+/// The compaction most needed now that touches no busy file, if any.
+pub fn pick(
+    version: &Version,
+    cursors: &[Vec<u8>],
+    cfg: &Config,
+    busy: Busy<'_>,
+) -> Option<Compaction> {
+    pick_for_tombstones(version, busy).or_else(|| pick_by_size(version, cursors, cfg, busy))
 }
 
 /// A file that may hold data a range tombstone deletes.
-pub fn pick_for_tombstones(version: &Version) -> Option<Compaction> {
+pub fn pick_for_tombstones(version: &Version, busy: Busy<'_>) -> Option<Compaction> {
     for t in &version.tombstones {
         for (level, files) in version.levels.iter().enumerate() {
-            let Some(f) = files.iter().find(|f| may_hold_covered(f, t)) else {
-                continue;
-            };
-            if level == 0 {
-                return level0(version);
+            for f in files.iter().filter(|f| may_hold_covered(f, t)) {
+                let candidate = if level == 0 {
+                    level0(version)
+                } else {
+                    Some(Compaction {
+                        level,
+                        inputs: vec![f.clone()],
+                        overlapping: Vec::new(),
+                        output_level: level,
+                    })
+                };
+                if let Some(c) = candidate.filter(|c| c.is_free(busy)) {
+                    return Some(c);
+                }
             }
-            return Some(Compaction {
-                level,
-                inputs: vec![f.clone()],
-                overlapping: Vec::new(),
-                output_level: level,
-            });
         }
     }
     None
@@ -183,53 +201,77 @@ fn level0(version: &Version) -> Option<Compaction> {
     })
 }
 
-fn pick_by_size(version: &Version, cursors: &[Vec<u8>], cfg: &Config) -> Option<Compaction> {
-    let mut best: Option<(f64, usize)> = None;
+/// One file of `level` into the next, round-robin from `cursor`.
+fn one_file(
+    version: &Version,
+    level: usize,
+    cursor: Option<&Vec<u8>>,
+    busy: Busy<'_>,
+) -> Option<Compaction> {
+    let files = &version.levels[level];
+    let start = cursor.filter(|c| !c.is_empty()).map_or(0, |c| {
+        files.partition_point(|f| key::compare(&f.props.smallest, c) != Ordering::Greater)
+    });
+    (0..files.len())
+        .map(|i| &files[(start + i) % files.len()])
+        .find_map(|f| {
+            let inputs = vec![f.clone()];
+            let (lo, hi) = key_range(&inputs)?;
+            let overlapping = version.levels[level + 1]
+                .iter()
+                .filter(|g| overlaps(g, &lo, &hi))
+                .cloned()
+                .collect();
+            Some(Compaction {
+                level,
+                inputs,
+                overlapping,
+                output_level: level + 1,
+            })
+            .filter(|c| c.is_free(busy))
+        })
+}
+
+fn pick_by_size(
+    version: &Version,
+    cursors: &[Vec<u8>],
+    cfg: &Config,
+    busy: Busy<'_>,
+) -> Option<Compaction> {
+    let mut scored: Vec<(f64, usize)> = Vec::new();
     let l0 = version.levels[0].len() as f64 / cfg.l0_trigger.max(1) as f64;
     if l0 >= 1.0 {
-        best = Some((l0, 0));
+        scored.push((l0, 0));
     }
     for level in 1..NUM_LEVELS - 1 {
         let score = level_bytes(&version.levels[level]) as f64 / target_bytes(cfg, level) as f64;
-        if score >= 1.0 && best.is_none_or(|(b, _)| score > b) {
-            best = Some((score, level));
+        if score >= 1.0 {
+            scored.push((score, level));
         }
     }
-    let (_, level) = best?;
-    if level == 0 {
-        return level0(version);
-    }
-    let files = &version.levels[level];
-    let cursor = cursors.get(level).filter(|c| !c.is_empty());
-    let next = cursor
-        .and_then(|c| {
-            files
-                .iter()
-                .find(|f| key::compare(&f.props.smallest, c) == Ordering::Greater)
-        })
-        .or_else(|| files.first())?;
-    let inputs = vec![next.clone()];
-    let (lo, hi) = key_range(&inputs)?;
-    let overlapping = version.levels[level + 1]
-        .iter()
-        .filter(|f| overlaps(f, &lo, &hi))
-        .cloned()
-        .collect();
-    Some(Compaction {
-        level,
-        inputs,
-        overlapping,
-        output_level: level + 1,
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.into_iter().find_map(|(_, level)| {
+        if level == 0 {
+            level0(version).filter(|c| c.is_free(busy))
+        } else {
+            one_file(version, level, cursors.get(level), busy)
+        }
     })
 }
 
 /// Level 0 into level 1, if level 0 holds anything in `[lo, hi]` (`cf ‖ key`).
-pub fn pick_level0_overlapping(version: &Version, lo: &[u8], hi: &[u8]) -> Option<Compaction> {
+pub fn pick_level0_overlapping(
+    version: &Version,
+    lo: &[u8],
+    hi: &[u8],
+    busy: Busy<'_>,
+) -> Option<Compaction> {
     version.levels[0]
         .iter()
         .any(|f| overlaps(f, lo, hi))
         .then(|| level0(version))
         .flatten()
+        .filter(|c| c.is_free(busy))
 }
 
 /// Whether a level below `output_level` may hold `cf ‖ user key`.
