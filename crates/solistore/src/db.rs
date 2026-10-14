@@ -390,23 +390,25 @@ struct Queue {
 /// as the work it waits for — and most waits here end sooner than this.
 const SPIN: Duration = Duration::from_micros(50);
 
-/// Spin until `done`, at most [`SPIN`]. Returns whether it became true.
+/// Wait for `done`, at most [`SPIN`], without sleeping: a few busy spins,
+/// then yielding the core on every check, so a waiting writer hands its CPU
+/// to the flush and compaction threads instead of burning it. Returns
+/// whether `done` became true.
 fn spin_until(done: impl Fn() -> bool) -> bool {
-    let start = Instant::now();
-    for i in 1u32.. {
+    for _ in 0..64 {
         if done() {
             return true;
         }
-        if i % 32 == 0 {
-            if start.elapsed() > SPIN {
-                return false;
-            }
-            std::thread::yield_now();
-        } else {
-            std::hint::spin_loop();
-        }
+        std::hint::spin_loop();
     }
-    unreachable!()
+    let start = Instant::now();
+    while start.elapsed() < SPIN {
+        if done() {
+            return true;
+        }
+        std::thread::yield_now();
+    }
+    done()
 }
 
 pub(crate) fn wal_name(no: u64) -> String {

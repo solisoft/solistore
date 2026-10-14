@@ -89,6 +89,8 @@ pub struct TableBuilder {
     entries: u64,
     deletions: u64,
     compress: bool,
+    /// Reused for every block's compressed form.
+    scratch: Vec<u8>,
 }
 
 impl TableBuilder {
@@ -107,6 +109,7 @@ impl TableBuilder {
             entries: 0,
             deletions: 0,
             compress: true,
+            scratch: Vec::new(),
         }
     }
 
@@ -166,11 +169,16 @@ impl TableBuilder {
         let start = self.out.len();
         let mut kind = TYPE_RAW;
         if compress {
-            let compressed = lz4_flex::block::compress(contents);
+            let max = lz4_flex::block::get_maximum_output_size(contents.len());
+            if self.scratch.len() < max {
+                self.scratch.resize(max, 0);
+            }
+            let compressed = lz4_flex::block::compress_into(contents, &mut self.scratch)
+                .map_err(|e| Error::Corruption(format!("LZ4: {e}")))?;
             // Not worth decompressing for less than an eighth saved.
-            if compressed.len() + 5 < contents.len() - contents.len() / 8 {
+            if compressed + 5 < contents.len() - contents.len() / 8 {
                 put_varint(&mut self.out, contents.len() as u64);
-                self.out.extend_from_slice(&compressed);
+                self.out.extend_from_slice(&self.scratch[..compressed]);
                 kind = TYPE_LZ4;
             }
         }

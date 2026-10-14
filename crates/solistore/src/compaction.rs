@@ -377,6 +377,7 @@ fn merge_range(
     let watermark = version.tombstones.iter().map(|t| t.seq).max().unwrap_or(0);
     let mut out = OutputFiles::new(fs, dir, cfg.target_file_size, watermark);
     let mut allocate = || allocate();
+    let mut live = LiveCf::new(live_cf);
     let mut last_id: Vec<u8> = Vec::new();
     let mut have_last = false;
     while merged.valid() {
@@ -397,13 +398,37 @@ fn merge_range(
             covering_seq(&version.tombstones, parsed.cf, parsed.user_key, u64::MAX) > parsed.seq;
         let dead_marker =
             parsed.kind == Kind::Delete && !may_exist_below(version, compaction.output_level, id);
-        if !(covered || dead_marker || !live_cf(parsed.cf)) {
+        if !(covered || dead_marker || !live.check(parsed.cf)) {
             out.add(parsed.cf, k, &merged.value(), &mut allocate)?;
         }
         merged.next();
     }
     merged.status()?;
     out.finish()
+}
+
+/// Whether a column family is live, asked once per run of keys in it: the
+/// answer comes from a hash set, and entries arrive grouped by family.
+pub struct LiveCf<'a> {
+    live: &'a (dyn Fn(u32) -> bool + Sync),
+    last: Option<(u32, bool)>,
+}
+
+impl<'a> LiveCf<'a> {
+    pub fn new(live: &'a (dyn Fn(u32) -> bool + Sync)) -> Self {
+        LiveCf { live, last: None }
+    }
+
+    pub fn check(&mut self, cf: u32) -> bool {
+        match self.last {
+            Some((last, alive)) if last == cf => alive,
+            _ => {
+                let alive = (self.live)(cf);
+                self.last = Some((cf, alive));
+                alive
+            }
+        }
+    }
 }
 
 /// Table files being written in key order, cut at a size and at column

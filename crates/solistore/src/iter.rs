@@ -49,74 +49,118 @@ pub fn collect_all(it: &mut dyn InternalIterator) -> Vec<(Vec<u8>, Bytes)> {
 
 /// The union of several cursors, in order. Used in one direction per
 /// positioning: `next` after `seek_ge`, `prev` after `seek_le`/`seek_to_last`.
+///
+/// The valid children are kept in a binary heap on their current keys
+/// (smallest on top walking forward, largest walking backward), so a step
+/// costs a few comparisons however many tables level 0 holds.
 pub struct MergingIterator {
     children: Vec<Box<dyn InternalIterator>>,
-    current: Option<usize>,
+    heap: Vec<usize>,
+    forward: bool,
 }
 
 impl MergingIterator {
     pub fn new(children: Vec<Box<dyn InternalIterator>>) -> Self {
         MergingIterator {
             children,
-            current: None,
+            heap: Vec::new(),
+            forward: true,
         }
     }
 
-    fn pick(&mut self, want: Ordering) {
-        let mut best: Option<usize> = None;
-        for (i, child) in self.children.iter().enumerate() {
-            if !child.valid() {
-                continue;
-            }
-            best = match best {
-                Some(b) if key::compare(child.key(), self.children[b].key()) != want => Some(b),
-                _ => Some(i),
-            };
+    /// Whether child `a` comes before child `b` in the walk's direction.
+    fn before(&self, a: usize, b: usize) -> bool {
+        let order = key::compare(self.children[a].key(), self.children[b].key());
+        if self.forward {
+            order == Ordering::Less
+        } else {
+            order == Ordering::Greater
         }
-        self.current = best;
+    }
+
+    fn sift_down(&mut self, mut at: usize) {
+        loop {
+            let (left, right) = (2 * at + 1, 2 * at + 2);
+            let mut best = at;
+            if left < self.heap.len() && self.before(self.heap[left], self.heap[best]) {
+                best = left;
+            }
+            if right < self.heap.len() && self.before(self.heap[right], self.heap[best]) {
+                best = right;
+            }
+            if best == at {
+                return;
+            }
+            self.heap.swap(at, best);
+            at = best;
+        }
+    }
+
+    fn rebuild(&mut self, forward: bool) {
+        self.forward = forward;
+        self.heap = (0..self.children.len())
+            .filter(|&i| self.children[i].valid())
+            .collect();
+        for at in (0..self.heap.len() / 2).rev() {
+            self.sift_down(at);
+        }
+    }
+
+    /// The top child moved: drop it if exhausted, then restore the heap.
+    fn advanced(&mut self) {
+        if !self.children[self.heap[0]].valid() {
+            let last = self.heap.len() - 1;
+            self.heap.swap(0, last);
+            self.heap.pop();
+        }
+        if !self.heap.is_empty() {
+            self.sift_down(0);
+        }
     }
 }
 
 impl InternalIterator for MergingIterator {
     fn seek_ge(&mut self, target: &[u8]) {
         self.children.iter_mut().for_each(|c| c.seek_ge(target));
-        self.pick(Ordering::Less);
+        self.rebuild(true);
     }
 
     fn seek_le(&mut self, target: &[u8]) {
         self.children.iter_mut().for_each(|c| c.seek_le(target));
-        self.pick(Ordering::Greater);
+        self.rebuild(false);
     }
 
     fn seek_to_last(&mut self) {
         self.children.iter_mut().for_each(|c| c.seek_to_last());
-        self.pick(Ordering::Greater);
+        self.rebuild(false);
     }
 
     fn next(&mut self) {
-        if let Some(i) = self.current {
-            self.children[i].next();
-            self.pick(Ordering::Less);
+        debug_assert!(self.forward);
+        if let Some(&top) = self.heap.first() {
+            self.children[top].next();
+            self.advanced();
         }
     }
 
     fn prev(&mut self) {
-        if let Some(i) = self.current {
-            self.children[i].prev();
-            self.pick(Ordering::Greater);
+        debug_assert!(!self.forward);
+        if let Some(&top) = self.heap.first() {
+            self.children[top].prev();
+            self.advanced();
         }
     }
 
     fn valid(&self) -> bool {
-        self.current.is_some()
+        !self.heap.is_empty()
     }
 
     fn key(&self) -> &[u8] {
-        self.children[self.current.expect("valid")].key()
+        self.children[self.heap[0]].key()
     }
 
     fn value(&self) -> Bytes {
-        self.children[self.current.expect("valid")].value()
+        self.children[self.heap[0]].value()
     }
 
     fn status(&self) -> Result<()> {

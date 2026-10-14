@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use crate::compaction::OutputFiles;
+use crate::compaction::{LiveCf, OutputFiles};
 use crate::error::Result;
 use crate::fs::Fs;
 use crate::key;
@@ -24,13 +24,14 @@ pub fn write_tables(
     fs: &dyn Fs,
     dir: &Path,
     mem: &Memtable,
-    live_cf: &dyn Fn(u32) -> bool,
+    live_cf: &(dyn Fn(u32) -> bool + Sync),
     target_size: u64,
     watermark: u64,
     mut allocate: impl FnMut() -> u64,
 ) -> Result<Vec<(u64, TableProps)>> {
     let tombstones = mem.tombstones();
     let mut out = OutputFiles::new(fs, dir, target_size, watermark);
+    let mut live = LiveCf::new(live_cf);
     let mut last_id: Vec<u8> = Vec::new();
     for (k, v) in mem.entries() {
         let id = key::cf_and_user_key(&k);
@@ -42,7 +43,7 @@ pub fn write_tables(
         let Some(parsed) = key::parse(&k) else {
             continue;
         };
-        if !live_cf(parsed.cf)
+        if !live.check(parsed.cf)
             || covering_seq(&tombstones, parsed.cf, parsed.user_key, u64::MAX) > parsed.seq
         {
             continue;
