@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/solistore"]
+# The benchmark is its own workspace: it links RocksDB for the baseline, and
+# the engine's own build must never pay for that C++.
+exclude = ["bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# SoliDB's floor (rust-rocksdb 0.53 declared it); the engine must not raise it.
+rust-version = "1.91"
+publish = false
+
+[workspace.dependencies]
+solistore = { path = "crates/solistore" }
+
+[profile.release]
+debug = 1
+
+# What CI runs tests with: optimised enough that crash and property tests
+# finish in seconds, without LTO.
+[profile.ci]
+inherits = "release"
+debug = 0
+incremental = false

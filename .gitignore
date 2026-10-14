@@ -1,0 +1,6 @@
+target/
+bench/target/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+*.profraw

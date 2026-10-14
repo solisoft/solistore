@@ -1,0 +1,31 @@
+[package]
+name = "engine-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "SoliDB-shaped storage-engine benchmark: RocksDB with SoliDB's prod profile against solistore"
+
+[features]
+default = ["rocks", "solistore"]
+# The baseline. Off, the benchmark builds without a C++ compiler.
+rocks = ["dep:rust-rocksdb"]
+solistore = ["dep:solistore"]
+
+[dependencies]
+# The RocksDB SoliDB ships (0.53 = RocksDB 11.8.1). Being its own workspace,
+# the benchmark may pin another version to compare two of them.
+rust-rocksdb = { version = "0.53", optional = true }
+solistore = { path = "../crates/solistore", optional = true }
+rand = "0.8"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+# As in the server: jemalloc serves Rust and RocksDB's C++ alike, so RSS
+# figures compare the engines and not two allocators.
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
+
+# Standalone: RocksDB must stay out of the engine's own build.
+[workspace]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

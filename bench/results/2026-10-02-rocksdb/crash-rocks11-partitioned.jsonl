@@ -1,0 +1,1 @@
+{"label":"rocks11-partitioned","engine":"rocks","phase":"crash","acked":80584,"lost_acked":0,"docs_found":80585,"index_entries":[80585,80585,80585],"torn_batch":false,"reopen_secs":0.214}

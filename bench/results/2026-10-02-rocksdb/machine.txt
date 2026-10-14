@@ -1,0 +1,10 @@
+date: 2026-10-02T11:59:13Z
+host: ns3445088.ip-213-32-26.eu
+cpu: AMD Ryzen 9 9950X 16-Core Processor
+cores: 16-23 of 32
+kernel: 6.12.0-211.56.1.el10_2.0.1.x86_64
+memory: 125 GiB
+fs: xfs /dev/md3
+bin10: f417f395fe39da4a
+bin11: 96817c74e96ded66
+reps: 3, large: 30000000 docs
