@@ -459,6 +459,169 @@ mod soli {
     }
 }
 
+// ---------------------------------------------------------------- SurrealKV
+
+#[cfg(feature = "surrealkv")]
+mod skv {
+    use super::*;
+    use surrealkv::{CompressionType, Durability, LSMIterator, Mode, Options, Tree, TreeBuilder};
+
+    /// SurrealKV 1.x with the same layout: one tree, collections under the
+    /// 8-byte prefix, the registry under its own prefix. It has no column
+    /// families and no compact_range, so a drop is a delete_range and the
+    /// space comes back with ordinary compaction.
+    pub struct Skv {
+        tree: Tree,
+        rt: tokio::runtime::Runtime,
+        /// Every commit fsynced (Durability::Immediate), or only sync writes.
+        durable: bool,
+        /// Commits retried after a write conflict.
+        retries: AtomicU64,
+    }
+
+    fn meta_key(coll: u32) -> Vec<u8> {
+        let mut key = 0u32.to_be_bytes().to_vec(); // db_id 0: the registry
+        key.extend_from_slice(format!("coll:{coll}").as_bytes());
+        key
+    }
+
+    impl Skv {
+        /// `factory`: SurrealKV's own defaults (no compression, 64 KiB
+        /// blocks, 32 MiB cache, 100 MiB memtable). Otherwise the budget
+        /// the other engines get: 512 MiB cache, 64 MiB memtable, 4 KiB
+        /// blocks, Snappy (it has no LZ4).
+        pub fn open(dir: &Path, durable: bool, factory: bool) -> Self {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let builder = if factory {
+                TreeBuilder::new()
+            } else {
+                TreeBuilder::with_options(
+                    Options::new()
+                        .with_compression_per_level(vec![CompressionType::SnappyCompression; 6]),
+                )
+                .with_max_memtable_size(64 << 20)
+                .with_block_cache_capacity(512 << 20)
+                .with_block_size(4096)
+            };
+            let builder = builder.with_path(dir.to_path_buf());
+            let tree = rt
+                .block_on(async { builder.build() })
+                .expect("open surrealkv");
+            Skv {
+                tree,
+                rt,
+                durable,
+                retries: AtomicU64::new(0),
+            }
+        }
+
+        /// Commit, retrying on a write conflict: SurrealKV checks
+        /// conflicts optimistically even for write-only transactions, where
+        /// a RocksDB or solistore batch simply applies. An application on
+        /// SurrealKV retries the same way.
+        fn commit(&self, f: impl Fn(&mut surrealkv::Transaction), sync: bool) {
+            loop {
+                let mut tx = self.tree.begin_with_mode(Mode::WriteOnly).expect("begin");
+                f(&mut tx);
+                if self.durable || sync {
+                    tx.set_durability(Durability::Immediate);
+                }
+                match self.rt.block_on(tx.commit()) {
+                    Ok(()) => return,
+                    Err(surrealkv::Error::TransactionWriteConflict) => {
+                        self.retries.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => panic!("commit: {e:?}"),
+                }
+            }
+        }
+    }
+
+    impl Engine for Skv {
+        fn create_collection(&self, coll: u32) {
+            self.commit(
+                |tx| tx.set(meta_key(coll), coll.to_be_bytes().to_vec()).unwrap(),
+                false,
+            );
+        }
+
+        fn drop_collection(&self, coll: u32) {
+            let (from, to) = coll_range(coll);
+            self.commit(
+                |tx| {
+                    tx.delete(meta_key(coll)).unwrap();
+                    tx.delete_range(from.clone(), to.clone()).unwrap();
+                },
+                false,
+            );
+        }
+
+        fn write(&self, ops: Vec<Op>, sync: bool) {
+            self.commit(
+                |tx| {
+                    for op in &ops {
+                        let key = prefixed(op.coll, &op.key);
+                        match &op.value {
+                            Some(v) => tx.set(key, v.clone()).unwrap(),
+                            None => tx.delete(key).unwrap(),
+                        }
+                    }
+                },
+                sync,
+            );
+        }
+
+        fn get(&self, coll: u32, key: &[u8]) -> Option<Vec<u8>> {
+            let tx = self.tree.begin_with_mode(Mode::ReadOnly).expect("begin");
+            tx.get(prefixed(coll, key)).unwrap()
+        }
+
+        fn scan_keys(
+            &self,
+            coll: u32,
+            start: &[u8],
+            end: &[u8],
+            rev: bool,
+            limit: usize,
+        ) -> Vec<Vec<u8>> {
+            let tx = self.tree.begin_with_mode(Mode::ReadOnly).expect("begin");
+            let mut it = tx
+                .range(prefixed(coll, start), prefixed(coll, end))
+                .unwrap();
+            let mut out = Vec::new();
+            let mut valid = if rev {
+                it.seek_last().unwrap()
+            } else {
+                it.seek_first().unwrap()
+            };
+            while valid && out.len() < limit {
+                out.push(it.key().user_key()[8..].to_vec());
+                valid = if rev {
+                    it.prev().unwrap()
+                } else {
+                    it.next().unwrap()
+                };
+            }
+            out
+        }
+
+        fn flush(&self) {
+            self.tree.flush_wal(true).expect("flush");
+        }
+
+        fn stats(&self) -> String {
+            format!(
+                r#"{{"conflict_retries":{}}}"#,
+                self.retries.load(Ordering::Relaxed)
+            )
+        }
+    }
+}
+
 /// solistore settings under test on top of its defaults.
 #[derive(Clone, Default)]
 struct SoliTuning {
@@ -499,6 +662,17 @@ fn open_engine(p: &Params) -> Box<dyn Engine> {
             },
             &p.soli,
         )),
+        // Every commit fsynced (Durability::Immediate), as solistore's default.
+        #[cfg(feature = "surrealkv")]
+        "surrealkv" => Box::new(skv::Skv::open(&p.dir, true, false)),
+        // SurrealKV's own default durability: commits do not wait for fsync.
+        #[cfg(feature = "surrealkv")]
+        "surrealkv-eventual" => Box::new(skv::Skv::open(&p.dir, false, false)),
+        // The same, with SurrealKV's factory settings instead of the shared budget.
+        #[cfg(feature = "surrealkv")]
+        "surrealkv-defaults" => Box::new(skv::Skv::open(&p.dir, true, true)),
+        #[cfg(feature = "surrealkv")]
+        "surrealkv-eventual-defaults" => Box::new(skv::Skv::open(&p.dir, false, true)),
         other => panic!("unknown engine {other}"),
     }
 }

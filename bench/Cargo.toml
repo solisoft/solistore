@@ -6,10 +6,13 @@ publish = false
 description = "SoliDB-shaped storage-engine benchmark: RocksDB with SoliDB's prod profile against solistore"
 
 [features]
-default = ["rocks", "solistore"]
+default = ["rocks", "solistore", "surrealkv"]
 # The baseline. Off, the benchmark builds without a C++ compiler.
 rocks = ["dep:rust-rocksdb"]
 solistore = ["dep:solistore"]
+# SurrealDB's LSM, for comparison (its commit is async: a tokio runtime
+# drives it).
+surrealkv = ["dep:surrealkv", "dep:tokio"]
 
 [dependencies]
 # The RocksDB SoliDB ships (0.53 = RocksDB 11.8.1). Being its own workspace,
@@ -17,6 +20,8 @@ solistore = ["dep:solistore"]
 rust-rocksdb = { version = "0.53", optional = true }
 solistore = { path = "../crates/solistore", optional = true }
 rand = "0.8"
+surrealkv = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 # As in the server: jemalloc serves Rust and RocksDB's C++ alike, so RSS
