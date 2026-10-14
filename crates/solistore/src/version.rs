@@ -37,6 +37,20 @@ pub fn parse_table_name(name: &str) -> Option<u64> {
     name.strip_suffix(".sst")?.parse().ok()
 }
 
+/// Table files whose delete failed, to try again later. On Windows a file
+/// another handle holds open cannot always be deleted; without a retry it
+/// would stay until the next open removes orphans.
+pub type Graveyard = Arc<parking_lot::Mutex<Vec<PathBuf>>>;
+
+/// Delete what the graveyard holds; keep what still cannot be deleted.
+pub fn retry_deletes(fs: &dyn Fs, graveyard: &Graveyard) {
+    let mut pending = graveyard.lock();
+    if pending.is_empty() {
+        return;
+    }
+    pending.retain(|path| fs.remove(path).is_err() && fs.exists(path));
+}
+
 /// A table file, opened on first use and deleted once obsolete and unused.
 pub struct TableFile {
     pub number: u64,
@@ -52,6 +66,7 @@ pub struct TableFile {
     /// that briefly took 600 MB.
     opening: parking_lot::Mutex<()>,
     obsolete: AtomicBool,
+    graveyard: Option<Graveyard>,
 }
 
 impl TableFile {
@@ -71,7 +86,14 @@ impl TableFile {
             reader: OnceLock::new(),
             opening: parking_lot::Mutex::new(()),
             obsolete: AtomicBool::new(false),
+            graveyard: None,
         }
+    }
+
+    /// Where a failed delete of this file goes to be retried.
+    pub fn with_graveyard(mut self, graveyard: Graveyard) -> Self {
+        self.graveyard = Some(graveyard);
+        self
     }
 
     pub fn reader(&self) -> Result<Arc<TableReader>> {
@@ -106,7 +128,11 @@ impl Drop for TableFile {
             // Close this table's own handle first: Windows refuses to delete
             // a file that is open without FILE_SHARE_DELETE.
             drop(self.reader.take());
-            self.fs.remove(&self.path).ok();
+            if self.fs.remove(&self.path).is_err() && self.fs.exists(&self.path) {
+                if let Some(graveyard) = &self.graveyard {
+                    graveyard.lock().push(self.path.clone());
+                }
+            }
         }
     }
 }

@@ -31,6 +31,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -357,7 +358,9 @@ struct Inner {
     /// Members of the last group, to gather as many for the next fsync.
     last_group: AtomicUsize,
     /// Wakes writers waiting for `visible_seq` to reach their group.
-    publish: Mutex<()>,
+    /// Groups fully inserted but not yet visible, `first -> last`: a group
+    /// can finish before an earlier one.
+    publish: Mutex<std::collections::BTreeMap<u64, u64>>,
     publish_cv: Condvar,
     /// Numbers of dead WAL files kept for reuse, and how many to keep.
     recycled_wals: Mutex<Vec<u64>>,
@@ -366,6 +369,8 @@ struct Inner {
     current_wal: Mutex<Arc<WalFile>>,
     /// What must be durable before the current WAL may be fsynced.
     barrier: Mutex<SyncBarrier>,
+    /// Table files whose delete failed, retried by the background.
+    graveyard: crate::version::Graveyard,
     /// A write, fsync or flush failed; see [`Error::Poisoned`].
     poisoned: AtomicBool,
     bg: Mutex<Background>,
@@ -432,8 +437,22 @@ struct Pending {
 enum Slot {
     /// In the WAL: insert into `group.mem` from this sequence number.
     Insert(Arc<Group>, u64),
+    /// In the WAL, and the leader inserts it: wait for the group to be
+    /// published.
+    Wait(Arc<Group>),
+    /// The leader of a group it inserts alone, with each member's first
+    /// sequence number.
+    InsertAll(Arc<Group>, Vec<u64>),
     Failed(Error),
 }
+
+/// Groups larger than this are inserted into the memtable by their leader
+/// alone. Parallel inserts pay off when every member has a core; past
+/// that, a member preempted between its insert and the group's
+/// publication holds up every later group. SoliDB runs SDBQL writes on
+/// tokio's blocking pool, 64 concurrent writers on 8 cores in the
+/// benchmark, and spent most of its off-CPU time in `wait_published`.
+const MAX_PARALLEL_INSERT: usize = 8;
 
 /// A commit group after its WAL write: its members insert in parallel, and
 /// the last one to finish publishes it, after the group before it.
@@ -460,20 +479,35 @@ const SPIN: Duration = Duration::from_micros(50);
 /// to the flush and compaction threads instead of burning it. Returns
 /// whether `done` became true.
 fn spin_until(done: impl Fn() -> bool) -> bool {
-    for _ in 0..64 {
-        if done() {
-            return true;
-        }
-        std::hint::spin_loop();
+    // At most one spinner per core. Past that (SoliDB's SDBQL writes run 64
+    // writers on 8 cores), spinners only take the CPU from the threads they
+    // wait for: the profile was kernel, clock reads and sched_yield, at 4.6x
+    // RocksDB's CPU per insert. The rest go straight to sleep.
+    static SPINNERS: AtomicUsize = AtomicUsize::new(0);
+    static CORES: OnceLock<usize> = OnceLock::new();
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    if SPINNERS.fetch_add(1, Ordering::Relaxed) >= cores {
+        SPINNERS.fetch_sub(1, Ordering::Relaxed);
+        return done();
     }
-    let start = Instant::now();
-    while start.elapsed() < SPIN {
-        if done() {
-            return true;
+    let spun = (|| {
+        for _ in 0..64 {
+            if done() {
+                return true;
+            }
+            std::hint::spin_loop();
         }
-        std::thread::yield_now();
-    }
-    done()
+        let start = Instant::now();
+        while start.elapsed() < SPIN {
+            if done() {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        done()
+    })();
+    SPINNERS.fetch_sub(1, Ordering::Relaxed);
+    spun
 }
 
 pub(crate) fn wal_name(no: u64) -> String {
@@ -604,16 +638,20 @@ impl Db {
         }
 
         let block_cache = Arc::new(BlockCache::new(opts.block_cache_size));
+        let graveyard = crate::version::Graveyard::default();
         let mut version = Version::empty();
         for (level, files) in state.levels.iter().enumerate() {
             for (number, props) in files {
-                version.levels[level].push(Arc::new(TableFile::new(
-                    fs.clone(),
-                    block_cache.clone(),
-                    &dir,
-                    *number,
-                    props.clone(),
-                )));
+                version.levels[level].push(Arc::new(
+                    TableFile::new(
+                        fs.clone(),
+                        block_cache.clone(),
+                        &dir,
+                        *number,
+                        props.clone(),
+                    )
+                    .with_graveyard(graveyard.clone()),
+                ));
             }
         }
         version.sort_level0();
@@ -677,12 +715,13 @@ impl Db {
             queued: AtomicUsize::new(0),
             leader_busy: AtomicBool::new(false),
             last_group: AtomicUsize::new(1),
-            publish: Mutex::new(()),
+            publish: Mutex::new(std::collections::BTreeMap::new()),
             publish_cv: Condvar::new(),
             recycled_wals: Mutex::new(recycled),
             recycle_wal_files: opts.recycle_wal_files,
             current_wal: Mutex::new(wal),
             barrier: Mutex::new(SyncBarrier::default()),
+            graveyard,
             poisoned: AtomicBool::new(false),
             bg: Mutex::new(Background::default()),
             bg_cv: Condvar::new(),
@@ -1416,7 +1455,16 @@ impl Inner {
                     me: &me,
                 };
                 let written = self.write_group(&group);
-                guard.finish(written)
+                match guard.finish(written) {
+                    Slot::InsertAll(g, firsts) => {
+                        for (pending, first) in group.iter().zip(firsts) {
+                            apply(&g.mem, pending.batch.ops(), first, |_| true);
+                        }
+                        self.publish_group(&g);
+                        return Ok(());
+                    }
+                    slot => slot,
+                }
             }
         };
         match slot {
@@ -1425,6 +1473,11 @@ impl Inner {
                 self.insert_and_publish(&me.batch, &group, first);
                 Ok(())
             }
+            Slot::Wait(group) => {
+                self.wait_published(group.last);
+                Ok(())
+            }
+            Slot::InsertAll(..) => unreachable!("only the leader inserts a whole group"),
         }
     }
 
@@ -1491,16 +1544,39 @@ impl Inner {
     fn insert_and_publish(&self, batch: &WriteBatch, group: &Group, first: u64) {
         apply(&group.mem, batch.ops(), first, |_| true);
         if group.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.wait_published(group.first - 1);
-            // Under the lock, so a writer that just found the old value is
-            // already waiting when the notification goes out.
-            let published = self.publish.lock();
-            self.visible_seq.store(group.last, Ordering::Release);
-            drop(published);
-            self.publish_cv.notify_all();
+            self.publish_group(group);
         } else {
             self.wait_published(group.last);
         }
+    }
+
+    /// Record a fully inserted group, and make visible every group up to
+    /// the first one still being inserted. Whichever thread finishes the
+    /// oldest pending group publishes those after it that are already done:
+    /// publication used to be one thread per group in order, each woken by
+    /// the one before, and with more writers than cores (SoliDB's SDBQL
+    /// writes) that chain of wake-ups capped commits at ~50k a second with
+    /// groups of one batch.
+    fn publish_group(&self, group: &Group) {
+        let mut done = self.publish.lock();
+        done.insert(group.first, group.last);
+        let mut visible = self.visible_seq.load(Ordering::Acquire);
+        let start = visible;
+        while let Some(last) = done.remove(&(visible + 1)) {
+            visible = last;
+        }
+        if visible == start {
+            // An earlier group is still being inserted; whoever finishes it
+            // publishes this one. A write returns only once visible.
+            drop(done);
+            self.wait_published(group.last);
+            return;
+        }
+        // Under the lock, so a writer that just found the old value is
+        // already waiting when the notification goes out.
+        self.visible_seq.store(visible, Ordering::Release);
+        drop(done);
+        self.publish_cv.notify_all();
     }
 
     /// Wait until `visible_seq` reaches `seq`.
@@ -1667,6 +1743,7 @@ impl Inner {
         self.sv.store(Arc::new(change.sv));
         // Deleted once the last reader holding an older version is done.
         change.retired.iter().for_each(|f| f.mark_obsolete());
+        crate::version::retry_deletes(self.fs.as_ref(), &self.graveyard);
         Ok(true)
     }
 
@@ -1719,13 +1796,16 @@ impl Inner {
         let tables: Vec<Arc<TableFile>> = files
             .iter()
             .map(|(number, props)| {
-                Arc::new(TableFile::new(
-                    self.fs.clone(),
-                    self.block_cache.clone(),
-                    &self.dir,
-                    *number,
-                    props.clone(),
-                ))
+                Arc::new(
+                    TableFile::new(
+                        self.fs.clone(),
+                        self.block_cache.clone(),
+                        &self.dir,
+                        *number,
+                        props.clone(),
+                    )
+                    .with_graveyard(self.graveyard.clone()),
+                )
             })
             .collect();
         // Open the new tables here, on the flush thread, so the first
@@ -1842,7 +1922,15 @@ impl Inner {
                     {
                         break claimed;
                     }
-                    self.bg_cv.wait(&mut bg);
+                    // Wake now and then even without work, to retry deletes
+                    // that failed.
+                    if self
+                        .bg_cv
+                        .wait_for(&mut bg, Duration::from_secs(1))
+                        .timed_out()
+                    {
+                        crate::version::retry_deletes(self.fs.as_ref(), &self.graveyard);
+                    }
                 }
             };
             let outcome = self.compact(&picked, &version);
@@ -1889,13 +1977,16 @@ impl Inner {
             outputs
                 .iter()
                 .map(|(number, props)| {
-                    Arc::new(TableFile::new(
-                        self.fs.clone(),
-                        self.block_cache.clone(),
-                        &self.dir,
-                        *number,
-                        props.clone(),
-                    ))
+                    Arc::new(
+                        TableFile::new(
+                            self.fs.clone(),
+                            self.block_cache.clone(),
+                            &self.dir,
+                            *number,
+                            props.clone(),
+                        )
+                        .with_graveyard(self.graveyard.clone()),
+                    )
                 })
                 .collect()
         };
@@ -1958,10 +2049,9 @@ impl Inner {
                 outputs.iter().map(|(_, p)| p.size).sum(),
             );
         }
-        if !applied {
-            for (number, _) in &outputs {
-                self.fs.remove(&self.dir.join(table_name(*number))).ok();
-            }
+        if !applied && !c.is_trivial_move() {
+            // Deleted as they are dropped, after their readers are closed.
+            new_tables.iter().for_each(|t| t.mark_obsolete());
         }
         if c.output_level > c.level {
             self.cursors.lock()[c.level] = c.largest();
@@ -2005,9 +2095,17 @@ impl LeaderGuard<'_> {
     /// Hand out the slots and return the leader's own.
     fn finish(self, written: Result<(Arc<Group>, Vec<u64>)>) -> Slot {
         let mut mine = None;
+        let leader_inserts = self.group.len() > MAX_PARALLEL_INSERT;
         let mut queue = self.inner.queue.lock();
         for (i, pending) in self.group.iter().enumerate() {
             let slot = match &written {
+                Ok((group, firsts)) if leader_inserts => {
+                    if Arc::ptr_eq(pending, self.me) {
+                        Slot::InsertAll(group.clone(), firsts.clone())
+                    } else {
+                        Slot::Wait(group.clone())
+                    }
+                }
                 Ok((group, firsts)) => Slot::Insert(group.clone(), firsts[i]),
                 Err(e) => Slot::Failed(e.clone()),
             };

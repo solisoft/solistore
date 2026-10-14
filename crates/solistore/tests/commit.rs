@@ -694,8 +694,13 @@ fn approximate_size_counts_flushed_data_in_the_range() {
 fn a_synced_write_carries_every_earlier_write_across_memtable_switches() {
     for seed in 0..400u64 {
         let fs = FaultFs::new();
+        // Slow fsyncs keep the flushes from finishing, so the WALs are still
+        // there at the crash on every platform (on Windows' CI the flushes
+        // won the race and no seed cut anything).
+        fs.set_sync_delay(Duration::from_millis(5));
         let opts = Options {
             fs: Arc::new(fs.clone()),
+            max_immutable_memtables: 32,
             durability: Durability::Eventual {
                 // Never: only the synced write makes anything durable.
                 sync_interval: Duration::from_secs(3600),
@@ -704,7 +709,14 @@ fn a_synced_write_carries_every_earlier_write_across_memtable_switches() {
             target_file_size: 16 << 10,
             ..Options::default()
         };
-        let db = Db::open("/db", opts.clone()).unwrap();
+        let db = Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts.clone()
+            },
+        )
+        .unwrap();
         let cf = db.default_cf();
         let before = 300 + (seed as u32 * 37) % 400;
         for i in 0..before {
@@ -724,7 +736,14 @@ fn a_synced_write_carries_every_earlier_write_across_memtable_switches() {
         };
         fs.crash(torn);
         drop(db);
-        let db = Db::open("/db", opts).unwrap();
+        let db = Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts
+            },
+        )
+        .unwrap();
         let cf = db.default_cf();
         let keys: Vec<u32> = db
             .iterator(&cf, IteratorMode::Start)
@@ -753,8 +772,13 @@ fn writes_after_a_point_in_time_recovery_survive_the_next_crash() {
     let mut cuts = 0;
     for seed in 0..400u64 {
         let fs = FaultFs::new();
+        // Slow fsyncs keep the flushes from finishing, so the WALs are still
+        // there at the crash on every platform (on Windows' CI the flushes
+        // won the race and no seed cut anything).
+        fs.set_sync_delay(Duration::from_millis(5));
         let opts = Options {
             fs: Arc::new(fs.clone()),
+            max_immutable_memtables: 32,
             durability: Durability::Eventual {
                 sync_interval: Duration::from_secs(3600),
             },
@@ -762,7 +786,14 @@ fn writes_after_a_point_in_time_recovery_survive_the_next_crash() {
             target_file_size: 16 << 10,
             ..Options::default()
         };
-        let db = Db::open("/db", opts.clone()).unwrap();
+        let db = Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts.clone()
+            },
+        )
+        .unwrap();
         let cf = db.default_cf();
         for i in 0..600u32 {
             db.put(&cf, i.to_be_bytes(), [i as u8; 48]).unwrap();
@@ -770,7 +801,14 @@ fn writes_after_a_point_in_time_recovery_survive_the_next_crash() {
         fs.crash(Torn::Seeded(seed));
         drop(db);
 
-        let db = Db::open("/db", opts.clone()).unwrap();
+        let db = Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts.clone()
+            },
+        )
+        .unwrap();
         if db.recovery_report().dropped_wal_files == 0 {
             continue;
         }
@@ -783,7 +821,14 @@ fn writes_after_a_point_in_time_recovery_survive_the_next_crash() {
         fs.crash(Torn::Seeded(seed + 1));
         drop(db);
 
-        let db = Db::open("/db", opts).unwrap();
+        let db = Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts
+            },
+        )
+        .unwrap();
         let cf = db.default_cf();
         assert_eq!(
             db.get(&cf, 1_000_000u32.to_be_bytes()).unwrap().as_deref(),
