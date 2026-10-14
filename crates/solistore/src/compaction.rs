@@ -43,6 +43,8 @@ pub struct Config {
     pub target_file_size: u64,
     /// Ranges one compaction is split into and merged in parallel.
     pub subcompactions: usize,
+    /// Start write-back of table files as they are written.
+    pub writeback: bool,
 }
 
 pub struct Compaction {
@@ -417,7 +419,8 @@ fn merge_range(
     }
 
     let watermark = version.tombstones.iter().map(|t| t.seq).max().unwrap_or(0);
-    let mut out = OutputFiles::new(fs, dir, cfg.target_file_size, watermark);
+    let mut out =
+        OutputFiles::with_writeback(fs, dir, cfg.target_file_size, watermark, cfg.writeback);
     let mut allocate = || allocate();
     let mut live = LiveCf::new(live_cf);
     let mut last_id: Vec<u8> = Vec::new();
@@ -483,10 +486,21 @@ pub struct OutputFiles<'a> {
     current: Option<(u64, TableBuilder)>,
     last_cf: Option<u32>,
     written: Vec<(u64, TableProps)>,
+    writeback: bool,
 }
 
 impl<'a> OutputFiles<'a> {
     pub fn new(fs: &'a dyn Fs, dir: &'a Path, target: u64, watermark: u64) -> Self {
+        Self::with_writeback(fs, dir, target, watermark, false)
+    }
+
+    pub fn with_writeback(
+        fs: &'a dyn Fs,
+        dir: &'a Path,
+        target: u64,
+        watermark: u64,
+        writeback: bool,
+    ) -> Self {
         OutputFiles {
             fs,
             dir,
@@ -495,6 +509,7 @@ impl<'a> OutputFiles<'a> {
             current: None,
             last_cf: None,
             written: Vec::new(),
+            writeback,
         }
     }
 
@@ -516,7 +531,8 @@ impl<'a> OutputFiles<'a> {
             let number = allocate();
             self.current = Some((
                 number,
-                TableBuilder::new(self.fs.create(&self.dir.join(table_name(number)))?),
+                TableBuilder::new(self.fs.create(&self.dir.join(table_name(number)))?)
+                    .with_writeback(self.writeback),
             ));
         }
         self.last_cf = Some(cf);

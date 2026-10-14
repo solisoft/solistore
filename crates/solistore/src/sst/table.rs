@@ -93,6 +93,8 @@ pub struct TableBuilder {
     scratch: Vec<u8>,
     /// Bytes appended to the file so far.
     written: u64,
+    /// Start write-back as chunks are written ([`TableBuilder::with_writeback`]).
+    writeback: bool,
 }
 
 impl TableBuilder {
@@ -113,12 +115,18 @@ impl TableBuilder {
             compress: true,
             scratch: Vec::new(),
             written: 0,
+            writeback: false,
         }
     }
 
     #[cfg(test)]
     pub fn uncompressed(mut self) -> Self {
         self.compress = false;
+        self
+    }
+
+    pub fn with_writeback(mut self, on: bool) -> Self {
+        self.writeback = on;
         self
     }
 
@@ -199,11 +207,15 @@ impl TableBuilder {
         self.offset += (len as usize + BLOCK_TRAILER) as u64;
         if self.out.len() >= WRITE_CHUNK {
             self.file.append(&self.out)?;
-            // RocksDB's bytes_per_sync: start the write-back of each chunk as
-            // it is written. A 64 MiB table reaching the device in one burst
-            // at its final fsync made every WAL fsync behind it wait.
+            // RocksDB's bytes_per_sync, when asked for: start the write-back
+            // of each chunk as it is written instead of in one burst at the
+            // final fsync. Off by default, as in RocksDB and SoliDB's
+            // profile: it keeps the device queue busy, and a WAL fsync
+            // queued behind it waited milliseconds.
             let len = self.out.len() as u64;
-            self.file.start_writeback(self.written, len);
+            if self.writeback {
+                self.file.start_writeback(self.written, len);
+            }
             self.written += len;
             self.out.clear();
         }

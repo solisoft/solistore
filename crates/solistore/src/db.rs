@@ -102,6 +102,11 @@ pub struct Options {
     pub max_background_jobs: usize,
     /// Bytes of decoded data blocks kept in memory, shared by every table.
     pub block_cache_size: u64,
+    /// Start writing compaction outputs back to the device as they are
+    /// written, instead of at their final fsync (RocksDB's `bytes_per_sync`;
+    /// any non-zero value turns it on, in 1 MiB steps). Off by default, as
+    /// in RocksDB and SoliDB's profile.
+    pub bytes_per_sync: u64,
     /// Dead WAL files kept to be written over instead of creating new ones
     /// (RocksDB's `recycle_log_file_num`; SoliDB's profile sets 3).
     pub recycle_wal_files: usize,
@@ -125,9 +130,13 @@ impl Default for Options {
             max_bytes_for_level_base: 512 << 20,
             level_multiplier: 10,
             max_subcompactions: 4,
-            max_background_compactions: 3,
+            // One at a time measured best at 5M documents: concurrent
+            // compactions hold level-1 files the next level-0 compaction
+            // needs, and rewrote more in all (results/2026-10-14-nowb).
+            max_background_compactions: 1,
             max_background_jobs: 6,
             block_cache_size: 512 << 20,
+            bytes_per_sync: 0,
             recycle_wal_files: 3,
         }
     }
@@ -155,6 +164,7 @@ impl fmt::Debug for Options {
             )
             .field("max_background_jobs", &self.max_background_jobs)
             .field("block_cache_size", &self.block_cache_size)
+            .field("bytes_per_sync", &self.bytes_per_sync)
             .field("recycle_wal_files", &self.recycle_wal_files)
             .finish()
     }
@@ -585,6 +595,7 @@ impl Db {
                 level_multiplier: opts.level_multiplier.max(2),
                 target_file_size: opts.target_file_size.max(1),
                 subcompactions: opts.max_subcompactions.max(1),
+                writeback: opts.bytes_per_sync > 0,
             },
             l0_slowdown: opts.level0_slowdown_trigger.max(1),
             l0_stop: opts
