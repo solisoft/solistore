@@ -214,12 +214,21 @@ struct State {
     failing_syncs: u32,
     syncs: u64,
     sync_delay: std::time::Duration,
+    /// Mutating operations left before a crash ([`FaultFs::crash_after`]).
+    countdown: Option<u64>,
+    countdown_torn: Option<Torn>,
 }
 
 /// An in-memory file system that can crash. Cloning shares the same files.
+///
+/// A handle from [`FaultFs::process`] belongs to one "process": once the
+/// file system crashes, every operation through it fails, as nothing a dead
+/// process does reaches the disk. Other handles see the file system as an
+/// observer would and keep working across crashes.
 #[derive(Clone, Default)]
 pub struct FaultFs {
     state: Arc<Mutex<State>>,
+    process: Option<u64>,
 }
 
 impl fmt::Debug for FaultFs {
@@ -229,7 +238,7 @@ impl fmt::Debug for FaultFs {
 }
 
 /// What a crash leaves of the bytes that were written but not synced.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Torn {
     /// Nothing: every file ends at its last sync.
     None,
@@ -249,19 +258,15 @@ fn crashed() -> io::Error {
     io::Error::other("FaultFs: this handle belongs to a crashed process")
 }
 
-impl FaultFile {
-    fn check_alive(&self) -> io::Result<()> {
-        if self.state.lock().generation == self.generation {
-            Ok(())
-        } else {
-            Err(crashed())
-        }
-    }
-}
-
 impl WritableFile for FaultFile {
     fn append(&self, data: &[u8]) -> io::Result<()> {
-        self.check_alive()?;
+        {
+            let mut state = self.state.lock();
+            if state.generation != self.generation {
+                return Err(crashed());
+            }
+            tick_countdown(&mut state)?;
+        }
         self.node.lock().data.extend_from_slice(data);
         Ok(())
     }
@@ -272,6 +277,7 @@ impl WritableFile for FaultFile {
             if state.generation != self.generation {
                 return Err(crashed());
             }
+            tick_countdown(&mut state)?;
             state.syncs += 1;
             if state.failing_syncs > 0 {
                 state.failing_syncs -= 1;
@@ -285,6 +291,48 @@ impl WritableFile for FaultFile {
         let mut node = self.node.lock();
         node.synced = node.data.len();
         Ok(())
+    }
+}
+
+fn crash_locked(state: &mut State, torn: Torn) {
+    state.generation += 1;
+    let mut seed = match torn {
+        Torn::None => 0,
+        Torn::Seeded(seed) => seed | 1,
+    };
+    let mut survivors = BTreeMap::new();
+    for (path, node) in &state.durable {
+        let node = node.lock();
+        let mut data = node.data[..node.synced].to_vec();
+        let unsynced = &node.data[node.synced..];
+        if seed != 0 && !unsynced.is_empty() {
+            let keep = (next_random(&mut seed) % (unsynced.len() as u64 + 1)) as usize;
+            data.extend_from_slice(&unsynced[..keep]);
+            if next_random(&mut seed).is_multiple_of(4) {
+                let garbage = (next_random(&mut seed) % 16) as usize;
+                data.extend((0..garbage).map(|_| next_random(&mut seed) as u8));
+            }
+        }
+        let synced = data.len();
+        survivors.insert(path.clone(), Arc::new(Mutex::new(Node { data, synced })));
+    }
+    state.live = survivors.clone();
+    state.durable = survivors;
+}
+
+fn tick_countdown(state: &mut State) -> io::Result<()> {
+    match state.countdown {
+        Some(0) => {
+            state.countdown = None;
+            let torn = state.countdown_torn.unwrap_or(Torn::None);
+            crash_locked(state, torn);
+            Err(crashed())
+        }
+        Some(n) => {
+            state.countdown = Some(n - 1);
+            Ok(())
+        }
+        None => Ok(()),
     }
 }
 
@@ -307,29 +355,41 @@ impl FaultFs {
     /// crash fail from now on.
     pub fn crash(&self, torn: Torn) {
         let mut state = self.state.lock();
-        state.generation += 1;
-        let mut seed = match torn {
-            Torn::None => 0,
-            Torn::Seeded(seed) => seed | 1,
-        };
-        let mut survivors = BTreeMap::new();
-        for (path, node) in &state.durable {
-            let node = node.lock();
-            let mut data = node.data[..node.synced].to_vec();
-            let unsynced = &node.data[node.synced..];
-            if seed != 0 && !unsynced.is_empty() {
-                let keep = (next_random(&mut seed) % (unsynced.len() as u64 + 1)) as usize;
-                data.extend_from_slice(&unsynced[..keep]);
-                if next_random(&mut seed).is_multiple_of(4) {
-                    let garbage = (next_random(&mut seed) % 16) as usize;
-                    data.extend((0..garbage).map(|_| next_random(&mut seed) as u8));
-                }
-            }
-            let synced = data.len();
-            survivors.insert(path.clone(), Arc::new(Mutex::new(Node { data, synced })));
+        // A crash ends the run a countdown was set for.
+        state.countdown = None;
+        crash_locked(&mut state, torn);
+    }
+
+    /// Crash on the `ops`-th mutating operation from now (appends, fsyncs,
+    /// creations, renames, links, removals, directory syncs): that operation
+    /// fails, and so does everything a process handle does after it.
+    pub fn crash_after(&self, ops: u64, torn: Torn) {
+        let mut state = self.state.lock();
+        state.countdown = Some(ops);
+        state.countdown_torn = Some(torn);
+    }
+
+    /// Whether a [`FaultFs::crash_after`] countdown has fired.
+    pub fn countdown_fired(&self) -> bool {
+        let state = self.state.lock();
+        state.countdown.is_none() && state.countdown_torn.is_some()
+    }
+
+    /// A handle for one process, dead after the next crash.
+    pub fn process(&self) -> FaultFs {
+        FaultFs {
+            state: self.state.clone(),
+            process: Some(self.state.lock().generation),
         }
-        state.live = survivors.clone();
-        state.durable = survivors;
+    }
+
+    /// Account for a mutating operation; fails if this handle's process is
+    /// dead or the countdown fires now.
+    fn tick(&self, state: &mut State) -> io::Result<()> {
+        if self.process.is_some_and(|g| g != state.generation) {
+            return Err(crashed());
+        }
+        tick_countdown(state)
     }
 
     /// The next `n` fsyncs fail with EIO (and make nothing durable).
@@ -389,6 +449,7 @@ impl Fs for FaultFs {
 
     fn create(&self, path: &Path) -> io::Result<Arc<dyn WritableFile>> {
         let mut state = self.state.lock();
+        self.tick(&mut state)?;
         let node: NodeRef = Arc::default();
         state.live.insert(path.to_path_buf(), node.clone());
         Ok(Arc::new(FaultFile {
@@ -422,6 +483,7 @@ impl Fs for FaultFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut state = self.state.lock();
+        self.tick(&mut state)?;
         let node = state
             .live
             .remove(from)
@@ -432,6 +494,7 @@ impl Fs for FaultFs {
 
     fn link(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut state = self.state.lock();
+        self.tick(&mut state)?;
         let node = state
             .live
             .get(from)
@@ -443,6 +506,7 @@ impl Fs for FaultFs {
 
     fn remove(&self, path: &Path) -> io::Result<()> {
         let mut state = self.state.lock();
+        self.tick(&mut state)?;
         state
             .live
             .remove(path)
@@ -452,6 +516,7 @@ impl Fs for FaultFs {
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         let mut state = self.state.lock();
+        self.tick(&mut state)?;
         let in_dir = |p: &PathBuf| p.parent() == Some(dir);
         state.durable.retain(|p, _| !in_dir(p));
         let entries: Vec<_> = state

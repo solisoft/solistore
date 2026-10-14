@@ -23,8 +23,12 @@ use crate::error::Result;
 use crate::iter::InternalIterator;
 use crate::key::{self, KeyRef, Kind, MemKey};
 
-/// Bookkeeping per entry, on top of key and value, for size accounting.
-const ENTRY_OVERHEAD: usize = 80;
+/// Memory an entry costs on top of its key and value bytes: the skiplist
+/// node (links, two `Bytes` handles), the allocation of the encoded key with
+/// its 12-byte prefix and trailer, and allocator rounding. Counting 80 here
+/// made a "64 MiB" memtable of SoliDB's small index entries hold ~90 MiB,
+/// and put peak RSS over RocksDB's, whose arenas count exactly.
+const ENTRY_OVERHEAD: usize = 176;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeTombstone {
