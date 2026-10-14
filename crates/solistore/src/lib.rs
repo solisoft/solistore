@@ -26,7 +26,7 @@ mod version;
 pub use batch::WriteBatch;
 pub use bytes::Bytes;
 pub use db::{
-    ColumnFamily, Db, Durability, Options, RecoveryReport, WriteOptions, MAX_GROUP_BYTES,
+    ColumnFamily, Db, Durability, Options, RecoveryReport, Stats, WriteOptions, MAX_GROUP_BYTES,
 };
 pub use error::{Error, Result};
 pub use iter::{DbIterator, Direction, IteratorMode, ReadOptions};

@@ -41,6 +41,8 @@ pub struct Config {
     pub level_base_bytes: u64,
     pub level_multiplier: u64,
     pub target_file_size: u64,
+    /// Ranges one compaction is split into and merged in parallel.
+    pub subcompactions: usize,
 }
 
 pub struct Compaction {
@@ -243,14 +245,111 @@ fn may_exist_below(version: &Version, output_level: usize, id: &[u8]) -> bool {
 /// Merge the inputs into new files for the output level. Each file is
 /// fsynced, then the directory. The outputs carry the highest tombstone
 /// sequence of `version` as their watermark.
+///
+/// The key space is split at input file boundaries into up to
+/// `cfg.subcompactions` ranges merged in parallel: a compaction from level 0
+/// rewrites most of level 1 and would otherwise run on one core while
+/// writers wait on it.
 pub fn run(
     compaction: &Compaction,
     version: &Version,
-    live_cf: &dyn Fn(u32) -> bool,
+    live_cf: &(dyn Fn(u32) -> bool + Sync),
     fs: &dyn Fs,
     dir: &Path,
     cfg: &Config,
-    mut allocate: impl FnMut() -> u64,
+    allocate: &(dyn Fn() -> u64 + Sync),
+) -> Result<Vec<(u64, TableProps)>> {
+    let ranges = split(compaction, cfg.subcompactions.max(1));
+    if ranges.len() == 1 {
+        return merge_range(
+            compaction, version, live_cf, fs, dir, cfg, allocate, None, None,
+        );
+    }
+    let results: Vec<Result<Vec<(u64, TableProps)>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|(lo, hi)| {
+                scope.spawn(move || {
+                    merge_range(
+                        compaction,
+                        version,
+                        live_cf,
+                        fs,
+                        dir,
+                        cfg,
+                        allocate,
+                        lo.as_deref(),
+                        hi.as_deref(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a subcompaction panicked"))
+            .collect()
+    });
+    let mut written: Vec<(u64, TableProps)> = Vec::new();
+    for result in results {
+        written.extend(result?);
+    }
+    // The ranges must partition the key space: outputs in order, disjoint.
+    // A bug here would silently break the level's sort order, so check.
+    for pair in written.windows(2) {
+        if key::cf_and_user_key(&pair[0].1.largest) >= key::cf_and_user_key(&pair[1].1.smallest) {
+            return Err(Error::Corruption("subcompaction outputs overlap".into()));
+        }
+    }
+    Ok(written)
+}
+
+type Range = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Up to `n` contiguous `cf ‖ user key` ranges covering every input, split
+/// at file boundaries so each range holds a similar number of files.
+fn split(compaction: &Compaction, n: usize) -> Vec<Range> {
+    let mut bounds: Vec<Vec<u8>> = compaction
+        .inputs
+        .iter()
+        .chain(&compaction.overlapping)
+        .map(|f| key::cf_and_user_key(&f.props.smallest).to_vec())
+        .collect();
+    bounds.sort();
+    bounds.dedup();
+    if n <= 1 || bounds.len() < 2 {
+        return vec![(None, None)];
+    }
+    // Skip the lowest bound: nothing sorts below it.
+    let candidates = &bounds[1..];
+    let parts = n.min(candidates.len() + 1);
+    let cuts: Vec<Vec<u8>> = (1..parts)
+        .map(|i| candidates[i * candidates.len() / parts].clone())
+        .collect();
+    let mut ranges = Vec::with_capacity(parts);
+    let mut lo = None;
+    for cut in cuts {
+        if lo.as_ref().is_some_and(|l: &Vec<u8>| *l >= cut) {
+            continue;
+        }
+        ranges.push((lo, Some(cut.clone())));
+        lo = Some(cut);
+    }
+    ranges.push((lo, None));
+    ranges
+}
+
+/// Merge the part of the inputs in `[lo, hi)` (`cf ‖ user key`).
+#[allow(clippy::too_many_arguments)]
+fn merge_range(
+    compaction: &Compaction,
+    version: &Version,
+    live_cf: &(dyn Fn(u32) -> bool + Sync),
+    fs: &dyn Fs,
+    dir: &Path,
+    cfg: &Config,
+    allocate: &(dyn Fn() -> u64 + Sync),
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
 ) -> Result<Vec<(u64, TableProps)>> {
     let mut children: Vec<Box<dyn InternalIterator>> = Vec::new();
     if compaction.level == 0 {
@@ -270,15 +369,22 @@ pub fn run(
         ));
     }
     let mut merged = MergingIterator::new(children);
-    merged.seek_ge(&key::first_of(0, b""));
+    match lo {
+        Some(lo) => merged.seek_ge(&key::first_of_id(lo)),
+        None => merged.seek_ge(&key::first_of(0, b"")),
+    }
 
     let watermark = version.tombstones.iter().map(|t| t.seq).max().unwrap_or(0);
     let mut out = OutputFiles::new(fs, dir, cfg.target_file_size, watermark);
+    let mut allocate = || allocate();
     let mut last_id: Vec<u8> = Vec::new();
     let mut have_last = false;
     while merged.valid() {
         let k = merged.key();
         let id = key::cf_and_user_key(k);
+        if hi.is_some_and(|hi| id >= hi) {
+            break;
+        }
         if have_last && id == last_id.as_slice() {
             merged.next();
             continue; // an older version of a key already handled

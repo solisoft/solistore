@@ -64,6 +64,14 @@ pub fn first_of(cf: u32, user_key: &[u8]) -> Vec<u8> {
     encode(cf, user_key, MAX_SEQ, Kind::Put)
 }
 
+/// Sorts before every version of the key whose `cf ‖ user key` is `id`.
+pub fn first_of_id(id: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(id.len() + TRAILER_LEN);
+    key.extend_from_slice(id);
+    key.extend_from_slice(&((MAX_SEQ << 8) | Kind::Put as u64).to_le_bytes());
+    key
+}
+
 /// Sorts after every version of `user_key`.
 pub fn last_of(cf: u32, user_key: &[u8]) -> Vec<u8> {
     encode(cf, user_key, 0, Kind::Delete)

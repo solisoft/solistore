@@ -11,7 +11,7 @@
 //! lookup can afford to scan them.
 
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -67,6 +67,9 @@ pub struct Version {
 pub struct Memtable {
     map: SkipMap<MemKey, Bytes>,
     tombstones: RwLock<Vec<RangeTombstone>>,
+    /// `tombstones` is not empty. Lets every point read skip the lock: a
+    /// read lock is a write to a shared cache line, on every get.
+    has_tombstones: AtomicBool,
     size: AtomicUsize,
     /// The highest sequence number inserted.
     max_seq: AtomicU64,
@@ -80,6 +83,7 @@ impl Memtable {
         Memtable {
             map: SkipMap::new(),
             tombstones: RwLock::new(Vec::new()),
+            has_tombstones: AtomicBool::new(false),
             size: AtomicUsize::new(0),
             max_seq: AtomicU64::new(0),
             first_wal,
@@ -95,18 +99,32 @@ impl Memtable {
         self.max_seq.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn insert(&self, cf: u32, key: &[u8], seq: u64, kind: Kind, value: &[u8]) {
-        self.max_seq.fetch_max(seq, Ordering::Relaxed);
-        self.size
-            .fetch_add(key.len() + value.len() + ENTRY_OVERHEAD, Ordering::Relaxed);
-        let key = MemKey(Bytes::from(key::encode(cf, key, seq, kind)));
-        self.map.insert(key, Bytes::copy_from_slice(value));
+        let bytes = self.insert_entry(cf, key, seq, kind, value);
+        self.account(bytes, seq);
+    }
+
+    /// Insert without updating the shared size and sequence counters;
+    /// returns the bytes to [`Memtable::account`] for. Writers inserting a
+    /// batch account once for all of it: eight writers bumping the same two
+    /// atomics for every entry would bounce their cache line between cores.
+    pub fn insert_entry(&self, cf: u32, key: &[u8], seq: u64, kind: Kind, value: &[u8]) -> usize {
+        let encoded = MemKey(Bytes::from(key::encode(cf, key, seq, kind)));
+        self.map.insert(encoded, Bytes::copy_from_slice(value));
+        key.len() + value.len() + ENTRY_OVERHEAD
+    }
+
+    pub fn account(&self, bytes: usize, max_seq: u64) {
+        self.size.fetch_add(bytes, Ordering::Relaxed);
+        self.max_seq.fetch_max(max_seq, Ordering::Relaxed);
     }
 
     pub fn insert_range_tombstone(&self, cf: u32, start: &[u8], end: &[u8], seq: u64) {
         self.max_seq.fetch_max(seq, Ordering::Relaxed);
         self.size
             .fetch_add(start.len() + end.len() + ENTRY_OVERHEAD, Ordering::Relaxed);
+        self.has_tombstones.store(true, Ordering::Release);
         self.tombstones.write().push(RangeTombstone {
             cf,
             start: Bytes::copy_from_slice(start),
@@ -121,7 +139,7 @@ impl Memtable {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty() && self.tombstones.read().is_empty()
+        self.map.is_empty() && !self.has_tombstones.load(Ordering::Acquire)
     }
 
     /// The newest version of `key` with a sequence number at most `snapshot`.
@@ -137,10 +155,16 @@ impl Memtable {
     }
 
     pub fn tombstones(&self) -> Vec<RangeTombstone> {
+        if !self.has_tombstones.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         self.tombstones.read().clone()
     }
 
     pub fn range_tombstone_seq(&self, cf: u32, key: &[u8], snapshot: u64) -> u64 {
+        if !self.has_tombstones.load(Ordering::Acquire) {
+            return 0;
+        }
         covering_seq(self.tombstones.read().iter(), cf, key, snapshot)
     }
 

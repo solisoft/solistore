@@ -93,6 +93,8 @@ pub struct Options {
     /// Target size of level 1; each deeper level is `level_multiplier` times larger.
     pub max_bytes_for_level_base: u64,
     pub level_multiplier: u64,
+    /// Ranges a compaction is split into and merged in parallel.
+    pub max_subcompactions: usize,
     /// Bytes of decoded data blocks kept in memory, shared by every table.
     pub block_cache_size: u64,
 }
@@ -112,6 +114,7 @@ impl Default for Options {
             level0_stop_trigger: 36,
             max_bytes_for_level_base: 512 << 20,
             level_multiplier: 10,
+            max_subcompactions: 4,
             block_cache_size: 512 << 20,
         }
     }
@@ -132,6 +135,7 @@ impl fmt::Debug for Options {
             .field("level0_stop_trigger", &self.level0_stop_trigger)
             .field("max_bytes_for_level_base", &self.max_bytes_for_level_base)
             .field("level_multiplier", &self.level_multiplier)
+            .field("max_subcompactions", &self.max_subcompactions)
             .field("block_cache_size", &self.block_cache_size)
             .finish()
     }
@@ -142,6 +146,53 @@ pub struct WriteOptions {
     /// Wait for this write's fsync even in [`Durability::Eventual`]. Always
     /// the case in [`Durability::Full`].
     pub sync: bool,
+}
+
+/// Counters since the database was opened: where writers waited, and how
+/// much work the background did. A snapshot; see [`Db::stats`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Commit groups and the batches they carried.
+    pub commit_groups: u64,
+    pub committed_batches: u64,
+    pub wal_fsyncs: u64,
+    /// Groups delayed 1 ms because level 0 passed the slowdown trigger.
+    pub l0_slowdowns: u64,
+    /// Microseconds writers were stopped by level 0 at the stop trigger.
+    pub l0_stop_micros: u64,
+    /// Microseconds writers waited for a flush because too many sealed
+    /// memtables were queued.
+    pub memtable_wait_micros: u64,
+    pub flushes: u64,
+    pub flushed_bytes: u64,
+    pub compactions: u64,
+    pub compaction_read_bytes: u64,
+    pub compaction_written_bytes: u64,
+    pub compaction_micros: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    commit_groups: AtomicU64,
+    committed_batches: AtomicU64,
+    wal_fsyncs: AtomicU64,
+    l0_slowdowns: AtomicU64,
+    l0_stop_micros: AtomicU64,
+    memtable_wait_micros: AtomicU64,
+    flushes: AtomicU64,
+    flushed_bytes: AtomicU64,
+    compactions: AtomicU64,
+    compaction_read_bytes: AtomicU64,
+    compaction_written_bytes: AtomicU64,
+    compaction_micros: AtomicU64,
+}
+
+fn add(counter: &AtomicU64, n: u64) {
+    counter.fetch_add(n, Ordering::Relaxed);
+}
+
+fn micros_since(start: Instant) -> u64 {
+    start.elapsed().as_micros() as u64
 }
 
 /// What opening the database found in its logs.
@@ -270,6 +321,7 @@ struct Inner {
     bg: Mutex<Background>,
     bg_cv: Condvar,
     recovery: RecoveryReport,
+    counters: Counters,
     _lock: Box<dyn Send + Sync>,
 }
 
@@ -500,6 +552,7 @@ impl Db {
                 level_base_bytes: opts.max_bytes_for_level_base.max(1),
                 level_multiplier: opts.level_multiplier.max(2),
                 target_file_size: opts.target_file_size.max(1),
+                subcompactions: opts.max_subcompactions.max(1),
             },
             l0_slowdown: opts.level0_slowdown_trigger.max(1),
             l0_stop: opts
@@ -534,6 +587,7 @@ impl Db {
             bg: Mutex::new(Background::default()),
             bg_cv: Condvar::new(),
             recovery,
+            counters: Counters::default(),
             _lock: lock,
         });
 
@@ -579,6 +633,25 @@ impl Db {
 
     pub fn recovery_report(&self) -> &RecoveryReport {
         &self.inner().recovery
+    }
+
+    pub fn stats(&self) -> Stats {
+        let c = &self.inner().counters;
+        let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        Stats {
+            commit_groups: get(&c.commit_groups),
+            committed_batches: get(&c.committed_batches),
+            wal_fsyncs: get(&c.wal_fsyncs),
+            l0_slowdowns: get(&c.l0_slowdowns),
+            l0_stop_micros: get(&c.l0_stop_micros),
+            memtable_wait_micros: get(&c.memtable_wait_micros),
+            flushes: get(&c.flushes),
+            flushed_bytes: get(&c.flushed_bytes),
+            compactions: get(&c.compactions),
+            compaction_read_bytes: get(&c.compaction_read_bytes),
+            compaction_written_bytes: get(&c.compaction_written_bytes),
+            compaction_micros: get(&c.compaction_micros),
+        }
     }
 
     /// Memory held by the memtables, approximately.
@@ -945,6 +1018,15 @@ impl Drop for Handle {
     }
 }
 
+/// Runs a closure when dropped: time an early-returning block.
+struct Defer<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}
+
 /// A structural change: its MANIFEST edits, the super version it leads to,
 /// and the table files it removes.
 struct VersionChange {
@@ -986,18 +1068,24 @@ fn tidy(change: &mut VersionChange) {
 
 /// Apply decoded ops to a memtable, numbering them from `first_seq`.
 fn apply(mem: &Memtable, ops: Vec<BatchOp<'_>>, first_seq: u64, live: impl Fn(u32) -> bool) {
+    let mut bytes = 0;
+    let mut last = 0;
     for (seq, op) in (first_seq..).zip(ops) {
         match op {
             BatchOp::Put { cf, key, value } if live(cf) => {
-                mem.insert(cf, key, seq, Kind::Put, value)
+                bytes += mem.insert_entry(cf, key, seq, Kind::Put, value)
             }
-            BatchOp::Delete { cf, key } if live(cf) => mem.insert(cf, key, seq, Kind::Delete, b""),
+            BatchOp::Delete { cf, key } if live(cf) => {
+                bytes += mem.insert_entry(cf, key, seq, Kind::Delete, b"")
+            }
             BatchOp::DeleteRange { cf, start, end } if live(cf) => {
                 mem.insert_range_tombstone(cf, start, end, seq)
             }
             _ => {} // a column family dropped before the crash
         }
+        last = seq;
     }
+    mem.account(bytes, last);
 }
 
 impl Inner {
@@ -1171,7 +1259,10 @@ impl Inner {
 
         let sync = self.durability == Durability::Full || group.iter().any(|p| p.sync);
         self.io(|| Ok(wal.file.append(buf)?))?;
+        add(&self.counters.commit_groups, 1);
+        add(&self.counters.committed_batches, group.len() as u64);
         if sync {
+            add(&self.counters.wal_fsyncs, 1);
             self.io(|| Ok(wal.file.sync()?))?;
         } else {
             wal.dirty.store(true, Ordering::Release);
@@ -1231,6 +1322,8 @@ impl Inner {
     fn throttle(&self) -> Result<()> {
         let l0 = self.sv.load().version.levels[0].len();
         if l0 >= self.l0_stop {
+            let start = Instant::now();
+            let _count = Defer(|| add(&self.counters.l0_stop_micros, micros_since(start)));
             let mut bg = self.bg.lock();
             while self.sv.load().version.levels[0].len() >= self.l0_stop {
                 self.check()?;
@@ -1243,6 +1336,7 @@ impl Inner {
                 self.bg_cv.wait(&mut bg);
             }
         } else if l0 >= self.l0_slowdown {
+            add(&self.counters.l0_slowdowns, 1);
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(())
@@ -1252,6 +1346,8 @@ impl Inner {
     /// commit lock held. Waits while too many memtables are waiting to flush.
     fn switch_memtable(&self, commit: &mut CommitState) -> Result<()> {
         {
+            let start = Instant::now();
+            let _count = Defer(|| add(&self.counters.memtable_wait_micros, micros_since(start)));
             let mut bg = self.bg.lock();
             while self.sv.load().imms.len() >= self.max_imms {
                 self.check()?;
@@ -1389,6 +1485,11 @@ impl Inner {
             || self.allocate_file(),
         )?;
 
+        add(&self.counters.flushes, 1);
+        add(
+            &self.counters.flushed_bytes,
+            files.iter().map(|(_, p)| p.size).sum(),
+        );
         let tables: Vec<Arc<TableFile>> = files
             .iter()
             .map(|(number, props)| {
@@ -1481,6 +1582,7 @@ impl Inner {
     /// lock held. If the inputs changed meanwhile (a range delete dropped
     /// one), the result is discarded.
     fn compact(&self, c: &compaction::Compaction, version: &Version) -> Result<()> {
+        let start = Instant::now();
         let output_level = c.output_level;
         let outputs = if c.is_trivial_move() {
             Vec::new()
@@ -1493,7 +1595,7 @@ impl Inner {
                 self.fs.as_ref(),
                 &self.dir,
                 &self.compaction,
-                || self.allocate_file(),
+                &|| self.allocate_file(),
             )?
         };
         let new_tables: Vec<Arc<TableFile>> = if c.is_trivial_move() {
@@ -1555,6 +1657,18 @@ impl Inner {
             },
             || {},
         )?;
+        add(&self.counters.compactions, 1);
+        add(&self.counters.compaction_micros, micros_since(start));
+        if !c.is_trivial_move() {
+            add(
+                &self.counters.compaction_read_bytes,
+                c.all_inputs().map(|(_, f)| f.props.size).sum(),
+            );
+            add(
+                &self.counters.compaction_written_bytes,
+                outputs.iter().map(|(_, p)| p.size).sum(),
+            );
+        }
         if !applied {
             for (number, _) in &outputs {
                 self.fs.remove(&self.dir.join(table_name(*number))).ok();

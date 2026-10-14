@@ -66,7 +66,14 @@ trait Engine: Send + Sync {
     fn scan_keys(&self, coll: u32, start: &[u8], end: &[u8], rev: bool, limit: usize) -> Vec<Vec<u8>>;
     /// Make everything durable.
     fn flush(&self);
+    /// Engine counters as a JSON object, printed with every phase.
+    fn stats(&self) -> String {
+        String::new()
+    }
 }
+
+/// The engine whose counters each phase line carries.
+static STATS_SOURCE: std::sync::Mutex<Option<Arc<dyn Engine>>> = std::sync::Mutex::new(None);
 
 fn prefixed(coll: u32, key: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + key.len());
@@ -353,6 +360,33 @@ mod soli {
 
         fn flush(&self) {
             self.db.flush().unwrap();
+        }
+
+        fn stats(&self) -> String {
+            let s = self.db.stats();
+            format!(
+                concat!(
+                    r#"{{"groups":{},"batches":{},"fsyncs":{},"l0_slowdowns":{},"l0_stop_ms":{},"#,
+                    r#""memtable_wait_ms":{},"flushes":{},"flushed_mb":{},"compactions":{},"#,
+                    r#""compaction_read_mb":{},"compaction_written_mb":{},"compaction_ms":{},"#,
+                    r#""files_per_level":{:?},"block_cache_mb":{},"memtable_mb":{}}}"#
+                ),
+                s.commit_groups,
+                s.committed_batches,
+                s.wal_fsyncs,
+                s.l0_slowdowns,
+                s.l0_stop_micros / 1000,
+                s.memtable_wait_micros / 1000,
+                s.flushes,
+                s.flushed_bytes >> 20,
+                s.compactions,
+                s.compaction_read_bytes >> 20,
+                s.compaction_written_bytes >> 20,
+                s.compaction_micros / 1000,
+                self.db.files_per_level(),
+                self.db.block_cache_usage() >> 20,
+                self.db.memtable_bytes() >> 20,
+            )
         }
     }
 }
@@ -656,7 +690,11 @@ impl<'a> Phase<'a> {
             mb(after.read_bytes.saturating_sub(before.read_bytes)),
             mb(self.logical_bytes),
             write_amp,
-            self.extra
+            {
+                let stats = STATS_SOURCE.lock().unwrap().as_ref().map(|e| e.stats()).unwrap_or_default();
+                let stats = if stats.is_empty() { String::new() } else { format!(r#","engine_stats":{stats}"#) };
+                format!("{}{stats}", self.extra)
+            }
         );
         std::io::stdout().flush().ok();
     }
@@ -764,6 +802,7 @@ fn index_scan(engine: &dyn Engine, p: &Params, rng: &mut StdRng, rev: bool) {
 fn run(p: Params) {
     std::fs::create_dir_all(&p.dir).unwrap();
     let engine: Arc<dyn Engine> = Arc::from(open_engine(&p));
+    *STATS_SOURCE.lock().unwrap() = Some(engine.clone());
 
     // ~1,232 collections exist.
     let before = counters();
@@ -949,6 +988,7 @@ fn run(p: Params) {
     let before = counters();
     let (tx, rx) = std::sync::mpsc::channel();
     let reopen_params = p.clone();
+    STATS_SOURCE.lock().unwrap().take();
     std::thread::spawn(move || {
         let close_start = Instant::now();
         drop(engine);
