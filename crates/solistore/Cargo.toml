@@ -19,6 +19,10 @@ parking_lot = "0.12"
 quick_cache = { version = "0.6", default-features = false, features = ["parking_lot"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+# sync_file_range for incremental table write-back: bindings only, no C build.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 proptest = "1"
 rand = "0.8"

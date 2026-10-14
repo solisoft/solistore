@@ -22,6 +22,13 @@ pub trait WritableFile: Send + Sync {
     fn append(&self, data: &[u8]) -> io::Result<()>;
     /// Make every appended byte durable (`fdatasync`).
     fn sync(&self) -> io::Result<()>;
+    /// Start writing `[offset, offset + len)` back to the device without
+    /// waiting for it, and without the journal flush an fsync costs
+    /// (`sync_file_range(SYNC_FILE_RANGE_WRITE)` on Linux, RocksDB's
+    /// `bytes_per_sync`). A large file then reaches the disk as it is
+    /// written instead of in one burst at its final fsync. A no-op where
+    /// the platform has nothing like it.
+    fn start_writeback(&self, _offset: u64, _len: u64) {}
 }
 
 /// A file read at arbitrary offsets by any number of threads (`pread`).
@@ -69,6 +76,22 @@ impl WritableFile for StdFile {
 
     fn sync(&self) -> io::Result<()> {
         self.0.sync_data()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_writeback(&self, offset: u64, len: u64) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a plain syscall on a file descriptor this struct owns; it
+        // reads no memory. A failure only means less smoothing, so it is
+        // ignored.
+        unsafe {
+            libc::sync_file_range(
+                self.0.as_raw_fd(),
+                offset as _,
+                len as _,
+                libc::SYNC_FILE_RANGE_WRITE,
+            );
+        }
     }
 }
 
