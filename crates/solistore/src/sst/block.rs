@@ -28,6 +28,54 @@ pub struct BlockBuilder {
     last_key: Vec<u8>,
 }
 
+/// Length of the common prefix of `a` and `b`, compared eight bytes at a
+/// time.
+#[inline]
+fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = u64::from_le_bytes(a[i..i + 8].try_into().expect("8 bytes"))
+            ^ u64::from_le_bytes(b[i..i + 8].try_into().expect("8 bytes"));
+        if x != 0 {
+            return i + (x.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// Decode an entry header (`shared`, `unshared`, `value_len`), returning it
+/// with the header's length. Keys in SoliDB's layout are short, so `shared`
+/// and `unshared` take one byte and `value_len` one or two; those cases skip
+/// the general varint loop.
+#[inline]
+fn entry_header(input: &[u8]) -> Option<(usize, usize, usize, usize)> {
+    if input.len() >= 4 && input[0] < 0x80 && input[1] < 0x80 {
+        let (shared, unshared) = (input[0] as usize, input[1] as usize);
+        if input[2] < 0x80 {
+            return Some((shared, unshared, input[2] as usize, 3));
+        }
+        if input[3] < 0x80 {
+            let value_len = (input[2] & 0x7f) as usize | (input[3] as usize) << 7;
+            return Some((shared, unshared, value_len, 4));
+        }
+    }
+    let mut rest = input;
+    let shared = get_varint(&mut rest)?;
+    let unshared = get_varint(&mut rest)?;
+    let value_len = get_varint(&mut rest)?;
+    Some((
+        usize::try_from(shared).ok()?,
+        usize::try_from(unshared).ok()?,
+        usize::try_from(value_len).ok()?,
+        input.len() - rest.len(),
+    ))
+}
+
 impl BlockBuilder {
     pub fn new(interval: usize) -> Self {
         BlockBuilder {
@@ -42,11 +90,7 @@ impl BlockBuilder {
     /// Keys must be added in order.
     pub fn add(&mut self, key: &[u8], value: &[u8]) {
         let shared = if self.counter < self.interval {
-            self.last_key
-                .iter()
-                .zip(key)
-                .take_while(|(a, b)| a == b)
-                .count()
+            shared_prefix(&self.last_key, key)
         } else {
             self.restarts.push(self.buf.len() as u32);
             self.counter = 0;
@@ -124,6 +168,19 @@ impl Block {
         u32::from_le_bytes(self.data[at..at + 4].try_into().expect("4 bytes")) as usize
     }
 
+    /// The key stored whole at restart point `i`, read in place; `None` if
+    /// the entry is malformed.
+    fn restart_key(&self, i: usize) -> Option<&[u8]> {
+        let data = &self.data[..self.restarts];
+        let at = self.restart_point(i);
+        let (shared, unshared, _, header) = entry_header(data.get(at..)?)?;
+        if shared != 0 {
+            return None;
+        }
+        let start = at.checked_add(header)?;
+        data.get(start..start.checked_add(unshared)?)
+    }
+
     pub fn iter(&self) -> BlockIter {
         BlockIter {
             block: self.clone(),
@@ -131,7 +188,6 @@ impl Block {
             next_offset: self.restarts,
             key: Vec::new(),
             value: (0, 0),
-            restart: 0,
             corrupt: false,
         }
     }
@@ -145,8 +201,6 @@ pub struct BlockIter {
     next_offset: usize,
     key: Vec<u8>,
     value: (usize, usize),
-    /// The restart interval holding the current entry.
-    restart: usize,
     corrupt: bool,
 }
 
@@ -184,20 +238,10 @@ impl BlockIter {
             return false;
         }
         let data = &self.block.data[..self.block.restarts];
-        let mut input = &data[self.offset..];
-        let header = (|| {
-            Some((
-                get_varint(&mut input)?,
-                get_varint(&mut input)?,
-                get_varint(&mut input)?,
-            ))
-        })();
-        let Some((shared, unshared, value_len)) = header else {
+        let Some((shared, unshared, value_len, header)) = entry_header(&data[self.offset..]) else {
             return self.fail();
         };
-        let (shared, unshared, value_len) =
-            (shared as usize, unshared as usize, value_len as usize);
-        let key_start = data.len() - input.len();
+        let key_start = self.offset + header;
         let Some(value_end) = key_start
             .checked_add(unshared)
             .and_then(|v| v.checked_add(value_len))
@@ -212,11 +256,6 @@ impl BlockIter {
             .extend_from_slice(&data[key_start..key_start + unshared]);
         self.value = (key_start + unshared, value_end);
         self.next_offset = value_end;
-        while self.restart + 1 < self.block.num_restarts
-            && self.block.restart_point(self.restart + 1) <= self.offset
-        {
-            self.restart += 1;
-        }
         true
     }
 
@@ -228,7 +267,6 @@ impl BlockIter {
 
     fn seek_to_restart(&mut self, i: usize) {
         self.key.clear();
-        self.restart = i;
         self.next_offset = self.block.restart_point(i);
     }
 
@@ -250,31 +288,37 @@ impl BlockIter {
     pub fn prev(&mut self) {
         debug_assert!(self.valid());
         let current = self.offset;
-        // Back to the restart point before the current entry, then forward
-        // to the entry just before it.
-        let mut r = self.restart;
-        while self.block.restart_point(r) >= current {
-            if r == 0 {
-                self.invalidate();
-                return;
+        // Back to the last restart point before the current entry, then
+        // forward to the entry just before it.
+        let (mut lo, mut hi) = (0, self.block.num_restarts);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.block.restart_point(mid) < current {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
-            r -= 1;
         }
-        self.seek_to_restart(r);
+        if lo == 0 {
+            self.invalidate();
+            return;
+        }
+        self.seek_to_restart(lo - 1);
         while self.parse_next() && self.next_offset < current {}
     }
 
     /// The first entry with a key at or after `target`.
     pub fn seek(&mut self, target: &[u8]) {
-        // Last restart point whose key is before `target`.
+        // Last restart point whose key is before `target`, comparing the
+        // restart keys where they lie in the block.
         let (mut left, mut right) = (0, self.block.num_restarts - 1);
         while left < right {
             let mid = (left + right).div_ceil(2);
-            self.seek_to_restart(mid);
-            if !self.parse_next() {
+            let Some(restart_key) = self.block.restart_key(mid) else {
+                self.fail();
                 return;
-            }
-            if key::compare(&self.key, target) == Ordering::Less {
+            };
+            if key::compare(restart_key, target) == Ordering::Less {
                 left = mid;
             } else {
                 right = mid - 1;
