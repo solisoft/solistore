@@ -39,7 +39,7 @@ Surveyed in `~/Work/soli/db` (file:line references are to that tree):
   | `prefix_iterator` without extractor (= seek, caller stops) | `From(prefix, Forward)` |
   | checkpoint (`POST /_api/backup`) | `checkpoint` (hard links) |
   | memtable / table-reader / block-cache / files-per-level properties | `memtable_bytes`, `table_readers_bytes`, `block_cache_usage`, `files_per_level` |
-  | `get_approximate_sizes_cf` (keyspace disk usage) | **missing**: add `approximate_size(cf, range)` |
+  | `get_approximate_sizes_cf` (keyspace disk usage) | `approximate_size(cf, start, end)` |
   | `set_readahead_size` | no-op (pread); revisit if scans need it |
   | `delete_file_in_range_cf` (migration only) | not needed |
 
@@ -62,6 +62,14 @@ Surveyed in `~/Work/soli/db` (file:line references are to that tree):
 ## Steps
 
 ### S1 — A storage interface in SoliDB, RocksDB behind it (no behaviour change)
+
+**Done** on SoliDB's `feat/storage-kv` branch: `storage::kv::Kv` is an
+enum-dispatched engine with RocksDB's method names and SoliDB's own types
+(`KvCf`, `KvBatch`, `KvIter`, `KvError`, read and write options), and the
+`RocksDb` alias names it. RocksDB is configured and opened in
+`storage/kv/rocks.rs`; `rust_rocksdb` is named nowhere else outside tests of
+the 1.x layout. A trait was not needed: a closed enum keeps every call
+statically dispatched.
 
 New module `storage::kv`, owned by SoliDB:
 
@@ -95,11 +103,15 @@ Estimate: the largest step. ~30 files, mostly mechanical; the 130
 ### S2 — solistore behind a feature, chosen per data directory
 
 - `storage/kv/solistore.rs`: `Kv` over `solistore::Db`, behind a cargo
-  feature `engine-solistore` (path dependency on `../store` for now, crates.io
-  once published).
-- Missing in solistore, to add first: `approximate_size(cf, range)`, a
-  read-only open (for the migration tool), and the `EngineProfile` knobs
-  (prod/dev sizes) mapped onto `Options`.
+  feature `engine-solistore` (git dependency on
+  github.com/solisoft/solistore, crates.io once published).
+- Missing in solistore: a read-only open (for the migration tool), and the
+  `EngineProfile` knobs (prod/dev sizes) mapped onto `Options`.
+  `approximate_size` is done.
+- In SoliDB: `KvBatch::default()` cannot know its engine, so a batch takes
+  its engine from the first column family written to it. Memory metrics
+  move to a database-wide `Kv::metrics()`: solistore's figures are not
+  per column family.
 - The engine is recorded in the data directory (`ENGINE` file); a
   directory is opened with the engine that wrote it, so a binary with both
   can serve either. `--engine solistore` selects it for a new directory.
