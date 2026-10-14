@@ -1,0 +1,6 @@
+{"ops":1000000,"ops_per_sec":310066.0,"p50_us":154,"p999_us":1124,"p99_us":1047,"phase":"insert","secs":3.225123049}
+{"ops":11438052,"ops_per_sec":762115.0,"p50_us":80,"p999_us":508,"p99_us":166,"phase":"get","secs":15.008295334}
+{"ops":3155244,"ops_per_sec":210300.0,"p50_us":247,"p999_us":1870,"p99_us":1242,"phase":"update","secs":15.003546698}
+{"ops":2190796,"ops_per_sec":146035.0,"p50_us":391,"p999_us":1957,"p99_us":1246,"phase":"query_index","secs":15.001830362}
+{"ops":36840,"ops_per_sec":2451.0,"p50_us":24520,"p999_us":91878,"p99_us":66058,"phase":"query_range","secs":15.027597894}
+{"ops":8719383,"ops_per_sec":581114.0,"p50_us":97,"p999_us":792,"p99_us":665,"phase":"mixed_90_10","secs":15.004610627}

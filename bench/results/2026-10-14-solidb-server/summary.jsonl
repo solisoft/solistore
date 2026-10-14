@@ -1,0 +1,6 @@
+{"engine":"rocksdb","rep":1,"hwm_kb":1126816,"rss_kb":748756,"disk_kb":431452,"reopen_s":0.052,"engine_file":"rocksdb"}
+{"engine":"solistore","rep":1,"hwm_kb":1149020,"rss_kb":835808,"disk_kb":379088,"reopen_s":0.052,"engine_file":"solistore"}
+{"engine":"rocksdb","rep":2,"hwm_kb":1128236,"rss_kb":754216,"disk_kb":434832,"reopen_s":0.052,"engine_file":"rocksdb"}
+{"engine":"solistore","rep":2,"hwm_kb":1148736,"rss_kb":842940,"disk_kb":311256,"reopen_s":0.052,"engine_file":"solistore"}
+{"engine":"rocksdb","rep":3,"hwm_kb":1116792,"rss_kb":745744,"disk_kb":421868,"reopen_s":0.052,"engine_file":"rocksdb"}
+{"engine":"solistore","rep":3,"hwm_kb":1139688,"rss_kb":859504,"disk_kb":311240,"reopen_s":0.052,"engine_file":"solistore"}
