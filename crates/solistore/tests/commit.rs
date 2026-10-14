@@ -400,18 +400,27 @@ fn compaction_moves_data_down_and_keeps_every_key() {
         keys,
         (0..n).filter(|i| !i.is_multiple_of(5)).collect::<Vec<_>>()
     );
-    // Every file on disk is live: compaction inputs were deleted.
-    let on_disk = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".sst")
-        })
-        .count();
-    assert_eq!(on_disk, db.files_per_level().iter().sum::<usize>());
+    // Every file on disk is live: compaction inputs were deleted. The
+    // reopened database may be compacting (its outputs are on disk before
+    // they are live), so wait for the two to agree; a leaked file never does.
+    let on_disk = || {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".sst")
+            })
+            .count()
+    };
+    let live = || db.files_per_level().iter().sum::<usize>();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while on_disk() != live() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(on_disk(), live());
 }
 
 /// A collection is a key prefix in a shared column family; dropping it is
