@@ -201,6 +201,8 @@ pub struct Stats {
     pub compaction_read_bytes: u64,
     pub compaction_written_bytes: u64,
     pub compaction_micros: u64,
+    /// The most bytes one WAL received before it was rotated.
+    pub largest_wal_bytes: u64,
 }
 
 #[derive(Default)]
@@ -217,6 +219,7 @@ struct Counters {
     compaction_read_bytes: AtomicU64,
     compaction_written_bytes: AtomicU64,
     compaction_micros: AtomicU64,
+    largest_wal_bytes: AtomicU64,
 }
 
 fn add(counter: &AtomicU64, n: u64) {
@@ -380,6 +383,8 @@ struct WalFile {
     number: u64,
     /// Written since its last fsync.
     dirty: AtomicBool,
+    /// Bytes appended to this WAL.
+    written: AtomicU64,
 }
 
 /// The leader's working state. Only the current leader locks it (and a
@@ -583,6 +588,7 @@ impl Db {
             file: wal_file,
             number: wal_no,
             dirty: AtomicBool::new(false),
+            written: AtomicU64::new(0),
         });
         let inner = Arc::new(Inner {
             dir,
@@ -703,6 +709,7 @@ impl Db {
             compaction_read_bytes: get(&c.compaction_read_bytes),
             compaction_written_bytes: get(&c.compaction_written_bytes),
             compaction_micros: get(&c.compaction_micros),
+            largest_wal_bytes: get(&c.largest_wal_bytes),
         }
     }
 
@@ -1355,6 +1362,7 @@ impl Inner {
 
         let sync = self.durability == Durability::Full || group.iter().any(|p| p.sync);
         self.io(|| Ok(wal.file.append(buf)?))?;
+        wal.written.fetch_add(buf.len() as u64, Ordering::Relaxed);
         add(&self.counters.commit_groups, 1);
         add(&self.counters.committed_batches, group.len() as u64);
         if sync {
@@ -1461,6 +1469,10 @@ impl Inner {
         // Everything in the old WAL must be durable before anything lands in
         // the new one: a crash may not keep a later write and lose an
         // earlier one.
+        let written = commit.wal.written.load(Ordering::Relaxed);
+        self.counters
+            .largest_wal_bytes
+            .fetch_max(written, Ordering::Relaxed);
         // The old WAL is closed with an end record, so its reused file's old
         // bytes are not mistaken for a torn write when it is replayed.
         let mut end = Vec::new();
@@ -1489,6 +1501,7 @@ impl Inner {
             file,
             number,
             dirty: AtomicBool::new(false),
+            written: AtomicU64::new(0),
         });
         commit.wal = wal.clone();
         *self.current_wal.lock() = wal;
