@@ -43,7 +43,7 @@ Surveyed in `~/Work/soli/db` (file:line references are to that tree):
   | `set_readahead_size` | no-op (pread); revisit if scans need it |
   | `delete_file_in_range_cf` (migration only) | not needed |
 
-## Two decisions to take first
+## Two decisions (taken 2026-10-14: Eventual 100 ms; refuse the 1.x layout)
 
 1. **Durability.** SoliDB writes with `sync = false` today, except
    transaction commits. solistore's default is an fsync per commit
