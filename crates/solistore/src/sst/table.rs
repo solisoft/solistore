@@ -119,7 +119,7 @@ impl TableBuilder {
         }
     }
 
-    #[cfg(test)]
+    /// Leave data blocks uncompressed.
     pub fn uncompressed(mut self) -> Self {
         self.compress = false;
         self

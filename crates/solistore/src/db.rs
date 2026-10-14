@@ -137,7 +137,10 @@ impl Default for Options {
             max_background_jobs: 6,
             block_cache_size: 512 << 20,
             bytes_per_sync: 0,
-            recycle_wal_files: 3,
+            // One spare, where RocksDB in SoliDB's profile keeps three: a
+            // reused file keeps the largest size it ever reached, and three of
+            // them came to ~300 MB on the benchmark's disk measure.
+            recycle_wal_files: 1,
         }
     }
 }

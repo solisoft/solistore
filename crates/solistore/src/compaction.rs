@@ -487,6 +487,7 @@ pub struct OutputFiles<'a> {
     last_cf: Option<u32>,
     written: Vec<(u64, TableProps)>,
     writeback: bool,
+    compress: bool,
 }
 
 impl<'a> OutputFiles<'a> {
@@ -510,6 +511,7 @@ impl<'a> OutputFiles<'a> {
             last_cf: None,
             written: Vec::new(),
             writeback,
+            compress: true,
         }
     }
 
@@ -529,11 +531,16 @@ impl<'a> OutputFiles<'a> {
         }
         if self.current.is_none() {
             let number = allocate();
-            self.current = Some((
-                number,
-                TableBuilder::new(self.fs.create(&self.dir.join(table_name(number)))?)
-                    .with_writeback(self.writeback),
-            ));
+            self.current = Some((number, {
+                let builder =
+                    TableBuilder::new(self.fs.create(&self.dir.join(table_name(number)))?)
+                        .with_writeback(self.writeback);
+                if self.compress {
+                    builder
+                } else {
+                    builder.uncompressed()
+                }
+            }));
         }
         self.last_cf = Some(cf);
         self.current.as_mut().expect("just set").1.add(key, value)
@@ -546,6 +553,15 @@ impl<'a> OutputFiles<'a> {
             self.written.push((number, props));
         }
         Ok(())
+    }
+
+    /// Write tables uncompressed. Tried for level 0 (2026-10-14): twice
+    /// the bytes for compaction to read, which cost more than the
+    /// compression saved (results/2026-10-14-l0raw).
+    #[allow(dead_code)]
+    pub fn uncompressed(mut self) -> Self {
+        self.compress = false;
+        self
     }
 
     /// Close the last file and sync the directory.

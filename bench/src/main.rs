@@ -372,7 +372,7 @@ mod soli {
                     r#"{{"groups":{},"batches":{},"fsyncs":{},"l0_slowdowns":{},"l0_stop_ms":{},"#,
                     r#""memtable_wait_ms":{},"flushes":{},"flushed_mb":{},"compactions":{},"#,
                     r#""compaction_read_mb":{},"compaction_written_mb":{},"compaction_ms":{},"#,
-                    r#""files_per_level":{:?},"block_cache_mb":{},"memtable_mb":{}}}"#
+                    r#""files_per_level":{:?},"block_cache_mb":{},"memtable_mb":{},"table_mb":{}}}"#
                 ),
                 s.commit_groups,
                 s.committed_batches,
@@ -389,6 +389,7 @@ mod soli {
                 self.db.files_per_level(),
                 self.db.block_cache_usage() >> 20,
                 self.db.memtable_bytes() >> 20,
+                self.db.live_table_bytes() >> 20,
             )
         }
     }
