@@ -244,6 +244,10 @@ pub struct RecoveryReport {
     pub discarded_bytes: u64,
     /// Table files no MANIFEST named (a flush cut short), deleted.
     pub orphan_tables: usize,
+    /// WALs not replayed, and deleted, because an earlier WAL lost writes
+    /// they come after (see `log`): replaying them would keep a later write
+    /// and lose an earlier one.
+    pub dropped_wal_files: usize,
 }
 
 // ---------------------------------------------------------------- column families
@@ -552,9 +556,14 @@ impl Db {
         for t in &state.tombstones {
             last_seq = last_seq.max(t.seq);
         }
-        for &no in &wals {
+        let mut cut = None;
+        for (i, &no) in wals.iter().enumerate() {
             let data = fs.read(&dir.join(wal_name(no)))?;
             let log = read_records(&data, file_no_u32(no)?);
+            if log.prev_last_seq.is_some_and(|prev| prev > last_seq) {
+                cut = Some(i);
+                break;
+            }
             recovery.wal_files += 1;
             recovery.discarded_bytes += log.discarded as u64;
             for record in log.records {
@@ -568,9 +577,25 @@ impl Db {
             }
         }
 
+        // Point-in-time: what follows a WAL that lost writes is dropped, and
+        // its files deleted before anything new is written, so that a later
+        // recovery does not stop there again and drop this run's writes.
+        if let Some(i) = cut {
+            for &no in &wals[i..] {
+                let path = dir.join(wal_name(no));
+                recovery.discarded_bytes += fs.read(&path).map(|d| d.len() as u64).unwrap_or(0);
+                fs.remove(&path)?;
+                recovery.dropped_wal_files += 1;
+            }
+            wals.truncate(i);
+        }
+
         // The MANIFEST's install syncs the directory, which makes the new
-        // WAL's name durable too.
+        // WAL's name durable too, and the deletions above.
         let wal_file = fs.create(&dir.join(wal_name(wal_no)))?;
+        let mut header = Vec::new();
+        log::encode_header(&mut header, file_no_u32(wal_no)?, last_seq);
+        wal_file.append(&header)?;
         let writer = ManifestWriter::install(fs.as_ref(), &dir, manifest_no, &state)?;
         for name in fs.list(&dir)? {
             if manifest::parse_manifest_name(&name).is_some_and(|no| no != manifest_no) {
@@ -1562,6 +1587,10 @@ impl Inner {
                 None => self.io(|| Ok(self.fs.create(&new_path)?))?,
             }
         };
+        // Everything up to `last_seq` is in older WALs or tables.
+        let mut header = Vec::new();
+        log::encode_header(&mut header, file_no_u32(number)?, commit.last_seq);
+        self.io(|| Ok(file.append(&header)?))?;
         {
             let mut barrier = self.barrier.lock();
             barrier.older.push(commit.wal.clone());

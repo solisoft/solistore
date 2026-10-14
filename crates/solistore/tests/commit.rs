@@ -692,7 +692,7 @@ fn approximate_size_counts_flushed_data_in_the_range() {
 /// in, although the switches themselves fsync nothing.
 #[test]
 fn a_synced_write_carries_every_earlier_write_across_memtable_switches() {
-    for seed in 0..40u64 {
+    for seed in 0..400u64 {
         let fs = FaultFs::new();
         let opts = Options {
             fs: Arc::new(fs.clone()),
@@ -743,4 +743,63 @@ fn a_synced_write_carries_every_earlier_write_across_memtable_switches() {
             "seed {seed}: not a prefix"
         );
     }
+}
+
+/// A recovery that drops WALs (an older one lost its tail) must not leave
+/// them to stop the next recovery: writes made after it survive a second
+/// crash.
+#[test]
+fn writes_after_a_point_in_time_recovery_survive_the_next_crash() {
+    let mut cuts = 0;
+    for seed in 0..400u64 {
+        let fs = FaultFs::new();
+        let opts = Options {
+            fs: Arc::new(fs.clone()),
+            durability: Durability::Eventual {
+                sync_interval: Duration::from_secs(3600),
+            },
+            write_buffer_size: 4 << 10,
+            target_file_size: 16 << 10,
+            ..Options::default()
+        };
+        let db = Db::open("/db", opts.clone()).unwrap();
+        let cf = db.default_cf();
+        for i in 0..600u32 {
+            db.put(&cf, i.to_be_bytes(), [i as u8; 48]).unwrap();
+        }
+        fs.crash(Torn::Seeded(seed));
+        drop(db);
+
+        let db = Db::open("/db", opts.clone()).unwrap();
+        if db.recovery_report().dropped_wal_files == 0 {
+            continue;
+        }
+        cuts += 1;
+        let cf = db.default_cf();
+        let kept = db.iterator(&cf, IteratorMode::Start).unwrap().count() as u32;
+        let mut batch = WriteBatch::new();
+        batch.put(&cf, 1_000_000u32.to_be_bytes(), b"after");
+        db.write_opt(batch, &WriteOptions { sync: true }).unwrap();
+        fs.crash(Torn::Seeded(seed + 1));
+        drop(db);
+
+        let db = Db::open("/db", opts).unwrap();
+        let cf = db.default_cf();
+        assert_eq!(
+            db.get(&cf, 1_000_000u32.to_be_bytes()).unwrap().as_deref(),
+            Some(&b"after"[..]),
+            "seed {seed}: a synced write after the recovery was lost"
+        );
+        let keys: Vec<u32> = db
+            .iterator(&cf, IteratorMode::Start)
+            .unwrap()
+            .map(|r| u32::from_be_bytes(r.unwrap().0[..].try_into().unwrap()))
+            .filter(|k| *k < 1_000_000)
+            .collect();
+        assert_eq!(keys, (0..kept).collect::<Vec<_>>(), "seed {seed}");
+    }
+    assert!(
+        cuts > 0,
+        "no seed produced a point-in-time cut; the test tests nothing"
+    );
 }
