@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use solistore::fs::{FaultFs, Torn};
-use solistore::{Db, Error, IteratorMode, Options, WriteBatch};
+use solistore::{Db, Durability, Error, IteratorMode, Options, WriteBatch, WriteOptions};
 
 fn open(fs: &FaultFs) -> Db {
     Db::open(
@@ -685,4 +685,62 @@ fn approximate_size_counts_flushed_data_in_the_range() {
     // Another column family's keys are not counted.
     let other = db.create_cf("d").unwrap();
     assert_eq!(db.approximate_size(&other, b"a", b"c").unwrap(), 0);
+}
+
+/// Eventual mode with the memtable switching every few writes: a synced
+/// write is durable with every write before it, whatever WAL those landed
+/// in, although the switches themselves fsync nothing.
+#[test]
+fn a_synced_write_carries_every_earlier_write_across_memtable_switches() {
+    for seed in 0..40u64 {
+        let fs = FaultFs::new();
+        let opts = Options {
+            fs: Arc::new(fs.clone()),
+            durability: Durability::Eventual {
+                // Never: only the synced write makes anything durable.
+                sync_interval: Duration::from_secs(3600),
+            },
+            write_buffer_size: 4 << 10,
+            target_file_size: 16 << 10,
+            ..Options::default()
+        };
+        let db = Db::open("/db", opts.clone()).unwrap();
+        let cf = db.default_cf();
+        let before = 300 + (seed as u32 * 37) % 400;
+        for i in 0..before {
+            db.put(&cf, i.to_be_bytes(), [i as u8; 48]).unwrap();
+        }
+        let mut batch = WriteBatch::new();
+        batch.put(&cf, before.to_be_bytes(), b"synced");
+        db.write_opt(batch, &WriteOptions { sync: true }).unwrap();
+        for i in before + 1..before + 200 {
+            db.put(&cf, i.to_be_bytes(), [i as u8; 48]).unwrap();
+        }
+
+        let torn = if seed % 2 == 0 {
+            Torn::None
+        } else {
+            Torn::Seeded(seed)
+        };
+        fs.crash(torn);
+        drop(db);
+        let db = Db::open("/db", opts).unwrap();
+        let cf = db.default_cf();
+        let keys: Vec<u32> = db
+            .iterator(&cf, IteratorMode::Start)
+            .unwrap()
+            .map(|r| u32::from_be_bytes(r.unwrap().0[..].try_into().unwrap()))
+            .collect();
+        // A prefix of the writes, reaching at least the synced one.
+        assert!(
+            keys.len() as u32 > before,
+            "seed {seed}: lost a write before the synced one ({} kept)",
+            keys.len()
+        );
+        assert_eq!(
+            keys,
+            (0..keys.len() as u32).collect::<Vec<_>>(),
+            "seed {seed}: not a prefix"
+        );
+    }
 }

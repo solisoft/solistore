@@ -357,6 +357,8 @@ struct Inner {
     recycle_wal_files: usize,
     /// The WAL being written, for the eventual-mode syncer.
     current_wal: Mutex<Arc<WalFile>>,
+    /// What must be durable before the current WAL may be fsynced.
+    barrier: Mutex<SyncBarrier>,
     /// A write, fsync or flush failed; see [`Error::Poisoned`].
     poisoned: AtomicBool,
     bg: Mutex<Background>,
@@ -364,6 +366,19 @@ struct Inner {
     recovery: RecoveryReport,
     counters: Counters,
     _lock: Box<dyn Send + Sync>,
+}
+
+/// A memtable switch does not fsync the old WAL or the directory: that
+/// would hold every writer behind the commit lock for a few milliseconds.
+/// Instead, whatever fsyncs the current WAL first fsyncs what the switch
+/// left behind, older WALs in order, then the directory (the new WAL's
+/// name). A later write can then never be durable without every earlier
+/// one, and an old WAL whose memtable is already flushed is dropped from
+/// the list.
+#[derive(Default)]
+struct SyncBarrier {
+    older: Vec<Arc<WalFile>>,
+    dir_dirty: bool,
 }
 
 #[derive(Default)]
@@ -431,7 +446,7 @@ struct Queue {
 /// How long a writer spins, yielding, before it sleeps on a condition
 /// variable. Waking a sleeping thread costs tens of microseconds — as much
 /// as the work it waits for — and most waits here end sooner than this.
-const SPIN: Duration = Duration::from_micros(50);
+const SPIN: Duration = Duration::from_micros(200);
 
 /// Wait for `done`, at most [`SPIN`], without sleeping: a few busy spins,
 /// then yielding the core on every check, so a waiting writer hands its CPU
@@ -639,6 +654,7 @@ impl Db {
             recycled_wals: Mutex::new(recycled),
             recycle_wal_files: opts.recycle_wal_files,
             current_wal: Mutex::new(wal),
+            barrier: Mutex::new(SyncBarrier::default()),
             poisoned: AtomicBool::new(false),
             bg: Mutex::new(Background::default()),
             bg_cv: Condvar::new(),
@@ -1026,9 +1042,7 @@ impl Db {
         let inner = self.inner();
         inner.check()?;
         let wal = inner.current_wal.lock().clone();
-        wal.dirty.store(false, Ordering::Release);
-        wal.file.sync().inspect_err(|_| inner.poison())?;
-        Ok(())
+        inner.sync_wal_file(&wal)
     }
 
     /// Write every memtable out as table files and wait until it is done.
@@ -1118,7 +1132,7 @@ impl Drop for Handle {
             if let Ok(no) = file_no_u32(wal.number) {
                 log::encode_end(&mut end, no);
                 if wal.file.append(&end).is_ok() {
-                    wal.file.sync().ok();
+                    self.inner.sync_wal_file(&wal).ok();
                 }
             }
         }
@@ -1238,6 +1252,26 @@ impl Inner {
     /// Run an I/O step of the write path; any failure poisons the database.
     fn io<T>(&self, step: impl FnOnce() -> Result<T>) -> Result<T> {
         step().inspect_err(|_| self.poison())
+    }
+
+    /// Fsync `wal`, after the older WALs and the directory entries a
+    /// memtable switch left unsynced (see [`SyncBarrier`]). Poisons the
+    /// database on failure.
+    fn sync_wal_file(&self, wal: &WalFile) -> Result<()> {
+        {
+            let mut barrier = self.barrier.lock();
+            for old in std::mem::take(&mut barrier.older) {
+                if old.dirty.swap(false, Ordering::AcqRel) {
+                    self.io(|| Ok(old.file.sync()?))?;
+                }
+            }
+            if barrier.dir_dirty {
+                self.io(|| Ok(self.fs.sync_dir(&self.dir)?))?;
+                barrier.dir_dirty = false;
+            }
+        }
+        wal.dirty.store(false, Ordering::Release);
+        self.io(|| Ok(wal.file.sync()?))
     }
 
     fn append_edits(&self, structure: &mut Structure, edits: &[Edit]) -> Result<()> {
@@ -1397,7 +1431,7 @@ impl Inner {
         add(&self.counters.committed_batches, group.len() as u64);
         if sync {
             add(&self.counters.wal_fsyncs, 1);
-            self.io(|| Ok(wal.file.sync()?))?;
+            self.sync_wal_file(wal)?;
         } else {
             wal.dirty.store(true, Ordering::Release);
         }
@@ -1509,9 +1543,6 @@ impl Inner {
         log::encode_end(&mut end, file_no_u32(commit.wal.number)?);
         self.io(|| Ok(commit.wal.file.append(&end)?))?;
         commit.wal.dirty.store(true, Ordering::Release);
-        if commit.wal.dirty.swap(false, Ordering::AcqRel) {
-            self.io(|| Ok(commit.wal.file.sync()?))?;
-        }
         let number = self.allocate_file();
         let new_path = self.dir.join(wal_name(number));
         // The recycled list stays locked until the file is renamed: a flush
@@ -1526,7 +1557,11 @@ impl Inner {
                 None => self.io(|| Ok(self.fs.create(&new_path)?))?,
             }
         };
-        self.io(|| Ok(self.fs.sync_dir(&self.dir)?))?;
+        {
+            let mut barrier = self.barrier.lock();
+            barrier.older.push(commit.wal.clone());
+            barrier.dir_dirty = true;
+        }
         let wal = Arc::new(WalFile {
             file,
             number,
@@ -1694,6 +1729,8 @@ impl Inner {
             // The LogNumber edit is durable: the old WALs can go, before the
             // new version is visible to anyone waiting for this flush.
             || {
+                // Their memtable is in table files now: nothing to fsync.
+                self.barrier.lock().older.retain(|w| w.number >= next_wal);
                 let mut recycled = self.recycled_wals.lock();
                 for name in self.fs.list(&self.dir).unwrap_or_default() {
                     let Some(no) = parse_wal_name(&name).filter(|no| *no < next_wal) else {
@@ -1905,8 +1942,9 @@ impl Inner {
                 return;
             }
             let wal = self.current_wal.lock().clone();
-            if wal.dirty.swap(false, Ordering::AcqRel) && wal.file.sync().is_err() {
-                self.poison();
+            let behind = !self.barrier.lock().older.is_empty();
+            if (wal.dirty.load(Ordering::Acquire) || behind) && self.sync_wal_file(&wal).is_err() {
+                return;
             }
         }
     }
