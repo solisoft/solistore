@@ -29,7 +29,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -255,6 +255,9 @@ struct Inner {
     commit: Mutex<CommitState>,
     queue: Mutex<Queue>,
     queue_cv: Condvar,
+    /// Wakes writers waiting for `visible_seq` to reach their group.
+    publish: Mutex<()>,
+    publish_cv: Condvar,
     /// The WAL being written, for the eventual-mode syncer.
     current_wal: Mutex<Arc<WalFile>>,
     /// A write, fsync or flush failed; see [`Error::Poisoned`].
@@ -288,6 +291,8 @@ struct WalFile {
 /// forced memtable switch).
 struct CommitState {
     wal: Arc<WalFile>,
+    /// The last sequence number handed out. Readers see up to
+    /// `visible_seq`, which catches up as groups finish their inserts.
     last_seq: u64,
     buf: Vec<u8>,
 }
@@ -295,8 +300,24 @@ struct CommitState {
 struct Pending {
     batch: WriteBatch,
     sync: bool,
-    /// Set by the leader that committed this batch, under the queue lock.
-    outcome: Mutex<Option<Result<()>>>,
+    /// Set by the leader that wrote this batch to the WAL, under the queue lock.
+    slot: Mutex<Option<Slot>>,
+}
+
+/// What a writer is told by its group's leader.
+enum Slot {
+    /// In the WAL: insert into `group.mem` from this sequence number.
+    Insert(Arc<Group>, u64),
+    Failed(Error),
+}
+
+/// A commit group after its WAL write: its members insert in parallel, and
+/// the last one to finish publishes it, after the group before it.
+struct Group {
+    mem: Arc<Memtable>,
+    first: u64,
+    last: u64,
+    remaining: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -472,6 +493,8 @@ impl Db {
             }),
             queue: Mutex::new(Queue::default()),
             queue_cv: Condvar::new(),
+            publish: Mutex::new(()),
+            publish_cv: Condvar::new(),
             current_wal: Mutex::new(wal),
             poisoned: AtomicBool::new(false),
             bg: Mutex::new(Background::default()),
@@ -1005,46 +1028,63 @@ impl Inner {
         let me = Arc::new(Pending {
             batch,
             sync,
-            outcome: Mutex::new(None),
+            slot: Mutex::new(None),
         });
         let mut queue = self.queue.lock();
         queue.waiting.push_back(me.clone());
-        loop {
-            if let Some(outcome) = me.outcome.lock().take() {
-                return outcome;
+        let lead = loop {
+            if let Some(slot) = me.slot.lock().take() {
+                break Err(slot);
             }
             let at_head = queue.waiting.front().is_some_and(|p| Arc::ptr_eq(p, &me));
             if at_head && !queue.leader_active {
-                break;
+                break Ok(());
             }
             self.queue_cv.wait(&mut queue);
-        }
-
-        // Leader: take the group, commit it outside the queue lock.
-        queue.leader_active = true;
-        let mut group = Vec::new();
-        let mut bytes = 0;
-        while let Some(next) = queue.waiting.front() {
-            let size = next.batch.size_in_bytes();
-            if !group.is_empty() && bytes + size > MAX_GROUP_BYTES {
-                break;
-            }
-            bytes += size;
-            group.push(queue.waiting.pop_front().expect("front exists"));
-        }
-        drop(queue);
-
-        let guard = LeaderGuard {
-            inner: self,
-            group: &group,
-            me: &me,
         };
-        let outcome = self.commit_group(&group);
-        guard.finish(outcome.clone());
-        outcome
+        let slot = match lead {
+            Err(slot) => {
+                drop(queue);
+                slot
+            }
+            Ok(()) => {
+                // Leader: take the group and write it to the WAL outside the
+                // queue lock. The next leader can start on its own group as
+                // soon as this one is in the WAL.
+                queue.leader_active = true;
+                let mut group = Vec::new();
+                let mut bytes = 0;
+                while let Some(next) = queue.waiting.front() {
+                    let size = next.batch.size_in_bytes();
+                    if !group.is_empty() && bytes + size > MAX_GROUP_BYTES {
+                        break;
+                    }
+                    bytes += size;
+                    group.push(queue.waiting.pop_front().expect("front exists"));
+                }
+                drop(queue);
+                let guard = LeaderGuard {
+                    inner: self,
+                    group: &group,
+                    me: &me,
+                };
+                let written = self.write_group(&group);
+                guard.finish(written)
+            }
+        };
+        match slot {
+            Slot::Failed(e) => Err(e),
+            Slot::Insert(group, first) => {
+                self.insert_and_publish(&me.batch, &group, first);
+                Ok(())
+            }
+        }
     }
 
-    fn commit_group(&self, group: &[Arc<Pending>]) -> Result<()> {
+    /// Give the group its sequence numbers and write it to the WAL, fsynced
+    /// if the durability asks for it. Returns the group and each member's
+    /// first sequence number.
+    fn write_group(&self, group: &[Arc<Pending>]) -> Result<(Arc<Group>, Vec<u64>)> {
         self.check()?;
         let mut commit = self.commit.lock();
         self.throttle()?;
@@ -1073,19 +1113,54 @@ impl Inner {
         } else {
             wal.dirty.store(true, Ordering::Release);
         }
-
-        // Switches happen under the commit lock, so this is the memtable the
-        // group belongs in.
-        let mem = self.sv.load().mem.clone();
-        for (pending, first) in group.iter().zip(firsts) {
-            apply(&mem, pending.batch.ops(), first, |_| true);
-        }
-        *last_seq = seq;
-        self.visible_seq.store(seq, Ordering::Release);
         if buf.capacity() > 2 * MAX_GROUP_BYTES {
             *buf = Vec::new();
         }
-        Ok(())
+        let first = *last_seq + 1;
+        *last_seq = seq;
+        // Switches happen under the commit lock, and wait for every group
+        // already handed out to be published: this memtable stays the one
+        // this group belongs in until it is.
+        let mem = self.sv.load().mem.clone();
+        Ok((
+            Arc::new(Group {
+                mem,
+                first,
+                last: seq,
+                remaining: AtomicUsize::new(group.len()),
+            }),
+            firsts,
+        ))
+    }
+
+    /// Insert one member's batch; the group's last member to finish
+    /// publishes it once every earlier group is published. Returns when the
+    /// group is visible, so a writer always reads its own write.
+    fn insert_and_publish(&self, batch: &WriteBatch, group: &Group, first: u64) {
+        apply(&group.mem, batch.ops(), first, |_| true);
+        if group.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let mut published = self.publish.lock();
+            while self.visible_seq.load(Ordering::Acquire) < group.first - 1 {
+                self.publish_cv.wait(&mut published);
+            }
+            self.visible_seq.store(group.last, Ordering::Release);
+            drop(published);
+            self.publish_cv.notify_all();
+        } else {
+            let mut published = self.publish.lock();
+            while self.visible_seq.load(Ordering::Acquire) < group.last {
+                self.publish_cv.wait(&mut published);
+            }
+        }
+    }
+
+    /// Wait until every sequence number handed out is published: nothing is
+    /// still being inserted into the current memtable.
+    fn wait_published(&self, last_seq: u64) {
+        let mut published = self.publish.lock();
+        while self.visible_seq.load(Ordering::Acquire) < last_seq {
+            self.publish_cv.wait(&mut published);
+        }
     }
 
     /// Hold writes back while level 0 has more files than compaction keeps
@@ -1127,6 +1202,8 @@ impl Inner {
                 self.bg_cv.wait(&mut bg);
             }
         }
+        // A flush must not start on a memtable still being inserted into.
+        self.wait_published(commit.last_seq);
         // Everything in the old WAL must be durable before anything lands in
         // the new one: a crash may not keep a later write and lose an
         // earlier one.
@@ -1450,8 +1527,8 @@ impl Inner {
     }
 }
 
-/// Hands the group's outcome to its followers and frees the leader slot —
-/// also if the leader panics, so the queue cannot wedge.
+/// Tells every member of the group what to do next and frees the leader
+/// slot — also if the leader panics, so the queue cannot wedge.
 struct LeaderGuard<'a> {
     inner: &'a Inner,
     group: &'a [Arc<Pending>],
@@ -1459,28 +1536,41 @@ struct LeaderGuard<'a> {
 }
 
 impl LeaderGuard<'_> {
-    fn finish(self, outcome: Result<()>) {
-        self.release(outcome);
-        std::mem::forget(self);
-    }
-
-    fn release(&self, outcome: Result<()>) {
+    /// Hand out the slots and return the leader's own.
+    fn finish(self, written: Result<(Arc<Group>, Vec<u64>)>) -> Slot {
+        let mut mine = None;
         let mut queue = self.inner.queue.lock();
-        for pending in self.group {
-            if !Arc::ptr_eq(pending, self.me) {
-                *pending.outcome.lock() = Some(outcome.clone());
+        for (i, pending) in self.group.iter().enumerate() {
+            let slot = match &written {
+                Ok((group, firsts)) => Slot::Insert(group.clone(), firsts[i]),
+                Err(e) => Slot::Failed(e.clone()),
+            };
+            if Arc::ptr_eq(pending, self.me) {
+                mine = Some(slot);
+            } else {
+                *pending.slot.lock() = Some(slot);
             }
         }
         queue.leader_active = false;
         drop(queue);
         self.inner.queue_cv.notify_all();
+        std::mem::forget(self);
+        mine.expect("the leader is in its own group")
     }
 }
 
 impl Drop for LeaderGuard<'_> {
     fn drop(&mut self) {
-        // Only reached by unwinding out of the commit.
+        // Only reached by unwinding out of the WAL write.
         self.inner.poison();
-        self.release(Err(Error::Poisoned));
+        let mut queue = self.inner.queue.lock();
+        for pending in self.group {
+            if !Arc::ptr_eq(pending, self.me) {
+                *pending.slot.lock() = Some(Slot::Failed(Error::Poisoned));
+            }
+        }
+        queue.leader_active = false;
+        drop(queue);
+        self.inner.queue_cv.notify_all();
     }
 }
