@@ -63,7 +63,14 @@ trait Engine: Send + Sync {
     fn write(&self, ops: Vec<Op>, sync: bool);
     fn get(&self, coll: u32, key: &[u8]) -> Option<Vec<u8>>;
     /// Keys in `[start, end)` of `coll`, ascending or descending, at most `limit`.
-    fn scan_keys(&self, coll: u32, start: &[u8], end: &[u8], rev: bool, limit: usize) -> Vec<Vec<u8>>;
+    fn scan_keys(
+        &self,
+        coll: u32,
+        start: &[u8],
+        end: &[u8],
+        rev: bool,
+        limit: usize,
+    ) -> Vec<Vec<u8>>;
     /// Make everything durable.
     fn flush(&self);
     /// Engine counters as a JSON object, printed with every phase.
@@ -193,15 +200,24 @@ mod rocks {
             } else {
                 Cache::new_lru_cache(capacity)
             };
-            let wbm = t
-                .wbm_mb
-                .map(|budget| WriteBufferManager::new_write_buffer_manager_with_cache(budget * mb, false, cache.clone()));
+            let wbm = t.wbm_mb.map(|budget| {
+                WriteBufferManager::new_write_buffer_manager_with_cache(
+                    budget * mb,
+                    false,
+                    cache.clone(),
+                )
+            });
             let cfs = ["default", META, SHARED]
                 .iter()
                 .map(|name| ColumnFamilyDescriptor::new(*name, cf_options(&cache, t)))
                 .collect::<Vec<_>>();
-            let db = Db::open_cf_descriptors(&db_options(&cache, t, wbm.as_ref()), dir, cfs).expect("open rocksdb");
-            Rocks { db, dead: std::sync::Mutex::new(Vec::new()), _wbm: wbm }
+            let db = Db::open_cf_descriptors(&db_options(&cache, t, wbm.as_ref()), dir, cfs)
+                .expect("open rocksdb");
+            Rocks {
+                db,
+                dead: std::sync::Mutex::new(Vec::new()),
+                _wbm: wbm,
+            }
         }
     }
 
@@ -209,7 +225,9 @@ mod rocks {
         fn create_collection(&self, coll: u32) {
             // 2.x: creating a collection is one registry write.
             let meta = self.db.cf_handle(META).unwrap();
-            self.db.put_cf(&meta, format!("coll:{coll}"), coll.to_be_bytes()).unwrap();
+            self.db
+                .put_cf(&meta, format!("coll:{coll}"), coll.to_be_bytes())
+                .unwrap();
         }
 
         fn drop_collection(&self, coll: u32) {
@@ -253,13 +271,24 @@ mod rocks {
             self.db.get_cf(&shared, prefixed(coll, key)).unwrap()
         }
 
-        fn scan_keys(&self, coll: u32, start: &[u8], end: &[u8], rev: bool, limit: usize) -> Vec<Vec<u8>> {
+        fn scan_keys(
+            &self,
+            coll: u32,
+            start: &[u8],
+            end: &[u8],
+            rev: bool,
+            limit: usize,
+        ) -> Vec<Vec<u8>> {
             // keyspace.rs bounded_opts: every iterator is bounded.
             let shared = self.db.cf_handle(SHARED).unwrap();
             let mut ro = ReadOptions::default();
             ro.set_iterate_lower_bound(prefixed(coll, start));
             ro.set_iterate_upper_bound(prefixed(coll, end));
-            let mode = if rev { IteratorMode::End } else { IteratorMode::Start };
+            let mode = if rev {
+                IteratorMode::End
+            } else {
+                IteratorMode::Start
+            };
             self.db
                 .iterator_cf_opt(&shared, ro, mode)
                 .take(limit)
@@ -281,7 +310,9 @@ mod rocks {
 #[cfg(feature = "solistore")]
 mod soli {
     use super::*;
-    use solistore::{ColumnFamily, Db, Durability, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions};
+    use solistore::{
+        ColumnFamily, Db, Durability, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions,
+    };
 
     const META: &str = "_meta";
     const SHARED: &str = "__keyspaces__";
@@ -297,7 +328,10 @@ mod soli {
 
     impl Soli {
         pub fn open(dir: &Path, durability: Durability, t: &SoliTuning) -> Self {
-            let mut opts = Options { durability, ..Options::default() };
+            let mut opts = Options {
+                durability,
+                ..Options::default()
+            };
             if let Some(mb) = t.buffer_mb {
                 opts.write_buffer_size = mb << 20;
             }
@@ -305,15 +339,25 @@ mod soli {
                 opts.max_background_compactions = n;
             }
             let db = Db::open(dir, opts).expect("open solistore");
-            let cf = |name: &str| db.cf_handle(name).unwrap_or_else(|| db.create_cf(name).unwrap());
+            let cf = |name: &str| {
+                db.cf_handle(name)
+                    .unwrap_or_else(|| db.create_cf(name).unwrap())
+            };
             let (meta, shared) = (cf(META), cf(SHARED));
-            Soli { db, meta, shared, dead: std::sync::Mutex::new(Vec::new()) }
+            Soli {
+                db,
+                meta,
+                shared,
+                dead: std::sync::Mutex::new(Vec::new()),
+            }
         }
     }
 
     impl Engine for Soli {
         fn create_collection(&self, coll: u32) {
-            self.db.put(&self.meta, format!("coll:{coll}"), coll.to_be_bytes()).unwrap();
+            self.db
+                .put(&self.meta, format!("coll:{coll}"), coll.to_be_bytes())
+                .unwrap();
         }
 
         fn drop_collection(&self, coll: u32) {
@@ -330,7 +374,9 @@ mod soli {
             // As keyspace_gc.rs does with RocksDB: compact each dropped range.
             for coll in self.dead.lock().unwrap().drain(..) {
                 let (from, to) = coll_range(coll);
-                self.db.compact_range(&self.shared, Some(&from), Some(&to)).unwrap();
+                self.db
+                    .compact_range(&self.shared, Some(&from), Some(&to))
+                    .unwrap();
             }
         }
 
@@ -347,12 +393,29 @@ mod soli {
         }
 
         fn get(&self, coll: u32, key: &[u8]) -> Option<Vec<u8>> {
-            self.db.get(&self.shared, prefixed(coll, key)).unwrap().map(|v| v.to_vec())
+            self.db
+                .get(&self.shared, prefixed(coll, key))
+                .unwrap()
+                .map(|v| v.to_vec())
         }
 
-        fn scan_keys(&self, coll: u32, start: &[u8], end: &[u8], rev: bool, limit: usize) -> Vec<Vec<u8>> {
-            let opts = ReadOptions { lower_bound: Some(prefixed(coll, start)), upper_bound: Some(prefixed(coll, end)) };
-            let mode = if rev { IteratorMode::End } else { IteratorMode::Start };
+        fn scan_keys(
+            &self,
+            coll: u32,
+            start: &[u8],
+            end: &[u8],
+            rev: bool,
+            limit: usize,
+        ) -> Vec<Vec<u8>> {
+            let opts = ReadOptions {
+                lower_bound: Some(prefixed(coll, start)),
+                upper_bound: Some(prefixed(coll, end)),
+            };
+            let mode = if rev {
+                IteratorMode::End
+            } else {
+                IteratorMode::Start
+            };
             self.db
                 .iterator_opt(&self.shared, opts, mode)
                 .unwrap()
@@ -421,13 +484,19 @@ fn open_engine(p: &Params) -> Box<dyn Engine> {
         "rocks" => Box::new(rocks::Rocks::open(&p.dir, &p.rocks)),
         // Every commit fsynced before it returns: the default.
         #[cfg(feature = "solistore")]
-        "solistore" => Box::new(soli::Soli::open(&p.dir, solistore::Durability::Full, &p.soli)),
+        "solistore" => Box::new(soli::Soli::open(
+            &p.dir,
+            solistore::Durability::Full,
+            &p.soli,
+        )),
         // Writes acknowledged once in the OS, fsynced every 100 ms: what
         // RocksDB's unsynced writes are compared against.
         #[cfg(feature = "solistore")]
         "solistore-eventual" => Box::new(soli::Soli::open(
             &p.dir,
-            solistore::Durability::Eventual { sync_interval: Duration::from_millis(100) },
+            solistore::Durability::Eventual {
+                sync_interval: Duration::from_millis(100),
+            },
             &p.soli,
         )),
         other => panic!("unknown engine {other}"),
@@ -506,7 +575,10 @@ impl Params {
             }
             i += 2;
         }
-        assert!(!p.engine.is_empty() && !p.dir.as_os_str().is_empty(), "--engine and --dir are required");
+        assert!(
+            !p.engine.is_empty() && !p.dir.as_os_str().is_empty(),
+            "--engine and --dir are required"
+        );
         if p.label.is_empty() {
             p.label = p.engine.clone();
         }
@@ -515,7 +587,12 @@ impl Params {
 
     /// The flags a child process needs to open the same engine the same way.
     fn engine_args(&self) -> Vec<String> {
-        let mut args = vec!["--engine".into(), self.engine.clone(), "--dir".into(), self.dir.display().to_string()];
+        let mut args = vec![
+            "--engine".into(),
+            self.engine.clone(),
+            "--dir".into(),
+            self.dir.display().to_string(),
+        ];
         let switches = [
             ("--rx-cache-index", self.rocks.cache_index),
             ("--rx-partitioned", self.rocks.partitioned),
@@ -552,9 +629,12 @@ impl Params {
 
 const WORDS: &[&str] = &[
     "alpha", "river", "stone", "garden", "signal", "market", "orbit", "paper", "copper", "harbor",
-    "winter", "lantern", "meadow", "engine", "silver", "canyon", "velvet", "pixel", "summit", "echo",
+    "winter", "lantern", "meadow", "engine", "silver", "canyon", "velvet", "pixel", "summit",
+    "echo",
 ];
-const CITIES: &[&str] = &["paris", "lyon", "berlin", "madrid", "rome", "oslo", "lisbon", "vienna"];
+const CITIES: &[&str] = &[
+    "paris", "lyon", "berlin", "madrid", "rome", "oslo", "lisbon", "vienna",
+];
 
 fn doc_key(n: u64) -> Vec<u8> {
     format!("doc:{n:020}").into_bytes()
@@ -568,7 +648,9 @@ fn age_key(age: u8, n: u64) -> Vec<u8> {
 }
 
 fn document(n: u64, age: u8, city: &str, rng: &mut StdRng) -> Vec<u8> {
-    let bio: Vec<&str> = (0..40).map(|_| WORDS[rng.gen_range(0..WORDS.len())]).collect();
+    let bio: Vec<&str> = (0..40)
+        .map(|_| WORDS[rng.gen_range(0..WORDS.len())])
+        .collect();
     format!(
         r#"{{"_key":"{n:020}","name":"user {n}","email":"user{n}@example.com","age":{age},"city":"{city}","bio":"{}","score":{}}}"#,
         bio.join(" "),
@@ -591,10 +673,26 @@ fn insert_ops(p: &Params, n: u64, rng: &mut StdRng) -> Vec<Op> {
     let age: u8 = rng.gen_range(18..90);
     let city = CITIES[rng.gen_range(0..CITIES.len())];
     vec![
-        Op { coll, key: doc_key(n), value: Some(document(n, age, city, rng)) },
-        Op { coll, key: age_key(age, n), value: Some(Vec::new()) },
-        Op { coll, key: format!("idx:email:user{n}@example.com:{n:020}").into_bytes(), value: Some(Vec::new()) },
-        Op { coll, key: format!("idx:city:{city}:{n:020}").into_bytes(), value: Some(Vec::new()) },
+        Op {
+            coll,
+            key: doc_key(n),
+            value: Some(document(n, age, city, rng)),
+        },
+        Op {
+            coll,
+            key: age_key(age, n),
+            value: Some(Vec::new()),
+        },
+        Op {
+            coll,
+            key: format!("idx:email:user{n}@example.com:{n:020}").into_bytes(),
+            value: Some(Vec::new()),
+        },
+        Op {
+            coll,
+            key: format!("idx:city:{city}:{n:020}").into_bytes(),
+            value: Some(Vec::new()),
+        },
     ]
 }
 
@@ -626,8 +724,14 @@ fn counters() -> Counters {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
     let after_comm = stat.rsplit(") ").next().unwrap_or("");
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    let cpu_ticks = fields.get(11).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
-        + fields.get(12).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let cpu_ticks = fields
+        .get(11)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        + fields
+            .get(12)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
     Counters {
         at: Instant::now(),
         cpu_ticks,
@@ -642,7 +746,11 @@ fn dir_bytes(dir: &Path) -> u64 {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
-            total += if meta.is_dir() { dir_bytes(&entry.path()) } else { meta.len() };
+            total += if meta.is_dir() {
+                dir_bytes(&entry.path())
+            } else {
+                meta.len()
+            };
         }
     }
     total
@@ -667,7 +775,14 @@ struct Phase<'a> {
 
 impl<'a> Phase<'a> {
     fn new(p: &'a Params, name: &'a str) -> Self {
-        Phase { p, name, ops: 0, logical_bytes: 0, lat_us: Vec::new(), extra: String::new() }
+        Phase {
+            p,
+            name,
+            ops: 0,
+            logical_bytes: 0,
+            lat_us: Vec::new(),
+            extra: String::new(),
+        }
     }
 
     fn print(mut self, before: Counters) {
@@ -676,7 +791,11 @@ impl<'a> Phase<'a> {
         let secs = after.at.duration_since(before.at).as_secs_f64();
         let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
         let written = after.write_bytes.saturating_sub(before.write_bytes);
-        let write_amp = if self.logical_bytes > 0 { written as f64 / self.logical_bytes as f64 } else { 0.0 };
+        let write_amp = if self.logical_bytes > 0 {
+            written as f64 / self.logical_bytes as f64
+        } else {
+            0.0
+        };
         println!(
             concat!(
                 r#"{{"label":"{}","engine":"{}","phase":"{}","ops":{},"secs":{:.3},"ops_per_sec":{:.0},"#,
@@ -688,7 +807,11 @@ impl<'a> Phase<'a> {
             self.name,
             self.ops,
             secs,
-            if secs > 0.0 { self.ops as f64 / secs } else { 0.0 },
+            if secs > 0.0 {
+                self.ops as f64 / secs
+            } else {
+                0.0
+            },
             percentile(&self.lat_us, 0.50),
             percentile(&self.lat_us, 0.99),
             percentile(&self.lat_us, 0.999),
@@ -702,8 +825,17 @@ impl<'a> Phase<'a> {
             mb(self.logical_bytes),
             write_amp,
             {
-                let stats = STATS_SOURCE.lock().unwrap().as_ref().map(|e| e.stats()).unwrap_or_default();
-                let stats = if stats.is_empty() { String::new() } else { format!(r#","engine_stats":{stats}"#) };
+                let stats = STATS_SOURCE
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|e| e.stats())
+                    .unwrap_or_default();
+                let stats = if stats.is_empty() {
+                    String::new()
+                } else {
+                    format!(r#","engine_stats":{stats}"#)
+                };
                 format!("{}{stats}", self.extra)
             }
         );
@@ -777,14 +909,28 @@ fn settle(engine: &dyn Engine, p: &Params, name: &str) {
 /// Read a document, rewrite it with a new age, swap its idx:age entry.
 fn update(engine: &dyn Engine, p: &Params, n: u64, rng: &mut StdRng) -> u64 {
     let coll = p.coll_of(n);
-    let old = engine.get(coll, &doc_key(n)).expect("updating a missing document");
+    let old = engine
+        .get(coll, &doc_key(n))
+        .expect("updating a missing document");
     let old_age = age_of(&old);
     let new_age: u8 = rng.gen_range(18..90);
     let city = CITIES[rng.gen_range(0..CITIES.len())];
     let ops = vec![
-        Op { coll, key: doc_key(n), value: Some(document(n, new_age, city, rng)) },
-        Op { coll, key: age_key(old_age, n), value: None },
-        Op { coll, key: age_key(new_age, n), value: Some(Vec::new()) },
+        Op {
+            coll,
+            key: doc_key(n),
+            value: Some(document(n, new_age, city, rng)),
+        },
+        Op {
+            coll,
+            key: age_key(old_age, n),
+            value: None,
+        },
+        Op {
+            coll,
+            key: age_key(new_age, n),
+            value: Some(Vec::new()),
+        },
     ];
     let bytes = ops.iter().map(Op::logical_bytes).sum();
     engine.write(ops, false);
@@ -865,32 +1011,52 @@ fn run(p: Params) {
         let mut rng = StdRng::seed_from_u64(10_000 + t);
         for _ in 0..p.gets / p.threads {
             let n = rng.gen_range(0..p.docs);
-            timed(&mut tally.lat, || assert!(engine.get(p.coll_of(n), &doc_key(n)).is_some(), "missing doc {n}"));
+            timed(&mut tally.lat, || {
+                assert!(
+                    engine.get(p.coll_of(n), &doc_key(n)).is_some(),
+                    "missing doc {n}"
+                )
+            });
         }
     });
     parallel_phase(&p, "get_hot", p.gets, |t, tally| {
         let mut rng = StdRng::seed_from_u64(11_000 + t);
         let hot = (p.docs / 100).max(1);
         for _ in 0..p.gets / p.threads {
-            let n = if rng.gen_bool(0.9) { rng.gen_range(0..hot) } else { rng.gen_range(0..p.docs) };
-            timed(&mut tally.lat, || assert!(engine.get(p.coll_of(n), &doc_key(n)).is_some()));
+            let n = if rng.gen_bool(0.9) {
+                rng.gen_range(0..hot)
+            } else {
+                rng.gen_range(0..p.docs)
+            };
+            timed(&mut tally.lat, || {
+                assert!(engine.get(p.coll_of(n), &doc_key(n)).is_some())
+            });
         }
     });
     parallel_phase(&p, "get_missing", p.gets / 2, |t, tally| {
         let mut rng = StdRng::seed_from_u64(12_000 + t);
         for _ in 0..p.gets / 2 / p.threads {
             let n = p.docs * 10 + rng.gen_range(0..p.docs);
-            timed(&mut tally.lat, || assert!(engine.get(p.coll_of(n), &doc_key(n)).is_none()));
+            timed(&mut tally.lat, || {
+                assert!(engine.get(p.coll_of(n), &doc_key(n)).is_none())
+            });
         }
     });
 
     for rev in [false, true] {
-        parallel_phase(&p, if rev { "scan_desc_100" } else { "scan_asc_100" }, p.scans, |t, tally| {
-            let mut rng = StdRng::seed_from_u64(20_000 + t + rev as u64 * 100);
-            for _ in 0..p.scans / p.threads {
-                timed(&mut tally.lat, || index_scan(engine.as_ref(), &p, &mut rng, rev));
-            }
-        });
+        parallel_phase(
+            &p,
+            if rev { "scan_desc_100" } else { "scan_asc_100" },
+            p.scans,
+            |t, tally| {
+                let mut rng = StdRng::seed_from_u64(20_000 + t + rev as u64 * 100);
+                for _ in 0..p.scans / p.threads {
+                    timed(&mut tally.lat, || {
+                        index_scan(engine.as_ref(), &p, &mut rng, rev)
+                    });
+                }
+            },
+        );
     }
 
     // Updates: read, rewrite, swap one index entry.
@@ -936,7 +1102,10 @@ fn run(p: Params) {
                             let n = rng.gen_range(0..p.docs);
                             bytes += update(engine.as_ref(), p, n, &mut rng);
                         }
-                        samples.push((second, t0.elapsed().as_micros().min(u32::MAX as u128) as u32));
+                        samples.push((
+                            second,
+                            t0.elapsed().as_micros().min(u32::MAX as u128) as u32,
+                        ));
                     }
                     (samples, bytes)
                 })
@@ -1037,7 +1206,11 @@ fn run(p: Params) {
 fn crash_child(p: Params) {
     let engine = open_engine(&p);
     engine.create_collection(1);
-    let single = Params { collections: 2, hot: 1, ..p.clone() };
+    let single = Params {
+        collections: 2,
+        hot: 1,
+        ..p.clone()
+    };
     let mut rng = StdRng::seed_from_u64(7);
     let stdout = std::io::stdout();
     for seq in 0.. {
@@ -1088,13 +1261,23 @@ fn crash(p: Params) {
     engine.create_collection(1);
     let reopen = start.elapsed();
 
-    let lost = (0..=last_acked).filter(|seq| engine.get(1, &doc_key(*seq)).is_none()).count();
+    let lost = (0..=last_acked)
+        .filter(|seq| engine.get(1, &doc_key(*seq)).is_none())
+        .count();
     // Atomicity: a document present without its index entries (or the
     // reverse) means a batch was half applied.
-    let docs = engine.scan_keys(1, b"doc:", b"doc;", false, usize::MAX).len();
-    let ages = engine.scan_keys(1, b"idx:age:", b"idx:age;", false, usize::MAX).len();
-    let emails = engine.scan_keys(1, b"idx:email:", b"idx:email;", false, usize::MAX).len();
-    let cities = engine.scan_keys(1, b"idx:city:", b"idx:city;", false, usize::MAX).len();
+    let docs = engine
+        .scan_keys(1, b"doc:", b"doc;", false, usize::MAX)
+        .len();
+    let ages = engine
+        .scan_keys(1, b"idx:age:", b"idx:age;", false, usize::MAX)
+        .len();
+    let emails = engine
+        .scan_keys(1, b"idx:email:", b"idx:email;", false, usize::MAX)
+        .len();
+    let cities = engine
+        .scan_keys(1, b"idx:city:", b"idx:city;", false, usize::MAX)
+        .len();
     let torn = ages != docs || emails != docs || cities != docs;
     println!(
         r#"{{"label":"{}","engine":"{}","phase":"crash","acked":{},"lost_acked":{},"docs_found":{},"index_entries":[{},{},{}],"torn_batch":{},"reopen_secs":{:.3}}}"#,
@@ -1171,7 +1354,14 @@ fn visibility(p: Params) {
                         None => {}
                         Some(doc) => {
                             let text = String::from_utf8(doc.clone()).unwrap();
-                            let city = text.split("\"city\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+                            let city = text
+                                .split("\"city\":\"")
+                                .nth(1)
+                                .unwrap()
+                                .split('"')
+                                .next()
+                                .unwrap()
+                                .to_string();
                             let keys = [
                                 age_key(age_of(&doc), n),
                                 format!("idx:email:user{n}@example.com:{n:020}").into_bytes(),
