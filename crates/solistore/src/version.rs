@@ -45,6 +45,12 @@ pub struct TableFile {
     fs: Arc<dyn Fs>,
     cache: Arc<BlockCache>,
     reader: OnceLock<Arc<TableReader>>,
+    /// Held while the reader is opened, so it is opened once: concurrent
+    /// readers of a table nobody had opened yet each read its index and
+    /// filter (a few MB) and all but one threw theirs away. With hundreds
+    /// of SoliDB query threads reaching a compaction's new tables at once,
+    /// that briefly took 600 MB.
+    opening: parking_lot::Mutex<()>,
     obsolete: AtomicBool,
 }
 
@@ -63,6 +69,7 @@ impl TableFile {
             fs,
             cache,
             reader: OnceLock::new(),
+            opening: parking_lot::Mutex::new(()),
             obsolete: AtomicBool::new(false),
         }
     }
@@ -71,10 +78,13 @@ impl TableFile {
         if let Some(reader) = self.reader.get() {
             return Ok(reader.clone());
         }
+        let _opening = self.opening.lock();
+        if let Some(reader) = self.reader.get() {
+            return Ok(reader.clone());
+        }
         let reader = TableReader::open(self.fs.open_random(&self.path)?)?
             .with_cache(self.cache.clone(), self.number);
-        let reader = Arc::new(reader);
-        Ok(self.reader.get_or_init(|| reader).clone())
+        Ok(self.reader.get_or_init(|| Arc::new(reader)).clone())
     }
 
     /// No longer in the live version: delete the file when the last reader

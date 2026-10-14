@@ -1699,6 +1699,11 @@ impl Inner {
                 ))
             })
             .collect();
+        // Open the new tables here, on the flush thread, so the first
+        // readers after the install do not each pay for it.
+        for table in &tables {
+            table.reader()?;
+        }
         self.log_and_apply(
             |sv| {
                 let mut edits: Vec<Edit> = files
@@ -1865,6 +1870,10 @@ impl Inner {
                 })
                 .collect()
         };
+        // Opened before they are installed, as the flush does.
+        for table in &new_tables {
+            table.reader()?;
+        }
         let applied = self.log_and_apply(
             |sv| {
                 let current = c
