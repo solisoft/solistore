@@ -269,6 +269,87 @@ mod rocks {
     }
 }
 
+// ---------------------------------------------------------------- solistore
+
+#[cfg(feature = "solistore")]
+mod soli {
+    use super::*;
+    use solistore::{ColumnFamily, Db, Durability, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions};
+
+    const META: &str = "_meta";
+    const SHARED: &str = "__keyspaces__";
+
+    /// The same layout as the RocksDB engine: collections share one column
+    /// family under an 8-byte prefix, and `_meta` holds the registry.
+    pub struct Soli {
+        db: Db,
+        meta: ColumnFamily,
+        shared: ColumnFamily,
+        dead: std::sync::Mutex<Vec<u32>>,
+    }
+
+    impl Soli {
+        pub fn open(dir: &Path, durability: Durability) -> Self {
+            let db = Db::open(dir, Options { durability, ..Options::default() }).expect("open solistore");
+            let cf = |name: &str| db.cf_handle(name).unwrap_or_else(|| db.create_cf(name).unwrap());
+            let (meta, shared) = (cf(META), cf(SHARED));
+            Soli { db, meta, shared, dead: std::sync::Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl Engine for Soli {
+        fn create_collection(&self, coll: u32) {
+            self.db.put(&self.meta, format!("coll:{coll}"), coll.to_be_bytes()).unwrap();
+        }
+
+        fn drop_collection(&self, coll: u32) {
+            let (from, to) = coll_range(coll);
+            let mut batch = WriteBatch::new();
+            batch.delete(&self.meta, format!("coll:{coll}"));
+            batch.put(&self.meta, format!("dead_ks:{coll}"), b"");
+            batch.delete_range(&self.shared, from, to);
+            self.db.write(batch).unwrap();
+            self.dead.lock().unwrap().push(coll);
+        }
+
+        fn reclaim(&self) {
+            // Nothing yet: range compaction comes with SSTs (M4).
+            self.dead.lock().unwrap().clear();
+        }
+
+        fn write(&self, ops: Vec<Op>, sync: bool) {
+            let mut batch = WriteBatch::new();
+            for op in ops {
+                let key = prefixed(op.coll, &op.key);
+                match op.value {
+                    Some(v) => batch.put(&self.shared, key, v),
+                    None => batch.delete(&self.shared, key),
+                }
+            }
+            self.db.write_opt(batch, &WriteOptions { sync }).unwrap();
+        }
+
+        fn get(&self, coll: u32, key: &[u8]) -> Option<Vec<u8>> {
+            self.db.get(&self.shared, prefixed(coll, key)).unwrap().map(|v| v.to_vec())
+        }
+
+        fn scan_keys(&self, coll: u32, start: &[u8], end: &[u8], rev: bool, limit: usize) -> Vec<Vec<u8>> {
+            let opts = ReadOptions { lower_bound: Some(prefixed(coll, start)), upper_bound: Some(prefixed(coll, end)) };
+            let mode = if rev { IteratorMode::End } else { IteratorMode::Start };
+            self.db
+                .iterator_opt(&self.shared, opts, mode)
+                .unwrap()
+                .take(limit)
+                .map(|item| item.unwrap().0[8..].to_vec())
+                .collect()
+        }
+
+        fn flush(&self) {
+            self.db.sync_wal().unwrap();
+        }
+    }
+}
+
 /// RocksDB settings under test on top of the prod profile.
 #[derive(Clone, Default)]
 struct RocksTuning {
@@ -283,6 +364,16 @@ fn open_engine(p: &Params) -> Box<dyn Engine> {
     match p.engine.as_str() {
         #[cfg(feature = "rocks")]
         "rocks" => Box::new(rocks::Rocks::open(&p.dir, &p.rocks)),
+        // Every commit fsynced before it returns: the default.
+        #[cfg(feature = "solistore")]
+        "solistore" => Box::new(soli::Soli::open(&p.dir, solistore::Durability::Full)),
+        // Writes acknowledged once in the OS, fsynced every 100 ms: what
+        // RocksDB's unsynced writes are compared against.
+        #[cfg(feature = "solistore")]
+        "solistore-eventual" => Box::new(soli::Soli::open(
+            &p.dir,
+            solistore::Durability::Eventual { sync_interval: Duration::from_millis(100) },
+        )),
         other => panic!("unknown engine {other}"),
     }
 }

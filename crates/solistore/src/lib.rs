@@ -7,3 +7,22 @@
 //!
 //! Every commit is fsynced before it is acknowledged unless the database is
 //! opened in eventual mode; concurrent commits share one fsync.
+
+mod batch;
+mod coding;
+mod db;
+mod error;
+pub mod fs;
+mod iter;
+mod key;
+mod log;
+mod manifest;
+mod memtable;
+
+pub use batch::WriteBatch;
+pub use bytes::Bytes;
+pub use db::{
+    ColumnFamily, Db, Durability, Options, RecoveryReport, WriteOptions, MAX_GROUP_BYTES,
+};
+pub use error::{Error, Result};
+pub use iter::{DbIterator, Direction, IteratorMode, ReadOptions};

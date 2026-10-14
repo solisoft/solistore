@@ -1,0 +1,453 @@
+//! The file system, behind a trait so tests can crash it.
+//!
+//! [`StdFs`] is the real one. [`FaultFs`] is an in-memory file system that
+//! knows which bytes and which directory entries have been made durable, and
+//! can "crash": throw away everything that was not, optionally leaving a torn
+//! tail of unsynced bytes behind. It also fails fsyncs on demand. Crash tests
+//! run thousands of crash points through it in the time one process-level
+//! SIGKILL test takes.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+/// A file being written: appended to by one writer at a time, synced by any
+/// thread (the commit leader, or the background syncer in eventual mode).
+pub trait WritableFile: Send + Sync {
+    fn append(&self, data: &[u8]) -> io::Result<()>;
+    /// Make every appended byte durable (`fdatasync`).
+    fn sync(&self) -> io::Result<()>;
+}
+
+pub trait Fs: Send + Sync + fmt::Debug {
+    fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+    /// Create `path`, truncating it if it exists, for appending.
+    fn create(&self, path: &Path) -> io::Result<Arc<dyn WritableFile>>;
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+    /// Names of the files directly in `dir`.
+    fn list(&self, dir: &Path) -> io::Result<Vec<String>>;
+    fn exists(&self, path: &Path) -> bool;
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn remove(&self, path: &Path) -> io::Result<()>;
+    /// Make the creations, renames and removals in `dir` durable.
+    fn sync_dir(&self, dir: &Path) -> io::Result<()>;
+    /// An exclusive lock on `path`, held until the returned guard drops.
+    fn lock(&self, path: &Path) -> io::Result<Box<dyn Send + Sync>>;
+}
+
+// ---------------------------------------------------------------- StdFs
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StdFs;
+
+struct StdFile(File);
+
+impl WritableFile for StdFile {
+    fn append(&self, data: &[u8]) -> io::Result<()> {
+        (&self.0).write_all(data)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.0.sync_data()
+    }
+}
+
+impl Fs for StdFs {
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(path)
+    }
+
+    fn create(&self, path: &Path) -> io::Result<Arc<dyn WritableFile>> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(Arc::new(StdFile(file)))
+    }
+
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+
+    fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        Ok(names)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
+
+    #[cfg(unix)]
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        File::open(dir)?.sync_all()
+    }
+
+    // Windows cannot open a directory as a file; NTFS journals its metadata.
+    #[cfg(not(unix))]
+    fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn lock(&self, path: &Path) -> io::Result<Box<dyn Send + Sync>> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        file.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "{} is locked: another process has this database open",
+                    path.display()
+                ),
+            ),
+            std::fs::TryLockError::Error(e) => e,
+        })?;
+        Ok(Box::new(file))
+    }
+}
+
+// ---------------------------------------------------------------- FaultFs
+
+#[derive(Default)]
+struct Node {
+    data: Vec<u8>,
+    /// Bytes `sync` has made durable; a crash keeps at most these (plus a
+    /// torn tail, if asked for).
+    synced: usize,
+}
+
+type NodeRef = Arc<Mutex<Node>>;
+
+#[derive(Default)]
+struct State {
+    /// Bumped by every crash; handles from an earlier generation are dead.
+    generation: u64,
+    /// The namespace as the running process sees it.
+    live: BTreeMap<PathBuf, NodeRef>,
+    /// The namespace as it was at each directory's last `sync_dir`.
+    durable: BTreeMap<PathBuf, NodeRef>,
+    dirs: BTreeSet<PathBuf>,
+    failing_syncs: u32,
+    syncs: u64,
+    sync_delay: std::time::Duration,
+}
+
+/// An in-memory file system that can crash. Cloning shares the same files.
+#[derive(Clone, Default)]
+pub struct FaultFs {
+    state: Arc<Mutex<State>>,
+}
+
+impl fmt::Debug for FaultFs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FaultFs")
+    }
+}
+
+/// What a crash leaves of the bytes that were written but not synced.
+#[derive(Debug, Clone, Copy)]
+pub enum Torn {
+    /// Nothing: every file ends at its last sync.
+    None,
+    /// A pseudo-random prefix of the unsynced bytes survives, and with it
+    /// sometimes a few garbage bytes, as a write cut short by power loss can
+    /// leave. Deterministic for a given seed.
+    Seeded(u64),
+}
+
+struct FaultFile {
+    node: NodeRef,
+    state: Arc<Mutex<State>>,
+    generation: u64,
+}
+
+fn crashed() -> io::Error {
+    io::Error::other("FaultFs: this handle belongs to a crashed process")
+}
+
+impl FaultFile {
+    fn check_alive(&self) -> io::Result<()> {
+        if self.state.lock().generation == self.generation {
+            Ok(())
+        } else {
+            Err(crashed())
+        }
+    }
+}
+
+impl WritableFile for FaultFile {
+    fn append(&self, data: &[u8]) -> io::Result<()> {
+        self.check_alive()?;
+        self.node.lock().data.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        let delay = {
+            let mut state = self.state.lock();
+            if state.generation != self.generation {
+                return Err(crashed());
+            }
+            state.syncs += 1;
+            if state.failing_syncs > 0 {
+                state.failing_syncs -= 1;
+                return Err(io::Error::other("FaultFs: injected EIO on fsync"));
+            }
+            state.sync_delay
+        };
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        let mut node = self.node.lock();
+        node.synced = node.data.len();
+        Ok(())
+    }
+}
+
+/// xorshift64*: enough randomness for torn tails without a dependency.
+fn next_random(seed: &mut u64) -> u64 {
+    *seed ^= *seed >> 12;
+    *seed ^= *seed << 25;
+    *seed ^= *seed >> 27;
+    seed.wrapping_mul(0x2545_f491_4f6c_dd1d)
+}
+
+impl FaultFs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Simulate power loss: every file not reachable through a synced
+    /// directory entry disappears, and every file loses its unsynced bytes
+    /// (all of them, or all but a torn prefix). Handles opened before the
+    /// crash fail from now on.
+    pub fn crash(&self, torn: Torn) {
+        let mut state = self.state.lock();
+        state.generation += 1;
+        let mut seed = match torn {
+            Torn::None => 0,
+            Torn::Seeded(seed) => seed | 1,
+        };
+        let mut survivors = BTreeMap::new();
+        for (path, node) in &state.durable {
+            let node = node.lock();
+            let mut data = node.data[..node.synced].to_vec();
+            let unsynced = &node.data[node.synced..];
+            if seed != 0 && !unsynced.is_empty() {
+                let keep = (next_random(&mut seed) % (unsynced.len() as u64 + 1)) as usize;
+                data.extend_from_slice(&unsynced[..keep]);
+                if next_random(&mut seed).is_multiple_of(4) {
+                    let garbage = (next_random(&mut seed) % 16) as usize;
+                    data.extend((0..garbage).map(|_| next_random(&mut seed) as u8));
+                }
+            }
+            let synced = data.len();
+            survivors.insert(path.clone(), Arc::new(Mutex::new(Node { data, synced })));
+        }
+        state.live = survivors.clone();
+        state.durable = survivors;
+    }
+
+    /// The next `n` fsyncs fail with EIO (and make nothing durable).
+    pub fn fail_next_syncs(&self, n: u32) {
+        self.state.lock().failing_syncs = n;
+    }
+
+    /// Make every fsync take this long, as a disk's would: commits then
+    /// arrive while one is in flight, which is what group commit is for.
+    pub fn set_sync_delay(&self, delay: std::time::Duration) {
+        self.state.lock().sync_delay = delay;
+    }
+
+    /// File fsyncs so far (directory syncs not counted).
+    pub fn sync_count(&self) -> u64 {
+        self.state.lock().syncs
+    }
+
+    fn not_found(path: &Path) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("FaultFs: {} not found", path.display()),
+        )
+    }
+}
+
+impl Fs for FaultFs {
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        self.state.lock().dirs.insert(path.to_path_buf());
+        Ok(())
+    }
+
+    fn create(&self, path: &Path) -> io::Result<Arc<dyn WritableFile>> {
+        let mut state = self.state.lock();
+        let node: NodeRef = Arc::default();
+        state.live.insert(path.to_path_buf(), node.clone());
+        Ok(Arc::new(FaultFile {
+            node,
+            state: self.state.clone(),
+            generation: state.generation,
+        }))
+    }
+
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let state = self.state.lock();
+        let node = state.live.get(path).ok_or_else(|| Self::not_found(path))?;
+        let data = node.lock().data.clone();
+        Ok(data)
+    }
+
+    fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+        let state = self.state.lock();
+        Ok(state
+            .live
+            .keys()
+            .filter(|p| p.parent() == Some(dir))
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect())
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        let state = self.state.lock();
+        state.live.contains_key(path) || state.dirs.contains(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut state = self.state.lock();
+        let node = state
+            .live
+            .remove(from)
+            .ok_or_else(|| Self::not_found(from))?;
+        state.live.insert(to.to_path_buf(), node);
+        Ok(())
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        let mut state = self.state.lock();
+        state
+            .live
+            .remove(path)
+            .map(|_| ())
+            .ok_or_else(|| Self::not_found(path))
+    }
+
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        let mut state = self.state.lock();
+        let in_dir = |p: &PathBuf| p.parent() == Some(dir);
+        state.durable.retain(|p, _| !in_dir(p));
+        let entries: Vec<_> = state
+            .live
+            .iter()
+            .filter(|(p, _)| in_dir(p))
+            .map(|(p, n)| (p.clone(), n.clone()))
+            .collect();
+        state.durable.extend(entries);
+        Ok(())
+    }
+
+    fn lock(&self, _path: &Path) -> io::Result<Box<dyn Send + Sync>> {
+        Ok(Box::new(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_crash_keeps_synced_bytes_and_synced_names_only() {
+        let fs = FaultFs::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+
+        let a = fs.create(&dir.join("a")).unwrap();
+        a.append(b"durable").unwrap();
+        a.sync().unwrap();
+        a.append(b" lost").unwrap();
+        fs.sync_dir(dir).unwrap();
+        // Created after the directory sync: its name is not durable.
+        let b = fs.create(&dir.join("b")).unwrap();
+        b.append(b"x").unwrap();
+        b.sync().unwrap();
+
+        fs.crash(Torn::None);
+        assert_eq!(fs.read(&dir.join("a")).unwrap(), b"durable");
+        assert!(!fs.exists(&dir.join("b")));
+        assert!(
+            a.append(b"late").is_err(),
+            "a pre-crash handle must be dead"
+        );
+    }
+
+    #[test]
+    fn a_rename_is_durable_only_after_the_directory_sync() {
+        let fs = FaultFs::new();
+        let dir = Path::new("/db");
+        let f = fs.create(&dir.join("tmp")).unwrap();
+        f.append(b"v1").unwrap();
+        f.sync().unwrap();
+        fs.sync_dir(dir).unwrap();
+        fs.rename(&dir.join("tmp"), &dir.join("CURRENT")).unwrap();
+        fs.crash(Torn::None);
+        assert!(fs.exists(&dir.join("tmp")));
+        assert!(!fs.exists(&dir.join("CURRENT")));
+    }
+
+    #[test]
+    fn injected_sync_failures_make_nothing_durable() {
+        let fs = FaultFs::new();
+        let dir = Path::new("/db");
+        let f = fs.create(&dir.join("a")).unwrap();
+        fs.sync_dir(dir).unwrap();
+        f.append(b"data").unwrap();
+        fs.fail_next_syncs(1);
+        assert!(f.sync().is_err());
+        fs.crash(Torn::None);
+        assert_eq!(fs.read(&dir.join("a")).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_torn_crash_keeps_a_prefix_of_the_unsynced_bytes() {
+        for seed in 0..64 {
+            let fs = FaultFs::new();
+            let dir = Path::new("/db");
+            let f = fs.create(&dir.join("a")).unwrap();
+            fs.sync_dir(dir).unwrap();
+            f.append(b"synced|").unwrap();
+            f.sync().unwrap();
+            f.append(b"unsynced tail").unwrap();
+            fs.crash(Torn::Seeded(seed));
+            let data = fs.read(&dir.join("a")).unwrap();
+            assert!(data.starts_with(b"synced|"));
+            let tail = &data[7..];
+            let real = tail
+                .iter()
+                .zip(b"unsynced tail")
+                .take_while(|(a, b)| a == b)
+                .count();
+            assert!(real <= 13 && tail.len() <= real + 16);
+        }
+    }
+}
