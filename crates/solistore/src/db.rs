@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -255,6 +255,11 @@ struct Inner {
     commit: Mutex<CommitState>,
     queue: Mutex<Queue>,
     queue_cv: Condvar,
+    /// Mirrors of the queue's state, readable while spinning.
+    queued: AtomicUsize,
+    leader_busy: AtomicBool,
+    /// Members of the last group, to gather as many for the next fsync.
+    last_group: AtomicUsize,
     /// Wakes writers waiting for `visible_seq` to reach their group.
     publish: Mutex<()>,
     publish_cv: Condvar,
@@ -302,6 +307,8 @@ struct Pending {
     sync: bool,
     /// Set by the leader that wrote this batch to the WAL, under the queue lock.
     slot: Mutex<Option<Slot>>,
+    /// `slot` is set: lets a waiting writer spin without the queue lock.
+    ready: AtomicBool,
 }
 
 /// What a writer is told by its group's leader.
@@ -324,6 +331,30 @@ struct Group {
 struct Queue {
     waiting: VecDeque<Arc<Pending>>,
     leader_active: bool,
+}
+
+/// How long a writer spins, yielding, before it sleeps on a condition
+/// variable. Waking a sleeping thread costs tens of microseconds — as much
+/// as the work it waits for — and most waits here end sooner than this.
+const SPIN: Duration = Duration::from_micros(50);
+
+/// Spin until `done`, at most [`SPIN`]. Returns whether it became true.
+fn spin_until(done: impl Fn() -> bool) -> bool {
+    let start = Instant::now();
+    for i in 1u32.. {
+        if done() {
+            return true;
+        }
+        if i % 32 == 0 {
+            if start.elapsed() > SPIN {
+                return false;
+            }
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+    unreachable!()
 }
 
 pub(crate) fn wal_name(no: u64) -> String {
@@ -493,6 +524,9 @@ impl Db {
             }),
             queue: Mutex::new(Queue::default()),
             queue_cv: Condvar::new(),
+            queued: AtomicUsize::new(0),
+            leader_busy: AtomicBool::new(false),
+            last_group: AtomicUsize::new(1),
             publish: Mutex::new(()),
             publish_cv: Condvar::new(),
             current_wal: Mutex::new(wal),
@@ -1029,17 +1063,32 @@ impl Inner {
             batch,
             sync,
             slot: Mutex::new(None),
+            ready: AtomicBool::new(false),
         });
         let mut queue = self.queue.lock();
         queue.waiting.push_back(me.clone());
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        let mut spun = false;
         let lead = loop {
-            if let Some(slot) = me.slot.lock().take() {
-                break Err(slot);
+            if me.ready.load(Ordering::Acquire) {
+                break Err(me.slot.lock().take().expect("ready means set"));
             }
             let at_head = queue.waiting.front().is_some_and(|p| Arc::ptr_eq(p, &me));
             if at_head && !queue.leader_active {
                 break Ok(());
             }
+            if !spun {
+                // Most waits end within microseconds: spin before sleeping.
+                spun = true;
+                parking_lot::MutexGuard::unlocked(&mut queue, || {
+                    spin_until(|| {
+                        me.ready.load(Ordering::Acquire)
+                            || !self.leader_busy.load(Ordering::Acquire)
+                    });
+                });
+                continue;
+            }
+            spun = false;
             self.queue_cv.wait(&mut queue);
         };
         let slot = match lead {
@@ -1048,10 +1097,22 @@ impl Inner {
                 slot
             }
             Ok(()) => {
-                // Leader: take the group and write it to the WAL outside the
-                // queue lock. The next leader can start on its own group as
-                // soon as this one is in the WAL.
                 queue.leader_active = true;
+                self.leader_busy.store(true, Ordering::Release);
+                // A group that will be fsynced is worth gathering: when the
+                // last group's writers come back, the first one would
+                // otherwise pay a whole fsync alone while the rest queue up
+                // behind it.
+                let fsync = self.durability == Durability::Full || me.sync;
+                let want = self.last_group.load(Ordering::Relaxed);
+                if fsync && queue.waiting.len() < want {
+                    parking_lot::MutexGuard::unlocked(&mut queue, || {
+                        spin_until(|| self.queued.load(Ordering::Acquire) >= want);
+                    });
+                }
+                // Take the group and write it to the WAL outside the queue
+                // lock. The next leader can start on its own group as soon as
+                // this one is in the WAL.
                 let mut group = Vec::new();
                 let mut bytes = 0;
                 while let Some(next) = queue.waiting.front() {
@@ -1062,6 +1123,8 @@ impl Inner {
                     bytes += size;
                     group.push(queue.waiting.pop_front().expect("front exists"));
                 }
+                self.queued.fetch_sub(group.len(), Ordering::Relaxed);
+                self.last_group.store(group.len(), Ordering::Relaxed);
                 drop(queue);
                 let guard = LeaderGuard {
                     inner: self,
@@ -1139,26 +1202,25 @@ impl Inner {
     fn insert_and_publish(&self, batch: &WriteBatch, group: &Group, first: u64) {
         apply(&group.mem, batch.ops(), first, |_| true);
         if group.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut published = self.publish.lock();
-            while self.visible_seq.load(Ordering::Acquire) < group.first - 1 {
-                self.publish_cv.wait(&mut published);
-            }
+            self.wait_published(group.first - 1);
+            // Under the lock, so a writer that just found the old value is
+            // already waiting when the notification goes out.
+            let published = self.publish.lock();
             self.visible_seq.store(group.last, Ordering::Release);
             drop(published);
             self.publish_cv.notify_all();
         } else {
-            let mut published = self.publish.lock();
-            while self.visible_seq.load(Ordering::Acquire) < group.last {
-                self.publish_cv.wait(&mut published);
-            }
+            self.wait_published(group.last);
         }
     }
 
-    /// Wait until every sequence number handed out is published: nothing is
-    /// still being inserted into the current memtable.
-    fn wait_published(&self, last_seq: u64) {
+    /// Wait until `visible_seq` reaches `seq`.
+    fn wait_published(&self, seq: u64) {
+        if spin_until(|| self.visible_seq.load(Ordering::Acquire) >= seq) {
+            return;
+        }
         let mut published = self.publish.lock();
-        while self.visible_seq.load(Ordering::Acquire) < last_seq {
+        while self.visible_seq.load(Ordering::Acquire) < seq {
             self.publish_cv.wait(&mut published);
         }
     }
@@ -1549,9 +1611,11 @@ impl LeaderGuard<'_> {
                 mine = Some(slot);
             } else {
                 *pending.slot.lock() = Some(slot);
+                pending.ready.store(true, Ordering::Release);
             }
         }
         queue.leader_active = false;
+        self.inner.leader_busy.store(false, Ordering::Release);
         drop(queue);
         self.inner.queue_cv.notify_all();
         std::mem::forget(self);
@@ -1567,9 +1631,11 @@ impl Drop for LeaderGuard<'_> {
         for pending in self.group {
             if !Arc::ptr_eq(pending, self.me) {
                 *pending.slot.lock() = Some(Slot::Failed(Error::Poisoned));
+                pending.ready.store(true, Ordering::Release);
             }
         }
         queue.leader_active = false;
+        self.inner.leader_busy.store(false, Ordering::Release);
         drop(queue);
         self.inner.queue_cv.notify_all();
     }
