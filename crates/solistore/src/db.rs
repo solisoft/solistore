@@ -744,6 +744,36 @@ impl Db {
             .sum()
     }
 
+    /// Approximate bytes on disk of the keys in `[start, end)` of `cf`:
+    /// table files only, as RocksDB's `GetApproximateSizes` without the
+    /// memtables. A file wholly inside the range counts in full; one that
+    /// straddles an edge counts from its index, block by block.
+    pub fn approximate_size(&self, cf: &ColumnFamily, start: &[u8], end: &[u8]) -> Result<u64> {
+        cf.check()?;
+        if start >= end {
+            return Ok(0);
+        }
+        let lo = key::first_of(cf.id(), start);
+        let hi = key::first_of(cf.id(), end);
+        let sv = self.inner().sv.load();
+        let mut total = 0;
+        for file in sv.version.files() {
+            let (smallest, largest) = (&file.props.smallest, &file.props.largest);
+            if key::compare(largest, &lo).is_lt() || key::compare(smallest, &hi).is_ge() {
+                continue;
+            }
+            if key::compare(smallest, &lo).is_ge() && key::compare(largest, &hi).is_lt() {
+                total += file.props.size;
+                continue;
+            }
+            let reader = file.reader()?;
+            let from = reader.approximate_offset_of(&lo)?;
+            let to = reader.approximate_offset_of(&hi)?;
+            total += to.saturating_sub(from);
+        }
+        Ok(total)
+    }
+
     /// Range tombstones some table file may still hold deleted data for.
     pub fn pending_range_tombstones(&self) -> usize {
         self.inner().sv.load().version.tombstones.len()

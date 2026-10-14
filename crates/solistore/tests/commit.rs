@@ -621,3 +621,59 @@ fn column_families_come_and_go_while_others_are_written() {
         total
     );
 }
+
+#[test]
+fn approximate_size_counts_flushed_data_in_the_range() {
+    let fs = FaultFs::new();
+    let db = Db::open(
+        "/db",
+        Options {
+            fs: Arc::new(fs.clone()),
+            // Small files, so the ranges below cut through some of them.
+            target_file_size: 64 << 10,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let cf = db.create_cf("c").unwrap();
+    // Values that do not compress, so data blocks dominate each file.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for prefix in *b"ab" {
+        for i in 0..4000u32 {
+            let mut key = vec![prefix];
+            key.extend_from_slice(&i.to_be_bytes());
+            let value: Vec<u8> = (0..25)
+                .flat_map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()
+                })
+                .collect();
+            db.put(&cf, key, value).unwrap();
+        }
+    }
+    // Unflushed data is not counted.
+    assert_eq!(db.approximate_size(&cf, b"a", b"c").unwrap(), 0);
+    db.flush().unwrap();
+
+    let all = db.approximate_size(&cf, b"a", b"c").unwrap();
+    let a = db.approximate_size(&cf, b"a", b"b").unwrap();
+    let b = db.approximate_size(&cf, b"b", b"c").unwrap();
+    let half = db.approximate_size(&cf, b"a", b"a\0\0\x07\xd0").unwrap();
+    assert!(all > 0 && all <= db.live_table_bytes(), "{all}");
+    // The two prefixes hold the same data; each is about half.
+    for part in [a, b] {
+        assert!(
+            part * 10 > all * 4 && part * 10 < all * 6,
+            "{part} of {all}"
+        );
+    }
+    // The first 2000 keys of `a` are about half of it.
+    assert!(half * 10 > a * 3 && half * 10 < a * 7, "{half} of {a}");
+    assert_eq!(db.approximate_size(&cf, b"c", b"d").unwrap(), 0);
+    assert_eq!(db.approximate_size(&cf, b"b", b"a").unwrap(), 0);
+    // Another column family's keys are not counted.
+    let other = db.create_cf("d").unwrap();
+    assert_eq!(db.approximate_size(&other, b"a", b"c").unwrap(), 0);
+}

@@ -271,6 +271,8 @@ impl TableBuilder {
 pub struct TableReader {
     file: Arc<dyn RandomAccessFile>,
     index: Block,
+    /// Where the data blocks end (the filter follows them).
+    data_end: u64,
     filter: Bytes,
     /// Bytes held in memory for this table (index and filter).
     pinned: usize,
@@ -337,6 +339,7 @@ impl TableReader {
             offset: u64_at(16),
             len: u64_at(24),
         };
+        let filter_at = filter.offset;
         let index = Block::new(read_block(file.as_ref(), index)?)?;
         let filter = read_block(file.as_ref(), filter)?;
         let pinned = index.size() + filter.len();
@@ -344,6 +347,7 @@ impl TableReader {
             cache: None,
             file,
             index,
+            data_end: filter_at,
             filter,
             pinned,
         })
@@ -372,6 +376,19 @@ impl TableReader {
             return Ok(block);
         }
         Block::new(read_block(self.file.as_ref(), handle)?)
+    }
+
+    /// Where in the file the data for internal keys at or after `target`
+    /// begins: the first data block that may hold one, or the end of the
+    /// data. Read from the index alone.
+    pub fn approximate_offset_of(&self, target: &[u8]) -> Result<u64> {
+        let mut index = self.index.iter();
+        index.seek(target);
+        index.status()?;
+        if !index.valid() {
+            return Ok(self.data_end);
+        }
+        Ok(Handle::decode(&index.value())?.offset)
     }
 
     /// The newest version of `user_key` at most `snapshot`, if this table has one.
