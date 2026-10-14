@@ -21,6 +21,7 @@ use bytes::Bytes;
 
 use super::block::{Block, BlockBuilder, BlockIter, RESTART_INTERVAL};
 use super::bloom;
+use super::cache::BlockCache;
 use crate::coding::{get_varint, put_varint};
 use crate::error::{Error, Result};
 use crate::fs::{RandomAccessFile, WritableFile};
@@ -244,6 +245,8 @@ pub struct TableReader {
     filter: Bytes,
     /// Bytes held in memory for this table (index and filter).
     pinned: usize,
+    /// The shared block cache and this table's number in it.
+    cache: Option<(Arc<BlockCache>, u64)>,
 }
 
 fn read_block(file: &dyn RandomAccessFile, handle: Handle) -> Result<Bytes> {
@@ -309,6 +312,7 @@ impl TableReader {
         let filter = read_block(file.as_ref(), filter)?;
         let pinned = index.size() + filter.len();
         Ok(TableReader {
+            cache: None,
             file,
             index,
             filter,
@@ -320,11 +324,28 @@ impl TableReader {
         self.pinned
     }
 
-    fn data_block(&self, handle_bytes: &[u8]) -> Result<Block> {
-        Block::new(read_block(
-            self.file.as_ref(),
-            Handle::decode(handle_bytes)?,
-        )?)
+    /// Serve data blocks through `cache`, where this table is `number`.
+    pub fn with_cache(mut self, cache: Arc<BlockCache>, number: u64) -> Self {
+        self.cache = Some((cache, number));
+        self
+    }
+
+    /// A data block, from the cache when it is there. `fill` says whether
+    /// to keep a block read from disk: compactions read everything once
+    /// and would only push out what readers need.
+    fn data_block(&self, handle_bytes: &[u8], fill: bool) -> Result<Block> {
+        let handle = Handle::decode(handle_bytes)?;
+        if let Some((cache, number)) = &self.cache {
+            if let Some(block) = cache.get(*number, handle.offset) {
+                return Ok(block);
+            }
+            let block = Block::new(read_block(self.file.as_ref(), handle)?)?;
+            if fill {
+                cache.insert(*number, handle.offset, block.clone());
+            }
+            return Ok(block);
+        }
+        Block::new(read_block(self.file.as_ref(), handle)?)
     }
 
     /// The newest version of `user_key` at most `snapshot`, if this table has one.
@@ -339,7 +360,7 @@ impl TableReader {
         if !index.valid() {
             return Ok(None);
         }
-        let mut it = self.data_block(&index.value())?.iter();
+        let mut it = self.data_block(&index.value(), true)?.iter();
         it.seek(&target);
         it.status()?;
         if !it.valid() {
@@ -349,7 +370,7 @@ impl TableReader {
             if !index.valid() {
                 return Ok(None);
             }
-            it = self.data_block(&index.value())?.iter();
+            it = self.data_block(&index.value(), true)?.iter();
             it.seek_to_first();
             it.status()?;
             if !it.valid() {
@@ -374,6 +395,7 @@ pub struct TableIter {
     index: BlockIter,
     data: Option<BlockIter>,
     error: Option<Error>,
+    fill_cache: bool,
 }
 
 impl TableIter {
@@ -384,7 +406,14 @@ impl TableIter {
             index,
             data: None,
             error: None,
+            fill_cache: true,
         }
+    }
+
+    /// For a compaction: blocks read from disk are not kept in the cache.
+    pub fn without_filling_cache(mut self) -> Self {
+        self.fill_cache = false;
+        self
     }
 
     /// Open the data block the index points at.
@@ -396,7 +425,7 @@ impl TableIter {
             }
             return false;
         }
-        match self.table.data_block(&self.index.value()) {
+        match self.table.data_block(&self.index.value(), self.fill_cache) {
             Ok(block) => {
                 self.data = Some(block.iter());
                 true

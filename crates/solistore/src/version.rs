@@ -25,7 +25,7 @@ use crate::fs::Fs;
 use crate::iter::InternalIterator;
 use crate::key::{self, Kind};
 use crate::memtable::{covering_seq, MemIter, Memtable, RangeTombstone, Version as Found};
-use crate::sst::{TableIter, TableProps, TableReader};
+use crate::sst::{BlockCache, TableIter, TableProps, TableReader};
 
 pub const NUM_LEVELS: usize = 7;
 
@@ -43,17 +43,25 @@ pub struct TableFile {
     pub props: TableProps,
     path: PathBuf,
     fs: Arc<dyn Fs>,
+    cache: Arc<BlockCache>,
     reader: OnceLock<Arc<TableReader>>,
     obsolete: AtomicBool,
 }
 
 impl TableFile {
-    pub fn new(fs: Arc<dyn Fs>, dir: &std::path::Path, number: u64, props: TableProps) -> Self {
+    pub fn new(
+        fs: Arc<dyn Fs>,
+        cache: Arc<BlockCache>,
+        dir: &std::path::Path,
+        number: u64,
+        props: TableProps,
+    ) -> Self {
         TableFile {
             number,
             props,
             path: dir.join(table_name(number)),
             fs,
+            cache,
             reader: OnceLock::new(),
             obsolete: AtomicBool::new(false),
         }
@@ -63,7 +71,9 @@ impl TableFile {
         if let Some(reader) = self.reader.get() {
             return Ok(reader.clone());
         }
-        let reader = Arc::new(TableReader::open(self.fs.open_random(&self.path)?)?);
+        let reader = TableReader::open(self.fs.open_random(&self.path)?)?
+            .with_cache(self.cache.clone(), self.number);
+        let reader = Arc::new(reader);
         Ok(self.reader.get_or_init(|| reader).clone())
     }
 
@@ -225,6 +235,7 @@ pub struct LevelIter {
     at: usize,
     current: Option<TableIter>,
     error: Option<Error>,
+    fill_cache: bool,
 }
 
 impl LevelIter {
@@ -234,7 +245,14 @@ impl LevelIter {
             at: 0,
             current: None,
             error: None,
+            fill_cache: true,
         }
+    }
+
+    /// For a compaction: see [`TableIter::without_filling_cache`].
+    pub fn without_filling_cache(mut self) -> Self {
+        self.fill_cache = false;
+        self
     }
 
     fn open(&mut self, at: usize) -> bool {
@@ -242,7 +260,12 @@ impl LevelIter {
         self.current = None;
         match self.files[at].reader() {
             Ok(reader) => {
-                self.current = Some(TableIter::new(reader));
+                let it = TableIter::new(reader);
+                self.current = Some(if self.fill_cache {
+                    it
+                } else {
+                    it.without_filling_cache()
+                });
                 true
             }
             Err(e) => {

@@ -15,6 +15,8 @@ crossbeam-skiplist = "0.1"
 # its faster unchecked paths; input is checksummed before it is decoded.
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 parking_lot = "0.12"
+# The block cache: sharded, weighted by bytes, pure Rust.
+quick_cache = { version = "0.6", default-features = false, features = ["parking_lot"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]

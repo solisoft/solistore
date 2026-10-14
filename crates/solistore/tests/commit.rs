@@ -507,3 +507,107 @@ fn dropping_a_column_family_deletes_its_files() {
         5_000
     );
 }
+
+#[test]
+fn a_checkpoint_is_a_consistent_openable_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+        write_buffer_size: 32 << 10,
+        ..Options::default()
+    };
+    let db = Db::open(dir.path().join("live"), opts.clone()).unwrap();
+    let cf = db.create_cf("c").unwrap();
+    for i in 0..10_000u32 {
+        db.put(&cf, i.to_be_bytes(), b"before").unwrap();
+    }
+    let mut batch = WriteBatch::new();
+    batch.delete_range(&cf, 100u32.to_be_bytes(), 200u32.to_be_bytes());
+    db.write(batch).unwrap();
+    db.checkpoint(dir.path().join("copy")).unwrap();
+    assert!(
+        db.checkpoint(dir.path().join("copy")).is_err(),
+        "an existing target is refused"
+    );
+    for i in 0..10_000u32 {
+        db.put(&cf, i.to_be_bytes(), b"after").unwrap();
+    }
+    db.compact_range(&cf, None, None).unwrap();
+
+    let copy = Db::open(dir.path().join("copy"), opts).unwrap();
+    let ccf = copy
+        .cf_handle("c")
+        .expect("column families are part of the copy");
+    let rows: Vec<_> = copy
+        .iterator(&ccf, IteratorMode::Start)
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(rows.len(), 10_000 - 100);
+    assert!(
+        rows.iter().all(|(_, v)| &v[..] == b"before"),
+        "nothing written after the checkpoint"
+    );
+    copy.put(&ccf, b"new", b"row").unwrap();
+    assert_eq!(
+        db.get(&cf, b"new").unwrap(),
+        None,
+        "the copy is independent"
+    );
+}
+
+#[test]
+fn column_families_come_and_go_while_others_are_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+        write_buffer_size: 32 << 10,
+        ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts.clone()).unwrap();
+    let stable = db.create_cf("stable").unwrap();
+    let stop = AtomicBool::new(false);
+    let written = AtomicU64::new(0);
+    std::thread::scope(|scope| {
+        for t in 0..3u64 {
+            let (db, stable, stop, written) = (&db, &stable, &stop, &written);
+            scope.spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    db.put(stable, format!("{t}:{i:08}"), b"v").unwrap();
+                    written.fetch_add(1, Ordering::Relaxed);
+                    i += 1;
+                }
+            });
+        }
+        let (db, stop) = (&db, &stop);
+        scope.spawn(move || {
+            for round in 0..200 {
+                let cf = db.create_cf("churn").unwrap();
+                for i in 0..20u32 {
+                    db.put(&cf, i.to_be_bytes(), format!("round {round}"))
+                        .unwrap();
+                }
+                assert_eq!(db.iterator(&cf, IteratorMode::Start).unwrap().count(), 20);
+                db.drop_cf("churn").unwrap();
+                assert!(matches!(
+                    db.put(&cf, b"late", b"x"),
+                    Err(Error::ColumnFamilyDropped(_))
+                ));
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+    });
+    let total = written.load(Ordering::Relaxed) as usize;
+    assert_eq!(
+        db.iterator(&stable, IteratorMode::Start).unwrap().count(),
+        total
+    );
+    drop(db);
+    let db = Db::open(dir.path(), opts).unwrap();
+    assert!(db.cf_handle("churn").is_none());
+    assert_eq!(
+        db.iterator(&db.cf_handle("stable").unwrap(), IteratorMode::Start)
+            .unwrap()
+            .count(),
+        total
+    );
+}

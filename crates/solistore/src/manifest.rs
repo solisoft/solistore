@@ -371,6 +371,8 @@ pub(crate) fn file_no_u32(no: u64) -> Result<u32> {
 pub struct ManifestWriter {
     file: Arc<dyn WritableFile>,
     file_no: u32,
+    /// Bytes in the file, to know when to roll it.
+    size: u64,
 }
 
 impl ManifestWriter {
@@ -395,17 +397,30 @@ impl ManifestWriter {
         current.sync()?;
         fs.rename(&tmp, &dir.join(CURRENT))?;
         fs.sync_dir(dir)?;
-        Ok(ManifestWriter { file, file_no })
+        Ok(ManifestWriter {
+            file,
+            file_no,
+            size: record.len() as u64,
+        })
     }
 
     /// Append edits and fsync them: a structural change is acknowledged only
     /// once durable, whatever the database's write durability.
-    pub fn append(&self, edits: &[Edit]) -> Result<()> {
+    pub fn append(&mut self, edits: &[Edit]) -> Result<()> {
         let mut record = Vec::new();
         encode_record(&mut record, self.file_no, &encode_edits(edits));
         self.file.append(&record)?;
+        self.size += record.len() as u64;
         self.file.sync()?;
         Ok(())
+    }
+
+    pub fn number(&self) -> u64 {
+        self.file_no as u64
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
     }
 }
 
@@ -480,7 +495,7 @@ mod tests {
         let dir = Path::new("/db");
         let mut state = ManifestState::new_database();
         let no = state.allocate_file();
-        let writer = ManifestWriter::install(&fs, dir, no, &state).unwrap();
+        let mut writer = ManifestWriter::install(&fs, dir, no, &state).unwrap();
         writer
             .append(&[Edit::CreateCf {
                 id: 1,

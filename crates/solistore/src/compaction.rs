@@ -255,13 +255,19 @@ pub fn run(
     let mut children: Vec<Box<dyn InternalIterator>> = Vec::new();
     if compaction.level == 0 {
         for f in &compaction.inputs {
-            children.push(Box::new(TableIter::new(f.reader()?)));
+            children.push(Box::new(
+                TableIter::new(f.reader()?).without_filling_cache(),
+            ));
         }
     } else {
-        children.push(Box::new(LevelIter::new(compaction.inputs.clone())));
+        children.push(Box::new(
+            LevelIter::new(compaction.inputs.clone()).without_filling_cache(),
+        ));
     }
     if !compaction.overlapping.is_empty() {
-        children.push(Box::new(LevelIter::new(compaction.overlapping.clone())));
+        children.push(Box::new(
+            LevelIter::new(compaction.overlapping.clone()).without_filling_cache(),
+        ));
     }
     let mut merged = MergingIterator::new(children);
     merged.seek_ge(&key::first_of(0, b""));

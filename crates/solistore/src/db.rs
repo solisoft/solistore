@@ -48,11 +48,15 @@ use crate::key::{Kind, MAX_SEQ};
 use crate::log::{encode_record_parts, read_records};
 use crate::manifest::{self, file_no_u32, Edit, ManifestState, ManifestWriter, DEFAULT_CF};
 use crate::memtable::Memtable;
+use crate::sst::BlockCache;
 use crate::version::{by_smallest, table_name, SuperVersion, TableFile, Version, NUM_LEVELS};
 
 /// The most a commit group writes to the WAL at once. A leader stops taking
 /// batches past this, so one huge group cannot hold every writer up.
 pub const MAX_GROUP_BYTES: usize = 4 << 20;
+
+/// A MANIFEST past this size is replaced by a snapshot of the state.
+const MANIFEST_ROLL_BYTES: u64 = 64 << 20;
 
 /// When a commit is acknowledged relative to the disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +93,8 @@ pub struct Options {
     /// Target size of level 1; each deeper level is `level_multiplier` times larger.
     pub max_bytes_for_level_base: u64,
     pub level_multiplier: u64,
+    /// Bytes of decoded data blocks kept in memory, shared by every table.
+    pub block_cache_size: u64,
 }
 
 impl Default for Options {
@@ -106,6 +112,7 @@ impl Default for Options {
             level0_stop_trigger: 36,
             max_bytes_for_level_base: 512 << 20,
             level_multiplier: 10,
+            block_cache_size: 512 << 20,
         }
     }
 }
@@ -125,6 +132,7 @@ impl fmt::Debug for Options {
             .field("level0_stop_trigger", &self.level0_stop_trigger)
             .field("max_bytes_for_level_base", &self.max_bytes_for_level_base)
             .field("level_multiplier", &self.level_multiplier)
+            .field("block_cache_size", &self.block_cache_size)
             .finish()
     }
 }
@@ -229,6 +237,7 @@ struct Inner {
     write_buffer_size: usize,
     max_imms: usize,
     target_file_size: u64,
+    block_cache: Arc<BlockCache>,
     compaction: compaction::Config,
     l0_slowdown: usize,
     l0_stop: usize,
@@ -397,11 +406,13 @@ impl Db {
             }
         }
 
+        let block_cache = Arc::new(BlockCache::new(opts.block_cache_size));
         let mut version = Version::empty();
         for (level, files) in state.levels.iter().enumerate() {
             for (number, props) in files {
                 version.levels[level].push(Arc::new(TableFile::new(
                     fs.clone(),
+                    block_cache.clone(),
                     &dir,
                     *number,
                     props.clone(),
@@ -431,6 +442,7 @@ impl Db {
             write_buffer_size: opts.write_buffer_size.max(1),
             max_imms: opts.max_immutable_memtables.max(1),
             target_file_size: opts.target_file_size.max(1),
+            block_cache,
             compaction: compaction::Config {
                 l0_trigger: opts.level0_compaction_trigger.max(1),
                 level_base_bytes: opts.max_bytes_for_level_base.max(1),
@@ -530,6 +542,11 @@ impl Db {
             .files()
             .map(|f| f.pinned_bytes())
             .sum()
+    }
+
+    /// Bytes held by the block cache.
+    pub fn block_cache_usage(&self) -> u64 {
+        self.inner().block_cache.usage()
     }
 
     /// Bytes of every live table file (RocksDB's `total-sst-files-size`).
@@ -687,6 +704,55 @@ impl Db {
             let Some(c) = picked else { break };
             inner.compact(&c, &version)?;
         }
+        Ok(())
+    }
+
+    /// Write a consistent copy of the database to `path`, which must not
+    /// exist: every memtable is flushed, then each live table file is hard
+    /// linked (copied across file systems) and a fresh MANIFEST written. The
+    /// copy holds everything committed before the call and opens like any
+    /// database. On the same file system it costs no space until the source
+    /// compacts the linked files away — which also means it is no protection
+    /// against losing that file system.
+    pub fn checkpoint(&self, path: impl AsRef<Path>) -> Result<()> {
+        let target = path.as_ref();
+        let inner = self.inner();
+        if inner.fs.exists(target) {
+            return Err(Error::InvalidArgument(format!(
+                "{} already exists",
+                target.display()
+            )));
+        }
+        self.flush()?;
+        // The pinned version keeps its files alive while they are linked.
+        let sv = inner.sv.load_full();
+        let mut state = ManifestState::empty();
+        state.cfs = inner.structure.lock().state.cfs.clone();
+        state.next_cf_id = inner.structure.lock().state.next_cf_id;
+        state.tombstones = sv.version.tombstones.clone();
+        let mut highest = 0;
+        for (level, files) in sv.version.levels.iter().enumerate() {
+            for f in files {
+                state.levels[level].insert(f.number, f.props.clone());
+                state.last_seq = state.last_seq.max(f.props.largest_seq);
+                highest = highest.max(f.number);
+            }
+        }
+        for t in &state.tombstones {
+            state.last_seq = state.last_seq.max(t.seq);
+        }
+        state.next_file = highest + 1;
+        state.log_number = state.next_file; // no WAL in a checkpoint
+
+        inner.fs.create_dir_all(target)?;
+        for f in sv.version.files() {
+            inner.fs.link(
+                &inner.dir.join(table_name(f.number)),
+                &target.join(table_name(f.number)),
+            )?;
+        }
+        let manifest_no = state.allocate_file();
+        ManifestWriter::install(inner.fs.as_ref(), target, manifest_no, &state)?;
         Ok(())
     }
 
@@ -902,6 +968,18 @@ impl Inner {
         self.io(|| structure.writer.append(edits))?;
         for edit in edits {
             structure.state.apply(edit);
+        }
+        if structure.writer.size() > MANIFEST_ROLL_BYTES {
+            // Start a new one holding just the current state.
+            let old = structure.writer.number();
+            let no = structure.state.allocate_file();
+            let writer = self.io(|| {
+                ManifestWriter::install(self.fs.as_ref(), &self.dir, no, &structure.state)
+            })?;
+            structure.writer = writer;
+            self.fs
+                .remove(&self.dir.join(manifest::manifest_name(old)))
+                .ok();
         }
         Ok(())
     }
@@ -1177,6 +1255,7 @@ impl Inner {
             .map(|(number, props)| {
                 Arc::new(TableFile::new(
                     self.fs.clone(),
+                    self.block_cache.clone(),
                     &self.dir,
                     *number,
                     props.clone(),
@@ -1286,6 +1365,7 @@ impl Inner {
                 .map(|(number, props)| {
                     Arc::new(TableFile::new(
                         self.fs.clone(),
+                        self.block_cache.clone(),
                         &self.dir,
                         *number,
                         props.clone(),

@@ -44,6 +44,10 @@ pub trait Fs: Send + Sync + fmt::Debug {
     fn list(&self, dir: &Path) -> io::Result<Vec<String>>;
     fn exists(&self, path: &Path) -> bool;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Make `to` name the same file as `from` (a hard link), or a copy of
+    /// it where the file system cannot link (another device). The bytes of
+    /// `to` are durable when this returns; its name is not until `sync_dir`.
+    fn link(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove(&self, path: &Path) -> io::Result<()>;
     /// Make the creations, renames and removals in `dir` durable.
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
@@ -141,6 +145,14 @@ impl Fs for StdFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
+    }
+
+    fn link(&self, from: &Path, to: &Path) -> io::Result<()> {
+        if std::fs::hard_link(from, to).is_ok() {
+            return Ok(());
+        }
+        std::fs::copy(from, to)?;
+        File::open(to)?.sync_all()
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {
@@ -413,6 +425,17 @@ impl Fs for FaultFs {
         let node = state
             .live
             .remove(from)
+            .ok_or_else(|| Self::not_found(from))?;
+        state.live.insert(to.to_path_buf(), node);
+        Ok(())
+    }
+
+    fn link(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut state = self.state.lock();
+        let node = state
+            .live
+            .get(from)
+            .cloned()
             .ok_or_else(|| Self::not_found(from))?;
         state.live.insert(to.to_path_buf(), node);
         Ok(())
