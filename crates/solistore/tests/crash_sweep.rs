@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use solistore::fs::{FaultFs, Torn};
+use solistore::fs::{FaultFs, Fs, Torn};
 use solistore::{Db, IteratorMode, Options, WriteBatch};
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -118,10 +118,40 @@ fn run(n: u64, torn: Torn) -> bool {
     if let Some(ops) = &in_flight {
         apply(&mut with_in_flight, ops);
     }
-    assert!(
-        got == acked || got == with_in_flight,
-        "crash at op {n} ({torn:?}): recovered state is neither the acknowledged one nor it plus the batch in flight"
-    );
+    if got != acked && got != with_in_flight {
+        let show = |k: &Vec<u8>| String::from_utf8_lossy(k).into_owned();
+        let missing: Vec<_> = acked
+            .keys()
+            .filter(|k| !got.contains_key(*k))
+            .map(show)
+            .collect();
+        let extra: Vec<_> = got
+            .keys()
+            .filter(|k| !acked.contains_key(*k) && !with_in_flight.contains_key(*k))
+            .map(show)
+            .collect();
+        let changed: Vec<_> = got
+            .iter()
+            .filter(|(k, v)| {
+                acked.get(*k).is_some_and(|a| a != *v) && with_in_flight.get(*k) != Some(*v)
+            })
+            .map(|(k, v)| {
+                format!(
+                    "{}={} (acked {})",
+                    show(k),
+                    String::from_utf8_lossy(v),
+                    String::from_utf8_lossy(&acked[k])
+                )
+            })
+            .collect();
+        let mut files = fs.list(std::path::Path::new("/db")).unwrap_or_default();
+        files.sort();
+        panic!(
+            "crash at op {n} ({torn:?}): recovered state is neither the acknowledged one nor it plus the batch in flight\n  missing {missing:?}\n  extra {extra:?}\n  changed {changed:?}\n  in flight: {}\n  recovery: {:?}\n  files: {files:?}",
+            in_flight.is_some(),
+            db.recovery_report(),
+        );
+    }
     // And it keeps working.
     db.put(&db.default_cf(), b"after", b"reopen").unwrap();
     fired

@@ -346,9 +346,19 @@ impl WritableFile for FaultFile {
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
+        // The fsync takes effect under the state lock, after checking again
+        // that no crash came in between: otherwise a sync racing another
+        // thread's crash returned Ok and was acknowledged, while what it
+        // synced was not in the post-crash state. A dead process cannot
+        // acknowledge anything; the crash sweep reported it as lost data.
+        let state = self.state.lock();
+        if state.generation != self.generation {
+            return Err(crashed());
+        }
         let pos = *self.pos.lock();
         let mut node = self.node.lock();
         node.synced = node.synced.max(pos);
+        drop(state);
         Ok(())
     }
 }
@@ -616,6 +626,32 @@ impl Fs for FaultFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reused_file_keeps_what_was_synced_after_the_reuse() {
+        let fs = FaultFs::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let old = fs.create(&dir.join("87")).unwrap();
+        old.append(b"old wal content").unwrap();
+        old.sync().unwrap();
+        fs.sync_dir(dir).unwrap();
+
+        let new = fs.reuse(&dir.join("87"), &dir.join("96")).unwrap();
+        new.append(b"NEW").unwrap();
+        fs.sync_dir(dir).unwrap();
+        new.sync().unwrap();
+        // The old handle is still around (a WAL kept for a deferred fsync).
+        old.sync().unwrap();
+
+        fs.crash(Torn::None);
+        let data = fs.read(&dir.join("96")).unwrap();
+        assert!(
+            data.starts_with(b"NEW"),
+            "{:?}",
+            String::from_utf8_lossy(&data)
+        );
+    }
 
     #[test]
     fn a_crash_keeps_synced_bytes_and_synced_names_only() {
