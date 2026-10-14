@@ -3,19 +3,24 @@
 # check no acknowledged batch is lost and none is torn) and one visibility
 # run (readers racing writers). Pinned and deprioritised like run.sh.
 #
-#   bench/gate.sh <binary> <engine> <work-dir> <results-dir> [crash-runs]
+#   bench/gate.sh <binary> <engine> <work-dir> <results-dir> [crash-runs] [extra flags…]
+#
+# Extra flags go to every run, e.g. `--sx-buffer-mb 2` so that solistore
+# flushes many times during each 3-second crash run.
 set -u
 BIN=$1 ENGINE=$2 WORK=$3 OUT=$4 RUNS=${5:-100}
+shift 5 2>/dev/null || shift $#
+EXTRA=("$@")
 CORES=${CORES:-16-23}
 RUN=(nice -n 10 ionice -c2 -n7 taskset -c "$CORES")
 mkdir -p "$WORK" "$OUT"
 : > "$OUT/crash-$ENGINE.jsonl"
 for i in $(seq 1 "$RUNS"); do
-  timeout 300 "${RUN[@]}" "$BIN" crash --engine "$ENGINE" --label "$ENGINE-$i" --dir "$WORK/crash" --secs 3 \
+  timeout 300 "${RUN[@]}" "$BIN" crash --engine "$ENGINE" --label "$ENGINE-$i" --dir "$WORK/crash" --secs 3 "${EXTRA[@]}" \
     >> "$OUT/crash-$ENGINE.jsonl" 2>> "$OUT/crash-$ENGINE.err" || echo "crash run $i: exit $?" >> "$OUT/status"
 done
 rm -rf "$WORK/crash"
-timeout 300 "${RUN[@]}" "$BIN" visibility --engine "$ENGINE" --dir "$WORK/vis" --secs 15 --collections 64 --hot 16 \
+timeout 300 "${RUN[@]}" "$BIN" visibility --engine "$ENGINE" --dir "$WORK/vis" --secs 15 --collections 64 --hot 16 "${EXTRA[@]}" \
   > "$OUT/visibility-$ENGINE.jsonl" 2> "$OUT/visibility-$ENGINE.err" || echo "visibility: exit $?" >> "$OUT/status"
 rm -rf "$WORK/vis"
 python3 - "$OUT/crash-$ENGINE.jsonl" "$OUT/visibility-$ENGINE.jsonl" <<'PY'

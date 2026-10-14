@@ -35,6 +35,7 @@ enum Op {
     CreateCf(usize),
     DropCf(usize),
     Reopen,
+    Flush,
     Crash(u64),
 }
 
@@ -76,6 +77,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (1..CFS.len()).prop_map(Op::CreateCf),
         1 => (1..CFS.len()).prop_map(Op::DropCf),
         1 => Just(Op::Reopen),
+        1 => Just(Op::Flush),
         1 => any::<u64>().prop_map(Op::Crash),
     ]
 }
@@ -146,9 +148,21 @@ impl Model {
     }
 }
 
-fn open(fs: &FaultFs) -> Db {
+/// Tiny memtables and files force switches, flushes, writer stalls and
+/// multi-file levels within a few dozen writes.
+fn open(fs: &FaultFs, write_buffer_size: usize) -> Db {
     let opts = Options {
         fs: Arc::new(fs.clone()),
+        write_buffer_size,
+        max_immutable_memtables: 2,
+        target_file_size: 512,
+        // Levels of a few kilobytes: compactions, trivial moves and level
+        // iterators across several files all happen within one test case.
+        max_bytes_for_level_base: 2048,
+        level_multiplier: 4,
+        level0_compaction_trigger: 2,
+        level0_slowdown_trigger: 6,
+        level0_stop_trigger: 10,
         ..Options::default()
     };
     Db::open(Path::new("/db"), opts).expect("open")
@@ -172,8 +186,9 @@ fn dump(db: &Db) -> Model {
     model
 }
 
-fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
+fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
     let fs = FaultFs::new();
+    let open = |fs: &FaultFs| open(fs, buffer);
     let mut db = open(&fs);
     let mut model = Model::new();
 
@@ -264,6 +279,10 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 );
                 prop_assert_eq!(&dump(&db), &model);
             }
+            Op::Flush => {
+                db.flush().unwrap();
+                prop_assert_eq!(&dump(&db), &model, "a flush changed what is visible");
+            }
             Op::Crash(seed) => {
                 fs.crash(Torn::Seeded(seed));
                 drop(db);
@@ -283,8 +302,11 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
 
     #[test]
-    fn the_database_matches_the_model_across_reopens_and_crashes(ops in prop::collection::vec(op(), 1..80)) {
-        run(ops)?;
+    fn the_database_matches_the_model_across_reopens_and_crashes(
+        ops in prop::collection::vec(op(), 1..80),
+        buffer in prop::sample::select(vec![256usize, 4096, 64 << 20]),
+    ) {
+        run(ops, buffer)?;
     }
 }
 

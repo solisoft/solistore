@@ -24,10 +24,21 @@ pub trait WritableFile: Send + Sync {
     fn sync(&self) -> io::Result<()>;
 }
 
+/// A file read at arbitrary offsets by any number of threads (`pread`).
+pub trait RandomAccessFile: Send + Sync {
+    /// Fill `buf` from `offset`; a short file is an error.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
+    fn len(&self) -> u64;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 pub trait Fs: Send + Sync + fmt::Debug {
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
     /// Create `path`, truncating it if it exists, for appending.
     fn create(&self, path: &Path) -> io::Result<Arc<dyn WritableFile>>;
+    fn open_random(&self, path: &Path) -> io::Result<Arc<dyn RandomAccessFile>>;
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
     /// Names of the files directly in `dir`.
     fn list(&self, dir: &Path) -> io::Result<Vec<String>>;
@@ -57,9 +68,47 @@ impl WritableFile for StdFile {
     }
 }
 
+struct StdRandomFile {
+    file: File,
+    len: u64,
+}
+
+impl RandomAccessFile for StdRandomFile {
+    #[cfg(unix)]
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn read_at(&self, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
+        use std::os::windows::fs::FileExt;
+        while !buf.is_empty() {
+            match self.file.seek_read(buf, offset)? {
+                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                n => {
+                    buf = &mut buf[n..];
+                    offset += n as u64;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
 impl Fs for StdFs {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(path)
+    }
+
+    fn open_random(&self, path: &Path) -> io::Result<Arc<dyn RandomAccessFile>> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Arc::new(StdRandomFile { file, len }))
     }
 
     fn create(&self, path: &Path) -> io::Result<Arc<dyn WritableFile>> {
@@ -295,10 +344,35 @@ impl FaultFs {
     }
 }
 
+/// Reads see the file as it was when opened: tables are immutable once
+/// written, which is the only way this crate reads at offsets.
+struct FaultRandomFile(Vec<u8>);
+
+impl RandomAccessFile for FaultRandomFile {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        let start =
+            usize::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+        let src = start
+            .checked_add(buf.len())
+            .and_then(|end| self.0.get(start..end))
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+        buf.copy_from_slice(src);
+        Ok(())
+    }
+
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+}
+
 impl Fs for FaultFs {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         self.state.lock().dirs.insert(path.to_path_buf());
         Ok(())
+    }
+
+    fn open_random(&self, path: &Path) -> io::Result<Arc<dyn RandomAccessFile>> {
+        Ok(Arc::new(FaultRandomFile(self.read(path)?)))
     }
 
     fn create(&self, path: &Path) -> io::Result<Arc<dyn WritableFile>> {

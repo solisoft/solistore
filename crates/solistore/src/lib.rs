@@ -10,14 +10,18 @@
 
 mod batch;
 mod coding;
+mod compaction;
 mod db;
 mod error;
+mod flush;
 pub mod fs;
 mod iter;
 mod key;
 mod log;
 mod manifest;
 mod memtable;
+mod sst;
+mod version;
 
 pub use batch::WriteBatch;
 pub use bytes::Bytes;

@@ -289,8 +289,12 @@ mod soli {
     }
 
     impl Soli {
-        pub fn open(dir: &Path, durability: Durability) -> Self {
-            let db = Db::open(dir, Options { durability, ..Options::default() }).expect("open solistore");
+        pub fn open(dir: &Path, durability: Durability, t: &SoliTuning) -> Self {
+            let mut opts = Options { durability, ..Options::default() };
+            if let Some(mb) = t.buffer_mb {
+                opts.write_buffer_size = mb << 20;
+            }
+            let db = Db::open(dir, opts).expect("open solistore");
             let cf = |name: &str| db.cf_handle(name).unwrap_or_else(|| db.create_cf(name).unwrap());
             let (meta, shared) = (cf(META), cf(SHARED));
             Soli { db, meta, shared, dead: std::sync::Mutex::new(Vec::new()) }
@@ -313,8 +317,11 @@ mod soli {
         }
 
         fn reclaim(&self) {
-            // Nothing yet: range compaction comes with SSTs (M4).
-            self.dead.lock().unwrap().clear();
+            // As keyspace_gc.rs does with RocksDB: compact each dropped range.
+            for coll in self.dead.lock().unwrap().drain(..) {
+                let (from, to) = coll_range(coll);
+                self.db.compact_range(&self.shared, Some(&from), Some(&to)).unwrap();
+            }
         }
 
         fn write(&self, ops: Vec<Op>, sync: bool) {
@@ -345,9 +352,16 @@ mod soli {
         }
 
         fn flush(&self) {
-            self.db.sync_wal().unwrap();
+            self.db.flush().unwrap();
         }
     }
+}
+
+/// solistore settings under test on top of its defaults.
+#[derive(Clone, Default)]
+struct SoliTuning {
+    /// Memtable size; small values make flushes frequent (crash tests).
+    buffer_mb: Option<usize>,
 }
 
 /// RocksDB settings under test on top of the prod profile.
@@ -366,13 +380,14 @@ fn open_engine(p: &Params) -> Box<dyn Engine> {
         "rocks" => Box::new(rocks::Rocks::open(&p.dir, &p.rocks)),
         // Every commit fsynced before it returns: the default.
         #[cfg(feature = "solistore")]
-        "solistore" => Box::new(soli::Soli::open(&p.dir, solistore::Durability::Full)),
+        "solistore" => Box::new(soli::Soli::open(&p.dir, solistore::Durability::Full, &p.soli)),
         // Writes acknowledged once in the OS, fsynced every 100 ms: what
         // RocksDB's unsynced writes are compared against.
         #[cfg(feature = "solistore")]
         "solistore-eventual" => Box::new(soli::Soli::open(
             &p.dir,
             solistore::Durability::Eventual { sync_interval: Duration::from_millis(100) },
+            &p.soli,
         )),
         other => panic!("unknown engine {other}"),
     }
@@ -397,6 +412,7 @@ struct Params {
     settle_secs: u64,
     crash_secs: u64,
     rocks: RocksTuning,
+    soli: SoliTuning,
 }
 
 impl Params {
@@ -419,6 +435,7 @@ impl Params {
             settle_secs: 30,
             crash_secs: 3,
             rocks: RocksTuning::default(),
+            soli: SoliTuning::default(),
         };
         let mut i = 2;
         while i + 1 < args.len() {
@@ -442,6 +459,7 @@ impl Params {
                 "--rx-partitioned" => p.rocks.partitioned = value == "1",
                 "--rx-wbm-mb" => p.rocks.wbm_mb = Some(value.parse().unwrap()),
                 "--rx-hcc" => p.rocks.hyper_clock = value == "1",
+                "--sx-buffer-mb" => p.soli.buffer_mb = Some(value.parse().unwrap()),
                 flag => panic!("unknown flag {flag}"),
             }
             i += 2;
@@ -466,6 +484,9 @@ impl Params {
         }
         if let Some(mb) = self.rocks.wbm_mb {
             args.extend(["--rx-wbm-mb".to_string(), mb.to_string()]);
+        }
+        if let Some(mb) = self.soli.buffer_mb {
+            args.extend(["--sx-buffer-mb".to_string(), mb.to_string()]);
         }
         args
     }

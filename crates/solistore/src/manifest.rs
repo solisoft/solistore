@@ -12,16 +12,28 @@
 //!   3 NextCfId   varint      ids are never reused, dropped ones included
 //!   4 NextFile   varint
 //!   5 LogNumber  varint      WAL files numbered below this hold nothing live
+//!   6 AddFile    level, number, size, smallest bytes, largest bytes,
+//!                smallest_seq, largest_seq, entries, tombstone_watermark
+//!                (all varints but the keys)
+//!   7 DeleteFile level, number
+//!   8 AddRangeTombstone  cf, start bytes, end bytes, seq
+//!   9 LastSeq    varint      highest sequence number in a table or tombstone
+//!  10 RemoveRangeTombstone  seq   no file holds anything it covers any more
 //! ```
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::coding::{get_bytes, get_varint, get_varint_u32, put_bytes, put_varint};
 use crate::error::{Error, Result};
 use crate::fs::{Fs, WritableFile};
 use crate::log::{encode_record, read_records};
+use crate::memtable::RangeTombstone;
+use crate::sst::TableProps;
+use crate::version::NUM_LEVELS;
 
 pub const DEFAULT_CF: &str = "default";
 const CURRENT: &str = "CURRENT";
@@ -32,14 +44,39 @@ const TAG_DROP_CF: u64 = 2;
 const TAG_NEXT_CF_ID: u64 = 3;
 const TAG_NEXT_FILE: u64 = 4;
 const TAG_LOG_NUMBER: u64 = 5;
+const TAG_ADD_FILE: u64 = 6;
+const TAG_DELETE_FILE: u64 = 7;
+const TAG_ADD_RANGE_TOMBSTONE: u64 = 8;
+const TAG_LAST_SEQ: u64 = 9;
+const TAG_REMOVE_RANGE_TOMBSTONE: u64 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edit {
-    CreateCf { id: u32, name: String },
-    DropCf { id: u32 },
+    CreateCf {
+        id: u32,
+        name: String,
+    },
+    DropCf {
+        id: u32,
+    },
     NextCfId(u32),
     NextFile(u64),
     LogNumber(u64),
+    AddFile {
+        level: u32,
+        number: u64,
+        props: TableProps,
+    },
+    DeleteFile {
+        level: u32,
+        number: u64,
+    },
+    AddRangeTombstone(RangeTombstone),
+    LastSeq(u64),
+    /// Tombstones are identified by their sequence number, which is unique.
+    RemoveRangeTombstone {
+        seq: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,15 +85,33 @@ pub struct ManifestState {
     pub next_cf_id: u32,
     pub next_file: u64,
     pub log_number: u64,
+    /// Sequence numbers up to this one have been used by flushed data. The
+    /// WALs replayed at open can only raise it.
+    pub last_seq: u64,
+    /// Table files per level, by number.
+    pub levels: Vec<BTreeMap<u64, TableProps>>,
+    pub tombstones: Vec<RangeTombstone>,
 }
 
 impl ManifestState {
     pub fn new_database() -> Self {
+        let mut state = Self::empty();
+        state.cfs.insert(0, DEFAULT_CF.to_string());
+        state.next_cf_id = 1;
+        state.next_file = 1;
+        state
+    }
+
+    /// Nothing at all, for replaying edits into.
+    pub fn empty() -> Self {
         ManifestState {
-            cfs: BTreeMap::from([(0, DEFAULT_CF.to_string())]),
-            next_cf_id: 1,
-            next_file: 1,
+            cfs: BTreeMap::new(),
+            next_cf_id: 0,
+            next_file: 0,
             log_number: 0,
+            last_seq: 0,
+            levels: vec![BTreeMap::new(); NUM_LEVELS],
+            tombstones: Vec::new(),
         }
     }
 
@@ -72,6 +127,20 @@ impl ManifestState {
             Edit::NextCfId(n) => self.next_cf_id = self.next_cf_id.max(*n),
             Edit::NextFile(n) => self.next_file = self.next_file.max(*n),
             Edit::LogNumber(n) => self.log_number = self.log_number.max(*n),
+            Edit::AddFile {
+                level,
+                number,
+                props,
+            } => {
+                self.levels[*level as usize].insert(*number, props.clone());
+                self.next_file = self.next_file.max(number + 1);
+            }
+            Edit::DeleteFile { level, number } => {
+                self.levels[*level as usize].remove(number);
+            }
+            Edit::AddRangeTombstone(t) => self.tombstones.push(t.clone()),
+            Edit::LastSeq(n) => self.last_seq = self.last_seq.max(*n),
+            Edit::RemoveRangeTombstone { seq } => self.tombstones.retain(|t| t.seq != *seq),
         }
     }
 
@@ -88,6 +157,17 @@ impl ManifestState {
         edits.push(Edit::NextCfId(self.next_cf_id));
         edits.push(Edit::NextFile(self.next_file));
         edits.push(Edit::LogNumber(self.log_number));
+        edits.push(Edit::LastSeq(self.last_seq));
+        for (level, files) in self.levels.iter().enumerate() {
+            for (number, props) in files {
+                edits.push(Edit::AddFile {
+                    level: level as u32,
+                    number: *number,
+                    props: props.clone(),
+                });
+            }
+        }
+        edits.extend(self.tombstones.iter().cloned().map(Edit::AddRangeTombstone));
         edits
     }
 
@@ -123,6 +203,42 @@ pub fn encode_edits(edits: &[Edit]) -> Vec<u8> {
                 put_varint(&mut buf, TAG_LOG_NUMBER);
                 put_varint(&mut buf, *n);
             }
+            Edit::AddFile {
+                level,
+                number,
+                props,
+            } => {
+                put_varint(&mut buf, TAG_ADD_FILE);
+                put_varint(&mut buf, *level as u64);
+                put_varint(&mut buf, *number);
+                put_varint(&mut buf, props.size);
+                put_bytes(&mut buf, &props.smallest);
+                put_bytes(&mut buf, &props.largest);
+                put_varint(&mut buf, props.smallest_seq);
+                put_varint(&mut buf, props.largest_seq);
+                put_varint(&mut buf, props.entries);
+                put_varint(&mut buf, props.tombstone_watermark);
+            }
+            Edit::DeleteFile { level, number } => {
+                put_varint(&mut buf, TAG_DELETE_FILE);
+                put_varint(&mut buf, *level as u64);
+                put_varint(&mut buf, *number);
+            }
+            Edit::LastSeq(n) => {
+                put_varint(&mut buf, TAG_LAST_SEQ);
+                put_varint(&mut buf, *n);
+            }
+            Edit::RemoveRangeTombstone { seq } => {
+                put_varint(&mut buf, TAG_REMOVE_RANGE_TOMBSTONE);
+                put_varint(&mut buf, *seq);
+            }
+            Edit::AddRangeTombstone(t) => {
+                put_varint(&mut buf, TAG_ADD_RANGE_TOMBSTONE);
+                put_varint(&mut buf, t.cf as u64);
+                put_bytes(&mut buf, &t.start);
+                put_bytes(&mut buf, &t.end);
+                put_varint(&mut buf, t.seq);
+            }
         }
     }
     buf
@@ -147,6 +263,56 @@ pub fn decode_edits(payload: &[u8]) -> Result<Vec<Edit>> {
             TAG_NEXT_CF_ID => Edit::NextCfId(get_varint_u32(&mut input).ok_or_else(corrupt)?),
             TAG_NEXT_FILE => Edit::NextFile(get_varint(&mut input).ok_or_else(corrupt)?),
             TAG_LOG_NUMBER => Edit::LogNumber(get_varint(&mut input).ok_or_else(corrupt)?),
+            TAG_ADD_FILE => {
+                let mut v = || get_varint(&mut input).ok_or_else(corrupt);
+                let (level, number, size) = (v()?, v()?, v()?);
+                if level as usize >= NUM_LEVELS {
+                    return Err(corrupt());
+                }
+                let smallest = get_bytes(&mut input).ok_or_else(corrupt)?.to_vec();
+                let largest = get_bytes(&mut input).ok_or_else(corrupt)?.to_vec();
+                let mut v = || get_varint(&mut input).ok_or_else(corrupt);
+                let props = TableProps {
+                    size,
+                    smallest,
+                    largest,
+                    smallest_seq: v()?,
+                    largest_seq: v()?,
+                    entries: v()?,
+                    tombstone_watermark: v()?,
+                };
+                Edit::AddFile {
+                    level: level as u32,
+                    number,
+                    props,
+                }
+            }
+            TAG_DELETE_FILE => {
+                let level = get_varint(&mut input).ok_or_else(corrupt)?;
+                if level as usize >= NUM_LEVELS {
+                    return Err(corrupt());
+                }
+                Edit::DeleteFile {
+                    level: level as u32,
+                    number: get_varint(&mut input).ok_or_else(corrupt)?,
+                }
+            }
+            TAG_LAST_SEQ => Edit::LastSeq(get_varint(&mut input).ok_or_else(corrupt)?),
+            TAG_REMOVE_RANGE_TOMBSTONE => Edit::RemoveRangeTombstone {
+                seq: get_varint(&mut input).ok_or_else(corrupt)?,
+            },
+            TAG_ADD_RANGE_TOMBSTONE => {
+                let cf = get_varint_u32(&mut input).ok_or_else(corrupt)?;
+                let start = Bytes::copy_from_slice(get_bytes(&mut input).ok_or_else(corrupt)?);
+                let end = Bytes::copy_from_slice(get_bytes(&mut input).ok_or_else(corrupt)?);
+                let seq = get_varint(&mut input).ok_or_else(corrupt)?;
+                Edit::AddRangeTombstone(RangeTombstone {
+                    cf,
+                    start,
+                    end,
+                    seq,
+                })
+            }
             _ => return Err(corrupt()),
         });
     }
@@ -187,12 +353,7 @@ pub fn read(fs: &dyn Fs, dir: &Path, no: u64) -> Result<ManifestState> {
             manifest_name(no)
         )));
     }
-    let mut state = ManifestState {
-        cfs: BTreeMap::new(),
-        next_cf_id: 0,
-        next_file: 0,
-        log_number: 0,
-    };
+    let mut state = ManifestState::empty();
     for record in log.records {
         for edit in decode_edits(record)? {
             state.apply(&edit);
@@ -264,6 +425,31 @@ mod tests {
             Edit::NextCfId(8),
             Edit::NextFile(12),
             Edit::LogNumber(9),
+            Edit::AddFile {
+                level: 3,
+                number: 11,
+                props: TableProps {
+                    size: 4096,
+                    smallest: b"smallest".to_vec(),
+                    largest: b"largest".to_vec(),
+                    smallest_seq: 1,
+                    largest_seq: 99,
+                    entries: 50,
+                    tombstone_watermark: 42,
+                },
+            },
+            Edit::DeleteFile {
+                level: 0,
+                number: 4,
+            },
+            Edit::LastSeq(1234),
+            Edit::RemoveRangeTombstone { seq: 77 },
+            Edit::AddRangeTombstone(RangeTombstone {
+                cf: 2,
+                start: Bytes::from_static(b"a"),
+                end: Bytes::from_static(b"z"),
+                seq: 77,
+            }),
         ];
         assert_eq!(decode_edits(&encode_edits(&edits)).unwrap(), edits);
     }
@@ -280,12 +466,7 @@ mod tests {
             name: "b".into(),
         });
         state.apply(&Edit::DropCf { id: 2 });
-        let mut rebuilt = ManifestState {
-            cfs: BTreeMap::new(),
-            next_cf_id: 0,
-            next_file: 0,
-            log_number: 0,
-        };
+        let mut rebuilt = ManifestState::empty();
         for edit in state.snapshot() {
             rebuilt.apply(&edit);
         }

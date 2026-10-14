@@ -63,7 +63,12 @@ fn concurrent_commits_share_fsyncs() {
 #[test]
 fn a_batch_is_visible_entirely_or_not_at_all() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open(dir.path(), Options::default()).unwrap();
+    // Small memtables: readers race memtable switches and flushes too.
+    let opts = Options {
+        write_buffer_size: 256 << 10,
+        ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
     let cf = db.default_cf();
     let writers = 4u64;
     let progress: Vec<AtomicU64> = (0..writers).map(|_| AtomicU64::new(0)).collect();
@@ -216,4 +221,289 @@ fn reopening_replays_the_log_quickly() {
         100_000
     );
     assert!(elapsed < Duration::from_secs(2), "reopen took {elapsed:?}");
+}
+
+#[test]
+fn flushed_data_survives_reopen_and_old_wals_are_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+        write_buffer_size: 64 << 10,
+        target_file_size: 32 << 10,
+        ..Options::default()
+    };
+    let n = 20_000u32;
+    {
+        let db = Db::open(dir.path(), opts.clone()).unwrap();
+        let cf = db.default_cf();
+        for chunk in (0..n).collect::<Vec<_>>().chunks(100) {
+            let mut batch = WriteBatch::new();
+            for i in chunk {
+                batch.put(&cf, i.to_be_bytes(), format!("value {i}"));
+            }
+            db.write(batch).unwrap();
+        }
+        // Overwrite and delete some, so tables shadow each other.
+        for i in (0..n).step_by(7) {
+            db.put(&cf, i.to_be_bytes(), b"updated").unwrap();
+        }
+        for i in (0..n).step_by(11) {
+            db.delete(&cf, i.to_be_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+        assert!(db.files_per_level()[0] > 2, "{:?}", db.files_per_level());
+        assert_eq!(db.memtable_bytes(), 0);
+        let wals = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".wal")
+            })
+            .count();
+        assert_eq!(wals, 1, "only the live WAL remains after a full flush");
+    }
+    let db = Db::open(dir.path(), opts).unwrap();
+    assert_eq!(db.recovery_report().batches, 0, "nothing left to replay");
+    let cf = db.default_cf();
+    let expect = |i: u32| {
+        if i.is_multiple_of(11) {
+            None
+        } else if i.is_multiple_of(7) {
+            Some(b"updated".to_vec())
+        } else {
+            Some(format!("value {i}").into_bytes())
+        }
+    };
+    for i in (0..n).step_by(13) {
+        assert_eq!(
+            db.get(&cf, i.to_be_bytes()).unwrap().map(|v| v.to_vec()),
+            expect(i),
+            "key {i}"
+        );
+    }
+    let forward: Vec<u32> = db
+        .iterator(&cf, IteratorMode::Start)
+        .unwrap()
+        .map(|r| u32::from_be_bytes(r.unwrap().0[..].try_into().unwrap()))
+        .collect();
+    let want: Vec<u32> = (0..n).filter(|i| i % 11 != 0).collect();
+    assert_eq!(forward, want);
+    let backward: Vec<u32> = db
+        .iterator(&cf, IteratorMode::End)
+        .unwrap()
+        .map(|r| u32::from_be_bytes(r.unwrap().0[..].try_into().unwrap()))
+        .collect();
+    assert_eq!(backward, want.iter().rev().copied().collect::<Vec<_>>());
+}
+
+#[test]
+fn a_table_left_by_a_crashed_flush_is_removed_on_open() {
+    let fs = FaultFs::new();
+    {
+        let db = open(&fs);
+        db.put(&db.default_cf(), b"k", b"v").unwrap();
+    }
+    // A flush that wrote its table but crashed before the MANIFEST edit.
+    let orphan = fs.create(std::path::Path::new("/db/999999.sst")).unwrap();
+    orphan.append(b"half a table").unwrap();
+    orphan.sync().unwrap();
+    use solistore::fs::Fs;
+    fs.sync_dir(std::path::Path::new("/db")).unwrap();
+    let db = open(&fs);
+    assert_eq!(db.recovery_report().orphan_tables, 1);
+    assert!(!fs.exists(std::path::Path::new("/db/999999.sst")));
+    assert_eq!(
+        db.get(&db.default_cf(), b"k").unwrap().as_deref(),
+        Some(&b"v"[..])
+    );
+}
+
+#[test]
+fn compaction_moves_data_down_and_keeps_every_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+        write_buffer_size: 16 << 10,
+        target_file_size: 8 << 10,
+        max_bytes_for_level_base: 64 << 10,
+        level_multiplier: 4,
+        level0_compaction_trigger: 2,
+        ..Options::default()
+    };
+    let n = 30_000u32;
+    let expect = |i: u32, round: u32| {
+        if i.is_multiple_of(5) {
+            None
+        } else {
+            Some(format!("{i}:{round}").into_bytes())
+        }
+    };
+    {
+        let db = Db::open(dir.path(), opts.clone()).unwrap();
+        let cf = db.default_cf();
+        for round in 0..3u32 {
+            for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+                let mut batch = WriteBatch::new();
+                for &i in chunk {
+                    match expect(i, round) {
+                        Some(v) => batch.put(&cf, i.to_be_bytes(), v),
+                        None => batch.delete(&cf, i.to_be_bytes()),
+                    }
+                }
+                db.write(batch).unwrap();
+            }
+        }
+        db.flush().unwrap();
+        // Compaction runs in the background; give it time to settle.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while db.files_per_level()[0] >= 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let levels = db.files_per_level();
+        assert!(levels[0] < 2, "level 0 not compacted: {levels:?}");
+        assert!(
+            levels[2..].iter().sum::<usize>() > 0,
+            "nothing reached level 2: {levels:?}"
+        );
+        for i in (0..n).step_by(7) {
+            assert_eq!(
+                db.get(&cf, i.to_be_bytes()).unwrap().map(|v| v.to_vec()),
+                expect(i, 2),
+                "key {i}"
+            );
+        }
+    }
+    let db = Db::open(dir.path(), opts).unwrap();
+    let cf = db.default_cf();
+    let keys: Vec<u32> = db
+        .iterator(&cf, IteratorMode::Start)
+        .unwrap()
+        .map(|r| {
+            let (k, v) = r.unwrap();
+            let i = u32::from_be_bytes(k[..].try_into().unwrap());
+            assert_eq!(Some(v.to_vec()), expect(i, 2));
+            i
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        (0..n).filter(|i| !i.is_multiple_of(5)).collect::<Vec<_>>()
+    );
+    // Every file on disk is live: compaction inputs were deleted.
+    let on_disk = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".sst")
+        })
+        .count();
+    assert_eq!(on_disk, db.files_per_level().iter().sum::<usize>());
+}
+
+/// A collection is a key prefix in a shared column family; dropping it is
+/// one range delete. `compact_range` must give its space back.
+#[test]
+fn a_range_delete_gives_its_space_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = Options {
+        write_buffer_size: 256 << 10,
+        target_file_size: 128 << 10,
+        max_bytes_for_level_base: 1 << 20,
+        level_multiplier: 4,
+        ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts).unwrap();
+    let cf = db.default_cf();
+    let value = vec![b'x'; 200];
+    // Ten collections of 5,000 documents, interleaved as a server writes them.
+    for i in 0..5_000u32 {
+        let mut batch = WriteBatch::new();
+        for coll in 0..10u32 {
+            batch.put(
+                &cf,
+                [&coll.to_be_bytes()[..], &i.to_be_bytes()].concat(),
+                &value,
+            );
+        }
+        db.write(batch).unwrap();
+    }
+    db.compact_range(&cf, None, None).unwrap();
+    let before = db.live_table_bytes();
+
+    // Drop collections 3 and 4.
+    let mut batch = WriteBatch::new();
+    batch.delete_range(&cf, 3u32.to_be_bytes(), 5u32.to_be_bytes());
+    db.write(batch).unwrap();
+    assert!(db
+        .get(&cf, [&3u32.to_be_bytes()[..], &7u32.to_be_bytes()].concat())
+        .unwrap()
+        .is_none());
+    db.compact_range(&cf, Some(&3u32.to_be_bytes()), Some(&5u32.to_be_bytes()))
+        .unwrap();
+
+    let after = db.live_table_bytes();
+    let freed = before.saturating_sub(after);
+    assert!(
+        freed * 10 >= before * 2 * 9 / 10,
+        "freed {freed} of {before}: expected ~20%"
+    );
+    assert_eq!(
+        db.pending_range_tombstones(),
+        0,
+        "nothing left for the tombstone to delete"
+    );
+    let left = db.iterator(&cf, IteratorMode::Start).unwrap().count();
+    assert_eq!(left, 8 * 5_000);
+    // And it is still right after a reopen.
+    drop(db);
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    assert_eq!(
+        db.iterator(&db.default_cf(), IteratorMode::Start)
+            .unwrap()
+            .count(),
+        8 * 5_000
+    );
+}
+
+#[test]
+fn dropping_a_column_family_deletes_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(
+        dir.path(),
+        Options {
+            write_buffer_size: 64 << 10,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let doomed = db.create_cf("doomed").unwrap();
+    let kept = db.default_cf();
+    for i in 0..5_000u32 {
+        let mut batch = WriteBatch::new();
+        batch.put(&doomed, i.to_be_bytes(), [1u8; 100]);
+        batch.put(&kept, i.to_be_bytes(), [2u8; 100]);
+        db.write(batch).unwrap();
+    }
+    db.flush().unwrap();
+    let before = db.live_table_bytes();
+    db.drop_cf("doomed").unwrap();
+    assert!(
+        db.live_table_bytes() * 10 < before * 6,
+        "{} of {before} left",
+        db.live_table_bytes()
+    );
+    let again = db.create_cf("doomed").unwrap();
+    assert_eq!(
+        db.iterator(&again, IteratorMode::Start).unwrap().count(),
+        0,
+        "a new cf of the same name is empty"
+    );
+    assert_eq!(
+        db.iterator(&kept, IteratorMode::Start).unwrap().count(),
+        5_000
+    );
 }
