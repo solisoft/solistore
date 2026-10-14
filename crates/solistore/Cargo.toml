@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license-file = "../../LICENCE.md"
+repository.workspace = true
 
 [dependencies]
 arc-swap = "1"

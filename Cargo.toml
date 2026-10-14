@@ -10,6 +10,8 @@ version = "0.1.0"
 edition = "2021"
 # SoliDB's floor (rust-rocksdb 0.53 declared it); the engine must not raise it.
 rust-version = "1.91"
+license-file = "LICENCE.md"
+repository = "https://github.com/solisoft/solistore"
 publish = false
 
 [workspace.dependencies]
