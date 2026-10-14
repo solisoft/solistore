@@ -97,6 +97,9 @@ pub struct Options {
     pub max_subcompactions: usize,
     /// Compactions that may run at once, on disjoint files.
     pub max_background_compactions: usize,
+    /// Threads for background work in all: one flushes, the rest compact,
+    /// subcompactions included. RocksDB's option of the same name.
+    pub max_background_jobs: usize,
     /// Bytes of decoded data blocks kept in memory, shared by every table.
     pub block_cache_size: u64,
 }
@@ -120,6 +123,7 @@ impl Default for Options {
             level_multiplier: 10,
             max_subcompactions: 4,
             max_background_compactions: 3,
+            max_background_jobs: 6,
             block_cache_size: 512 << 20,
         }
     }
@@ -145,6 +149,7 @@ impl fmt::Debug for Options {
                 "max_background_compactions",
                 &self.max_background_compactions,
             )
+            .field("max_background_jobs", &self.max_background_jobs)
             .field("block_cache_size", &self.block_cache_size)
             .finish()
     }
@@ -310,6 +315,9 @@ struct Inner {
     sv_lock: Mutex<()>,
     /// Table files some compaction is working on; others leave them alone.
     compacting: Mutex<HashSet<u64>>,
+    /// Compaction threads allowed in all, and in use (subcompactions count).
+    compaction_threads: usize,
+    compaction_threads_used: Mutex<usize>,
     /// The highest sequence number a reader may see.
     visible_seq: AtomicU64,
     commit: Mutex<CommitState>,
@@ -580,6 +588,8 @@ impl Db {
             }),
             sv_lock: Mutex::new(()),
             compacting: Mutex::new(HashSet::new()),
+            compaction_threads: opts.max_background_jobs.saturating_sub(1).max(1),
+            compaction_threads_used: Mutex::new(0),
             visible_seq: AtomicU64::new(last_seq),
             commit: Mutex::new(CommitState {
                 wal: wal.clone(),
@@ -1572,6 +1582,22 @@ impl Inner {
         Ok(())
     }
 
+    /// Take up to `want` compaction threads, at least one: a compaction
+    /// splits into as many subcompactions as the budget has room for.
+    fn reserve_threads(&self, want: usize) -> usize {
+        let mut used = self.compaction_threads_used.lock();
+        let granted = want
+            .min(self.compaction_threads.saturating_sub(*used))
+            .max(1);
+        *used += granted;
+        granted
+    }
+
+    fn release_threads(&self, n: usize) {
+        let mut used = self.compaction_threads_used.lock();
+        *used = used.saturating_sub(n);
+    }
+
     /// Pick a compaction with `choose` and reserve its files, atomically
     /// with respect to every other compaction.
     fn claim(
@@ -1632,15 +1658,22 @@ impl Inner {
             Vec::new()
         } else {
             let live = self.live_cfs();
-            compaction::run(
+            let threads = self.reserve_threads(self.compaction.subcompactions);
+            let cfg = compaction::Config {
+                subcompactions: threads,
+                ..self.compaction
+            };
+            let outcome = compaction::run(
                 c,
                 version,
                 &|cf| live.contains(&cf),
                 self.fs.as_ref(),
                 &self.dir,
-                &self.compaction,
+                &cfg,
                 &|| self.allocate_file(),
-            )?
+            );
+            self.release_threads(threads);
+            outcome?
         };
         let new_tables: Vec<Arc<TableFile>> = if c.is_trivial_move() {
             vec![c.inputs[0].clone()]
