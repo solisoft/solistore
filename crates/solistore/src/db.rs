@@ -676,15 +676,10 @@ impl Db {
             .sum()
     }
 
-    /// Memory held by open tables' indexes and filters.
+    /// Memory held by open tables' indexes and filters (charged against
+    /// the block cache's budget).
     pub fn table_readers_bytes(&self) -> usize {
-        self.inner()
-            .sv
-            .load()
-            .version
-            .files()
-            .map(|f| f.pinned_bytes())
-            .sum()
+        self.inner().block_cache.pinned() as usize
     }
 
     /// Bytes held by the block cache.

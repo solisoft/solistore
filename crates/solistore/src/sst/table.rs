@@ -38,6 +38,8 @@ const TYPE_LZ4: u8 = 1;
 const BLOCK_TRAILER: usize = 5;
 /// Buffer this much before writing to the file.
 const WRITE_CHUNK: usize = 1 << 20;
+/// Fsync a table being written every this many bytes.
+const BYTES_PER_SYNC: u64 = 4 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Handle {
@@ -91,6 +93,8 @@ pub struct TableBuilder {
     compress: bool,
     /// Reused for every block's compressed form.
     scratch: Vec<u8>,
+    /// Bytes appended since the last fsync.
+    unsynced: u64,
 }
 
 impl TableBuilder {
@@ -110,6 +114,7 @@ impl TableBuilder {
             deletions: 0,
             compress: true,
             scratch: Vec::new(),
+            unsynced: 0,
         }
     }
 
@@ -196,7 +201,16 @@ impl TableBuilder {
         self.offset += (len as usize + BLOCK_TRAILER) as u64;
         if self.out.len() >= WRITE_CHUNK {
             self.file.append(&self.out)?;
+            self.unsynced += self.out.len() as u64;
             self.out.clear();
+            // RocksDB's bytes_per_sync: write back as we go. A 64 MiB table
+            // fsynced in one go floods the device, and every WAL fsync behind
+            // it waits — commit latency jumped to a millisecond under
+            // concurrent compactions.
+            if self.unsynced >= BYTES_PER_SYNC {
+                self.file.sync()?;
+                self.unsynced = 0;
+            }
         }
         Ok(handle)
     }
@@ -328,12 +342,9 @@ impl TableReader {
         })
     }
 
-    pub fn pinned_bytes(&self) -> usize {
-        self.pinned
-    }
-
     /// Serve data blocks through `cache`, where this table is `number`.
     pub fn with_cache(mut self, cache: Arc<BlockCache>, number: u64) -> Self {
+        cache.charge(self.pinned as u64);
         self.cache = Some((cache, number));
         self
     }
@@ -394,6 +405,14 @@ impl TableReader {
                 value: it.value(),
             }),
         )
+    }
+}
+
+impl Drop for TableReader {
+    fn drop(&mut self) {
+        if let Some((cache, _)) = &self.cache {
+            cache.release(self.pinned as u64);
+        }
     }
 }
 

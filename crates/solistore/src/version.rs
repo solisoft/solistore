@@ -77,11 +77,6 @@ impl TableFile {
         Ok(self.reader.get_or_init(|| reader).clone())
     }
 
-    /// Memory the open table holds (index and filter), 0 if not open.
-    pub fn pinned_bytes(&self) -> usize {
-        self.reader.get().map_or(0, |r| r.pinned_bytes())
-    }
-
     /// No longer in the live version: delete the file when the last reader
     /// still holding it lets go.
     pub fn mark_obsolete(&self) {
