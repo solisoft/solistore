@@ -103,6 +103,9 @@ impl TableFile {
 impl Drop for TableFile {
     fn drop(&mut self) {
         if self.obsolete.load(AtomicOrdering::Acquire) {
+            // Close this table's own handle first: Windows refuses to delete
+            // a file that is open without FILE_SHARE_DELETE.
+            drop(self.reader.take());
             self.fs.remove(&self.path).ok();
         }
     }

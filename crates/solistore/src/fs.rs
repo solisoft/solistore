@@ -139,7 +139,20 @@ impl Fs for StdFs {
     }
 
     fn open_random(&self, path: &Path) -> io::Result<Arc<dyn RandomAccessFile>> {
-        let file = File::open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        // As on Unix, an open table can still be deleted (an iterator may
+        // hold one that compaction made obsolete); otherwise the delete
+        // fails and the file stays until the next open removes orphans.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x1;
+            const FILE_SHARE_WRITE: u32 = 0x2;
+            const FILE_SHARE_DELETE: u32 = 0x4;
+            opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        }
+        let file = opts.open(path)?;
         let len = file.metadata()?.len();
         Ok(Arc::new(StdRandomFile { file, len }))
     }
