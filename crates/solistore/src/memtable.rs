@@ -23,11 +23,18 @@ use crate::error::Result;
 use crate::iter::InternalIterator;
 use crate::key::{self, KeyRef, Kind, MemKey};
 
-/// Memory an entry costs on top of its key and value bytes: its skiplist
-/// node (links and two `Bytes` handles), rounded by the allocator. Keys and
-/// values themselves live in a writer's arena chunk (see [`arena_copy`]),
-/// so they cost exactly their length.
-const ENTRY_OVERHEAD: usize = 112;
+/// What an entry counts toward the write buffer on top of its key and
+/// value bytes (which live in a writer's arena chunk, see [`arena_copy`]).
+///
+/// Its real cost is higher: a crossbeam skiplist node with two `Bytes`
+/// handles is ~112 bytes after allocator rounding. Counting that made a
+/// 64 MiB memtable hold ~30% fewer entries than RocksDB's, which counts
+/// ~30 bytes of overhead per entry, so it flushed 45% more often. Each
+/// extra level-0 file meant another L0->L1 compaction rewriting all of L1.
+/// On SoliDB's update phase (1M documents), compaction writes went from
+/// 757 to 515 bytes per update and throughput up 5%. The memtables' real
+/// footprint is then up to ~1.3x the write buffer size.
+const ENTRY_OVERHEAD: usize = 32;
 
 /// Size of the chunks writers copy keys and values into.
 const ARENA_CHUNK: usize = 1 << 20;

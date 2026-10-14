@@ -187,6 +187,8 @@ pub struct Stats {
     /// Commit groups and the batches they carried.
     pub commit_groups: u64,
     pub committed_batches: u64,
+    /// Bytes appended to WALs.
+    pub wal_bytes: u64,
     pub wal_fsyncs: u64,
     /// Groups delayed 1 ms because level 0 passed the slowdown trigger.
     pub l0_slowdowns: u64,
@@ -209,6 +211,7 @@ pub struct Stats {
 struct Counters {
     commit_groups: AtomicU64,
     committed_batches: AtomicU64,
+    wal_bytes: AtomicU64,
     wal_fsyncs: AtomicU64,
     l0_slowdowns: AtomicU64,
     l0_stop_micros: AtomicU64,
@@ -446,7 +449,7 @@ struct Queue {
 /// How long a writer spins, yielding, before it sleeps on a condition
 /// variable. Waking a sleeping thread costs tens of microseconds — as much
 /// as the work it waits for — and most waits here end sooner than this.
-const SPIN: Duration = Duration::from_micros(200);
+const SPIN: Duration = Duration::from_micros(50);
 
 /// Wait for `done`, at most [`SPIN`], without sleeping: a few busy spins,
 /// then yielding the core on every check, so a waiting writer hands its CPU
@@ -715,6 +718,7 @@ impl Db {
         Stats {
             commit_groups: get(&c.commit_groups),
             committed_batches: get(&c.committed_batches),
+            wal_bytes: get(&c.wal_bytes),
             wal_fsyncs: get(&c.wal_fsyncs),
             l0_slowdowns: get(&c.l0_slowdowns),
             l0_stop_micros: get(&c.l0_stop_micros),
@@ -1427,6 +1431,7 @@ impl Inner {
         let sync = self.durability == Durability::Full || group.iter().any(|p| p.sync);
         self.io(|| Ok(wal.file.append(buf)?))?;
         wal.written.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        add(&self.counters.wal_bytes, buf.len() as u64);
         add(&self.counters.commit_groups, 1);
         add(&self.counters.committed_batches, group.len() as u64);
         if sync {
