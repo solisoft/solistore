@@ -23,8 +23,9 @@ fsync. It is written to replace RocksDB under
 ```
 
 > **Status — not used in production yet.** solistore passed its go/no-go
-> gates against RocksDB 11.8.1 on 2026-10-14 and is now being integrated
-> into SoliDB behind a feature flag. The on-disk format may still change
+> gates against RocksDB 11.8.1 on 2026-10-14. SoliDB now runs on it behind
+> a feature flag, where it is ahead of RocksDB on every phase measured
+> (see [Benchmarks](#benchmarks)). The on-disk format may still change
 > before 1.0. See [the integration plan](docs/solidb-integration.md).
 
 ## Why another storage engine
@@ -145,38 +146,105 @@ code exercises failure paths:
 
 ## Benchmarks
 
-`bench/` runs the same SoliDB-shaped workload against RocksDB 11.8.1, with
-SoliDB's production profile, and against solistore. The workload is 5 million
-documents with indexes, and figures are medians of 3 runs. Ratios are
-solistore throughput over RocksDB's; above 1.0 is faster.
+All figures are against RocksDB 11.8.1 with SoliDB's production profile.
+Ratios are solistore throughput over RocksDB's; above 1.0 is faster.
+solistore runs in `Eventual` mode (100 ms), and RocksDB with SoliDB's
+`sync=false` writes, unless stated otherwise.
 
-| Phase | Eventual vs RocksDB (`sync=false`) |
+### Inside SoliDB, whole server
+
+The same SoliDB binary ran on each engine, with 1M documents and two
+indexes. The load came over SoliDB's native driver with the query cache
+off; the server had 8 cores, the client 8 others. Figures are medians of
+3 runs.
+
+| Phase | 64 connections | 256 connections |
+|---|---:|---:|
+| insert, one document per request | 1.11× | 1.07× |
+| get by key | 1.04× | 1.08× |
+| update (read, merge, write) | 1.07× | 1.14× |
+| query on an index (equality) | 1.05× | 1.10× |
+| query on an index (range) | 1.05× | 1.10× |
+| mixed, 90% reads | 0.99× | 1.00× |
+
+SDBQL queries, 64 connections (8 for the scan and aggregate):
+
+| Query | Ratio |
+|---|---:|
+| `FILTER d._key == @k` | 1.02× |
+| index equality, `LIMIT 10` | 1.08× |
+| `COLLECT WITH COUNT` over ~1,000 documents | 1.06× |
+| projection of 1,000 rows | 1.04× |
+| `SORT` on an index, `LIMIT 10` | 1.05× |
+| join (correlated subquery) | 1.08× |
+| 100 raw rows over the driver | 1.04× |
+| `UPDATE` | 1.04× |
+| `INSERT` | 1.16× |
+| filter on an unindexed field (scan) | 1.12× |
+| `COLLECT` over 100,000 documents | 1.12× |
+
+solistore also uses less CPU per operation, for example 27 µs per update
+against 32 µs. Peak RSS is 1.02–1.08× RocksDB's. With 256 connections,
+RocksDB's p99 update latency is 4.4 ms and solistore's 3.0 ms.
+
+### Storage engines alone
+
+`bench/` runs a SoliDB-shaped workload on each engine directly: a write is
+the document plus three index entries, and the phases are gets, scans,
+updates, fsynced transactions and a ~1,232-collection catalog.
+
+At 5M documents, medians of 3, the go/no-go series of 2026-10-14
+(`bench/results/2026-10-14-m7`):
+
+| Phase | Eventual vs RocksDB |
 |---|---:|
 | bulk load | 0.81× |
 | updates | 0.82× |
 | mixed read/write | 1.09× |
-| get, uniform | 1.03× |
-| get, hot keys | 1.23× |
-| get, missing keys | 1.65× |
+| get, uniform / hot / missing | 1.03× / 1.23× / 1.65× |
 | scans | 1.34–1.43× |
-| fsynced commits, 1 thread | 1.21× |
-| fsynced commits, 8 threads | 1.24× |
+| fsynced commits, 1 / 8 threads | 1.21× / 1.24× |
+
+In full durability mode, solistore fsyncs *every* commit. It still runs
+2.9× (1 thread) and 1.4× (8 threads) RocksDB's fsynced-commit throughput.
 
 The gates that block integration all passed:
 
-- 100 SIGKILL crashes, with 14.87M acknowledged writes, 0 lost and 0 torn
+- 100 SIGKILL crashes with 14.87M acknowledged writes: 0 lost, 0 torn
   batches.
 - 0 visibility violations in 42M checks.
 - Reopen under 0.03 s.
 - 260 MB reclaimed after a drop.
 - RSS 0.95× RocksDB's, disk 1.09×.
 
-In full durability mode, solistore commits *every* write with an fsync and
-still runs 2.9× (1 thread) and 1.4× (8 threads) RocksDB's fsynced-commit
-throughput. Its bulk load and updates run at about 0.36× of RocksDB without
-fsync.
+The engine-only bench predates the commit-pipeline and memtable-sizing
+work that put solistore ahead inside SoliDB; it has not been rerun at 5M
+since.
 
-Raw results are in `bench/results/` (JSON lines per phase).
+### Against SurrealKV
+
+SurrealKV 1.0.0 is in the same bench, with the budget the other engines
+get: 512 MiB block cache, 64 MiB memtable, 4 KiB blocks and Snappy. At 1M
+documents (single runs, `bench/results/2026-10-14-surrealkv`):
+
+| Phase | RocksDB | solistore | SurrealKV |
+|---|---:|---:|---:|
+| load | 434k | 398k | 335k |
+| fsynced commits, 8 threads | 63.5k | 214k | 68k |
+| get, uniform | 3.64M | 3.23M | 2.57M |
+| scan, 100 keys | 59k | 82k | 40k |
+| update | 651k | 484k | 376k |
+| mixed | 290k | 346k | 180k |
+| peak RSS | 948 MB | 973 MB | 1,176 MB |
+
+With every commit fsynced, solistore writes about twice as fast as
+SurrealKV (load 170k against 86k, updates 174k against 90k).
+
+With its factory settings (32 MiB cache, no compression), SurrealKV's
+uniform gets fall to 307k a second. Its published benchmark used 500,000
+keys, which fit in its memtable and cache.
+
+Raw results are in `bench/results/`, as JSON lines per phase.
 
 ## Building
 
@@ -221,9 +289,9 @@ docs/             integration plan for SoliDB
 
 - [x] M0–M7: WAL and group commit, tables, compaction, range tombstones,
   block cache, checkpoints and metrics, then the go/no-go benchmark.
-- [ ] SoliDB on solistore behind a feature, with the engine recorded per
-  data directory.
-- [ ] A migration tool from RocksDB data directories.
+- [x] SoliDB on solistore behind a feature, with the engine recorded per
+  data directory. Ahead of RocksDB on every measured phase.
+- [ ] A migration tool from RocksDB data directories (in progress).
 - [ ] A trial on real workloads, then removing RocksDB from SoliDB.
 - [ ] Dynamic level sizing, a fully arena-allocated skiplist, `loom` on the
   commit path, Miri on the `unsafe`, decoder fuzzing, and crash tests on
