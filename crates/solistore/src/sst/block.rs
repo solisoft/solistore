@@ -217,6 +217,11 @@ impl BlockIter {
         self.block.data.slice(self.value.0..self.value.1)
     }
 
+    /// Size of the decoded block the values slice.
+    pub fn block_size(&self) -> usize {
+        self.block.size()
+    }
+
     pub fn status(&self) -> Result<()> {
         if self.corrupt {
             Err(corrupt())

@@ -43,6 +43,26 @@ thread_local! {
     static ARENA: std::cell::RefCell<bytes::BytesMut> = std::cell::RefCell::new(bytes::BytesMut::new());
 }
 
+/// A value handed out by a point lookup, as its own allocation when it is a
+/// small part of the buffer it slices (`backing` bytes).
+///
+/// A `Bytes` slice keeps its whole buffer alive: a 250-byte document read
+/// from a table pinned its 4 KiB decoded block, and one read from a memtable
+/// its 1 MiB arena chunk, for as long as the caller held it — past the
+/// block's eviction from the cache and past the memtable's flush. A
+/// `multi_get` of 5,000 documents held ~3,600 blocks that way until the
+/// query ended; with 64 such queries in flight SoliDB's live heap was
+/// ~450 MB above RocksDB's, whose bindings copy every value out. Copying a
+/// value that small costs nothing next to the decompression that produced
+/// it. A value that is most of its buffer is handed out as it is.
+pub(crate) fn detach(value: Bytes, backing: usize) -> Bytes {
+    if value.len().saturating_mul(2) < backing {
+        Bytes::copy_from_slice(&value)
+    } else {
+        value
+    }
+}
+
 /// Copy `len` bytes, written by `fill`, into this thread's arena chunk and
 /// return them as one shared buffer. Entries are then slices of it: one
 /// allocation per megabyte instead of two per entry. Allocations were most
@@ -193,7 +213,7 @@ impl Memtable {
         (found.cf == cf && found.user_key == key).then(|| Version {
             seq: found.seq,
             kind: found.kind,
-            value: entry.value().clone(),
+            value: detach(entry.value().clone(), ARENA_CHUNK),
         })
     }
 

@@ -426,7 +426,7 @@ impl TableReader {
             (found.cf == cf && found.user_key == user_key).then(|| Version {
                 seq: found.seq,
                 kind: found.kind,
-                value: it.value(),
+                value: crate::memtable::detach(it.value(), it.block_size()),
             }),
         )
     }
