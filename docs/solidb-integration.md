@@ -102,6 +102,44 @@ Estimate: the largest step. ~30 files, mostly mechanical; the 130
 
 ### S2 — solistore behind a feature, chosen per data directory
 
+**Done** (SoliDB `feat/storage-kv`, 2026-10-14):
+
+- solistore is a second `Kv` engine behind `engine-solistore`, with a git
+  dependency on this repository.
+- Each data directory records its engine in an `ENGINE` file. An unmarked
+  directory with RocksDB `OPTIONS-*` files is RocksDB's; any other
+  ambiguous one is refused. A new directory takes `SOLIDB_ENGINE`.
+- Durability on solistore is set by `SOLIDB_DURABILITY`: `eventual`
+  (100 ms) by default, or `full`.
+- `KvBatch` takes its engine from its first column family, and memory
+  figures come from a database-wide `Kv::memory()`.
+- `/metrics` exports `solidb_storage_*` counters on both engines.
+- All 121 SoliDB test binaries pass on both engines.
+
+Measured in the whole server against RocksDB 11.8.1, at 1M documents over
+the native driver with the query cache off. The numbers are on the
+results dashboard and in `bench/results/2026-10-14-solidb-server`.
+
+| | Ratio |
+|---|---|
+| Driver phases, 64 connections | 0.99-1.11 |
+| Driver phases, 256 connections | 1.00-1.14 |
+| SDBQL queries, writes included | 1.02-1.16 |
+
+Peak RSS is 1.02-1.08x RocksDB's. Getting there took these solistore
+changes (d1fc8f5 to f3d1618):
+
+- Block seeks without key copies.
+- A fast block-cache hasher.
+- No fsync inside a memtable switch, with point-in-time recovery across
+  WALs.
+- Memtables counted like RocksDB's.
+- Each table opened once, before it is installed.
+- A commit pipeline that holds up with more writers than cores.
+
+Still to do for S2: the CI job that runs SoliDB's tests on solistore,
+and a read-only open for S3.
+
 - `storage/kv/solistore.rs`: `Kv` over `solistore::Db`, behind a cargo
   feature `engine-solistore` (git dependency on
   github.com/solisoft/solistore, crates.io once published).
