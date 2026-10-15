@@ -373,6 +373,10 @@ struct Inner {
     graveyard: crate::version::Graveyard,
     /// A write, fsync or flush failed; see [`Error::Poisoned`].
     poisoned: AtomicBool,
+    /// The first failure that poisoned the database, reported with every
+    /// refusal after it: a background flush or compaction fails with no
+    /// caller to tell, and writers only ever saw "poisoned".
+    poison_cause: Mutex<Option<Arc<str>>>,
     bg: Mutex<Background>,
     bg_cv: Condvar,
     recovery: RecoveryReport,
@@ -723,6 +727,7 @@ impl Db {
             barrier: Mutex::new(SyncBarrier::default()),
             graveyard,
             poisoned: AtomicBool::new(false),
+            poison_cause: Mutex::new(None),
             bg: Mutex::new(Background::default()),
             bg_cv: Condvar::new(),
             recovery,
@@ -1309,9 +1314,21 @@ impl Inner {
         self.bg_cv.notify_all();
     }
 
+    /// Poison, recording `cause` unless an earlier failure already did.
+    fn poison_because(&self, cause: &Error) {
+        self.poison_cause
+            .lock()
+            .get_or_insert_with(|| Arc::from(cause.to_string()));
+        self.poison();
+    }
+
+    fn poisoned_error(&self) -> Error {
+        Error::Poisoned(self.poison_cause.lock().clone())
+    }
+
     fn check(&self) -> Result<()> {
         if self.poisoned.load(Ordering::Acquire) {
-            Err(Error::Poisoned)
+            Err(self.poisoned_error())
         } else {
             Ok(())
         }
@@ -1319,7 +1336,7 @@ impl Inner {
 
     /// Run an I/O step of the write path; any failure poisons the database.
     fn io<T>(&self, step: impl FnOnce() -> Result<T>) -> Result<T> {
-        step().inspect_err(|_| self.poison())
+        step().inspect_err(|e| self.poison_because(e))
     }
 
     /// Fsync `wal`, after the older WALs and the directory entries a
@@ -1715,7 +1732,7 @@ impl Inner {
                 }
             };
             if let Err(e) = self.flush_memtable(&imm) {
-                self.poison();
+                self.poison_because(&e);
                 self.bg.lock().flush_error = Some(e);
                 self.notify_background();
                 return;
@@ -1942,7 +1959,7 @@ impl Inner {
             let outcome = self.compact(&picked, &version);
             self.release(&picked);
             if let Err(e) = outcome {
-                self.poison();
+                self.poison_because(&e);
                 self.bg.lock().flush_error = Some(e);
                 self.notify_background();
                 return;
@@ -2138,7 +2155,7 @@ impl Drop for LeaderGuard<'_> {
         let mut queue = self.inner.queue.lock();
         for pending in self.group {
             if !Arc::ptr_eq(pending, self.me) {
-                *pending.slot.lock() = Some(Slot::Failed(Error::Poisoned));
+                *pending.slot.lock() = Some(Slot::Failed(self.inner.poisoned_error()));
                 pending.ready.store(true, Ordering::Release);
             }
         }

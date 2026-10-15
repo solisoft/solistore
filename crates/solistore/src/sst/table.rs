@@ -302,7 +302,11 @@ fn read_block(file: &dyn RandomAccessFile, handle: Handle) -> Result<Bytes> {
         TYPE_LZ4 => {
             let mut input = contents;
             let raw_len = get_varint(&mut input).ok_or_else(|| corrupt("length"))? as usize;
-            if raw_len > 64 << 20 {
+            // LZ4 expands at most ~255x: a longer claim cannot be ours, and
+            // must not size an allocation. A fixed cap (64 MiB) here refused
+            // blocks the writer had written: one value above it made a
+            // compaction fail and poisoned the database.
+            if raw_len > input.len().saturating_mul(255).saturating_add(64) {
                 return Err(corrupt("implausible length"));
             }
             let raw = lz4_flex::block::decompress(input, raw_len).map_err(|_| corrupt("LZ4"))?;

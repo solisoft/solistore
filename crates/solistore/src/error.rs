@@ -15,7 +15,8 @@ pub enum Error {
     /// unknown, and retrying the fsync would report success for pages the
     /// kernel already dropped (PostgreSQL's "fsyncgate"), so the database
     /// refuses writes until it is reopened and has recovered from its log.
-    Poisoned,
+    /// Carries the failure that poisoned it, when one was recorded.
+    Poisoned(Option<Arc<str>>),
     ColumnFamilyNotFound(String),
     ColumnFamilyExists(String),
     /// The handle names a column family that has since been dropped.
@@ -30,7 +31,13 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::Corruption(what) => write!(f, "corruption: {what}"),
-            Error::Poisoned => write!(f, "a previous write or fsync failed; reopen the database"),
+            Error::Poisoned(None) => {
+                write!(f, "a previous write or fsync failed; reopen the database")
+            }
+            Error::Poisoned(Some(cause)) => write!(
+                f,
+                "a previous write or fsync failed ({cause}); reopen the database"
+            ),
             Error::ColumnFamilyNotFound(name) => write!(f, "column family not found: {name}"),
             Error::ColumnFamilyExists(name) => write!(f, "column family already exists: {name}"),
             Error::ColumnFamilyDropped(name) => write!(f, "column family was dropped: {name}"),

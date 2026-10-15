@@ -165,8 +165,14 @@ fn a_failed_fsync_poisons_writes_and_loses_no_acknowledged_data() {
     fs.fail_next_syncs(1);
     assert!(db.put(&cf, b"failed", b"1").is_err());
     // No retry: the kernel may already have dropped the dirty pages.
-    assert!(matches!(db.put(&cf, b"after", b"1"), Err(Error::Poisoned)));
-    assert!(matches!(db.create_cf("x"), Err(Error::Poisoned)));
+    let refused = db.put(&cf, b"after", b"1");
+    assert!(matches!(refused, Err(Error::Poisoned(_))));
+    // The refusal says what poisoned the database.
+    assert!(
+        refused.unwrap_err().to_string().contains("injected EIO"),
+        "the first failure is reported"
+    );
+    assert!(matches!(db.create_cf("x"), Err(Error::Poisoned(_))));
     assert_eq!(
         db.get(&cf, b"before").unwrap().as_deref(),
         Some(&b"1"[..]),

@@ -35,3 +35,27 @@ fn a_small_value_does_not_pin_its_block_or_arena() {
     let v = db.get(&cf, b"big").unwrap().unwrap();
     assert_eq!(&v[..], &big[..]);
 }
+
+/// A value larger than any block size is written, flushed, compacted and
+/// read back whole. A 70 MB compressible one used to be refused on read (a
+/// 64 MiB cap the writer did not share), which poisoned the database during
+/// the compaction that read it.
+#[test]
+fn a_very_large_value_survives_flush_compaction_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let big: Vec<u8> = (0..70u32 << 20).map(|i| (i % 251) as u8).collect();
+    {
+        let db = Db::open(dir.path(), Options::default()).unwrap();
+        let cf = db.default_cf();
+        db.put(&cf, b"a", b"before").unwrap();
+        db.put(&cf, b"big", &big).unwrap();
+        db.put(&cf, b"z", b"after").unwrap();
+        db.flush().unwrap();
+        db.compact_range(&cf, None, None).unwrap();
+        assert_eq!(&db.get(&cf, b"big").unwrap().unwrap()[..], &big[..]);
+    }
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    let cf = db.default_cf();
+    assert_eq!(&db.get(&cf, b"big").unwrap().unwrap()[..], &big[..]);
+    assert_eq!(db.get(&cf, b"z").unwrap().as_deref(), Some(&b"after"[..]));
+}
