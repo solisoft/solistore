@@ -848,3 +848,95 @@ fn writes_after_a_point_in_time_recovery_survive_the_next_crash() {
         "no seed produced a point-in-time cut; the test tests nothing"
     );
 }
+
+/// A synced write must not count on another thread's fsync still in flight.
+/// The background syncer cleared an old WAL's dirty flag before its fsync
+/// finished; a synced write in the next WAL then skipped that WAL, was
+/// acknowledged, and a crash before the other fsync completed lost it with
+/// the WAL's tail (macOS CI, seed 25 of the test above). `sync_wal` runs the
+/// background syncer's path, here in a loop to race the switches. The race
+/// is a few instructions wide, so this rarely catches it unaided; with a
+/// pause injected in the syncer between clearing the flag and fsyncing, it
+/// failed at seed 45 before the fix and passes after it.
+#[test]
+fn a_synced_write_does_not_rely_on_a_concurrent_fsync() {
+    for seed in 0..100u64 {
+        let fs = FaultFs::new();
+        fs.set_sync_delay(Duration::from_millis(2));
+        let opts = Options {
+            fs: Arc::new(fs.clone()),
+            max_immutable_memtables: 32,
+            durability: Durability::Eventual {
+                sync_interval: Duration::from_secs(3600),
+            },
+            write_buffer_size: 1 << 10,
+            target_file_size: 16 << 10,
+            ..Options::default()
+        };
+        let db = Arc::new(
+            Db::open(
+                "/db",
+                Options {
+                    fs: Arc::new(fs.process()),
+                    ..opts.clone()
+                },
+            )
+            .unwrap(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let syncer = {
+            let (db, stop) = (db.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if db.sync_wal().is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        let cf = db.default_cf();
+        // The synced write lands at a different point of a memtable's life
+        // each seed, and the crash comes right after it: while an fsync the
+        // other thread started may still be running.
+        let last_synced = 200 + (seed as u32 * 7) % 60;
+        for i in 0..last_synced {
+            db.put(&cf, i.to_be_bytes(), [i as u8; 48]).unwrap();
+        }
+        let mut batch = WriteBatch::new();
+        batch.put(&cf, last_synced.to_be_bytes(), [1u8; 48]);
+        db.write_opt(batch, &WriteOptions { sync: true }).unwrap();
+        let torn = if seed % 2 == 0 {
+            Torn::None
+        } else {
+            Torn::Seeded(seed)
+        };
+        fs.crash(torn);
+        stop.store(true, Ordering::Relaxed);
+        syncer.join().unwrap();
+        drop(db);
+        let db = Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts
+            },
+        )
+        .unwrap();
+        let cf = db.default_cf();
+        let keys: Vec<u32> = db
+            .iterator(&cf, IteratorMode::Start)
+            .unwrap()
+            .map(|r| u32::from_be_bytes(r.unwrap().0[..].try_into().unwrap()))
+            .collect();
+        assert!(
+            keys.len() as u32 > last_synced,
+            "seed {seed}: lost the synced write {last_synced} ({} kept)",
+            keys.len()
+        );
+        assert_eq!(
+            keys,
+            (0..keys.len() as u32).collect::<Vec<_>>(),
+            "seed {seed}: not a prefix"
+        );
+    }
+}

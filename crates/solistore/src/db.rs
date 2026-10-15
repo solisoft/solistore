@@ -1328,10 +1328,16 @@ impl Inner {
     fn sync_wal_file(&self, wal: &WalFile) -> Result<()> {
         {
             let mut barrier = self.barrier.lock();
+            // Every one, whatever its dirty flag says. A clear flag only
+            // means another thread has started an fsync of it, not that the
+            // fsync is done: the background syncer clears the flag before
+            // syncing, and when a switch had set it again in between, a
+            // synced write here skipped the WAL, was acknowledged, and a
+            // crash before the other fsync finished lost it with that WAL's
+            // tail. At most one fsync more per memtable switch.
             for old in std::mem::take(&mut barrier.older) {
-                if old.dirty.swap(false, Ordering::AcqRel) {
-                    self.io(|| Ok(old.file.sync()?))?;
-                }
+                old.dirty.store(false, Ordering::Release);
+                self.io(|| Ok(old.file.sync()?))?;
             }
             if barrier.dir_dirty {
                 self.io(|| Ok(self.fs.sync_dir(&self.dir)?))?;
