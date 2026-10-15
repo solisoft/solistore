@@ -44,7 +44,7 @@ use crate::compaction;
 use crate::error::{Error, Result};
 use crate::flush;
 use crate::fs::{Fs, StdFs, WritableFile};
-use crate::iter::{DbIterator, IteratorMode, ReadOptions};
+use crate::iter::{DbIterator, InternalIterator, IteratorMode, ReadOptions};
 use crate::key::{self, Kind, MAX_SEQ};
 use crate::log::{self, encode_record_parts, read_records};
 use crate::manifest::{self, file_no_u32, Edit, ManifestState, ManifestWriter, DEFAULT_CF};
@@ -1026,6 +1026,114 @@ impl Db {
         Ok(())
     }
 
+    /// Load `cf`, which must be untouched (no entry, delete or range delete
+    /// anywhere), from `entries`: user keys in strictly increasing order.
+    /// The table files are written straight into the bottom level by
+    /// `threads` threads and installed with one MANIFEST record: no WAL, no
+    /// memtable, no compaction, each byte written once. RocksDB's ingestion
+    /// of external files, for the case of a whole column family.
+    ///
+    /// Entries get sequence 0, as compaction gives entries at the bottom of
+    /// the tree: nothing older can exist, since the column family was empty.
+    /// The files are fsynced, then the directory, then the MANIFEST record;
+    /// the load is durable when this returns and absent if it fails, its
+    /// files removed. Nothing else may write to `cf` meanwhile: a write found
+    /// there at install time fails the load.
+    pub fn ingest<K, V, E>(
+        &self,
+        cf: &ColumnFamily,
+        entries: impl IntoIterator<Item = std::result::Result<(K, V), E>>,
+        threads: usize,
+    ) -> Result<IngestReport>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+        E: fmt::Display,
+    {
+        cf.check()?;
+        let inner = self.inner();
+        inner.check()?;
+        let id = cf.id();
+        if !inner.untouched(&inner.sv.load(), id) {
+            return Err(Error::InvalidArgument(format!(
+                "ingest needs an untouched column family; {} holds entries, deletes or \
+                 range deletes",
+                cf.name()
+            )));
+        }
+        let threads = threads.max(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<(Vec<u8>, Vec<u8>)>>(threads);
+        let rx = Mutex::new(rx);
+        let written: Mutex<Vec<(u64, crate::sst::TableProps)>> = Mutex::new(Vec::new());
+        let failed: Mutex<Option<Error>> = Mutex::new(None);
+        let mut report = IngestReport::default();
+        let read = std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| loop {
+                    let Ok(chunk) = rx.lock().recv() else {
+                        return;
+                    };
+                    if failed.lock().is_some() {
+                        continue; // drain what the reader already sent
+                    }
+                    match inner.ingest_chunk(id, &chunk) {
+                        Ok(files) => written.lock().extend(files),
+                        Err(e) => {
+                            failed.lock().get_or_insert(e);
+                        }
+                    }
+                });
+            }
+            let tx = tx;
+            let mut chunk: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut size = 0usize;
+            let mut last: Option<Vec<u8>> = None;
+            for item in entries {
+                let (k, v) =
+                    item.map_err(|e| Error::InvalidArgument(format!("ingest source: {e}")))?;
+                let (k, v) = (k.as_ref(), v.as_ref());
+                match &mut last {
+                    Some(l) if l.as_slice() >= k => {
+                        return Err(Error::InvalidArgument(
+                            "ingest keys must be strictly increasing".into(),
+                        ));
+                    }
+                    Some(l) => {
+                        l.clear();
+                        l.extend_from_slice(k);
+                    }
+                    None => last = Some(k.to_vec()),
+                }
+                size += k.len() + v.len() + key::MIN_LEN;
+                report.entries += 1;
+                report.bytes += (k.len() + v.len()) as u64;
+                chunk.push((key::encode(id, k, 0, Kind::Put), v.to_vec()));
+                if size >= INGEST_CHUNK_BYTES {
+                    size = 0;
+                    if failed.lock().is_some() || tx.send(std::mem::take(&mut chunk)).is_err() {
+                        break;
+                    }
+                }
+            }
+            if !chunk.is_empty() {
+                let _ = tx.send(chunk);
+            }
+            Ok(())
+        });
+        let mut files = written.into_inner();
+        let outcome = read
+            .and_then(|()| failed.into_inner().map_or(Ok(()), Err))
+            .and_then(|()| inner.install_ingested(id, &mut files));
+        if let Err(e) = outcome {
+            for (number, _) in &files {
+                inner.fs.remove(&inner.dir.join(table_name(*number))).ok();
+            }
+            return Err(e);
+        }
+        report.files = files.len();
+        Ok(report)
+    }
+
     /// Write a consistent copy of the database to `path`, which must not
     /// exist: every memtable is flushed, then each live table file is hard
     /// linked (copied across file systems) and a fresh MANIFEST written. The
@@ -1223,6 +1331,21 @@ impl<F: FnMut()> Drop for Defer<F> {
 
 /// A structural change: its MANIFEST edits, the super version it leads to,
 /// and the table files it removes.
+/// What [`Db::ingest`] loaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngestReport {
+    pub entries: u64,
+    /// Key and value bytes.
+    pub bytes: u64,
+    /// Table files written.
+    pub files: usize,
+}
+
+/// Bytes of entries one [`Db::ingest`] thread turns into tables at a time.
+/// With `threads` threads at work and as many chunks queued, the load holds
+/// about `2 * threads` of these in memory.
+const INGEST_CHUNK_BYTES: usize = 96 << 20;
+
 struct VersionChange {
     edits: Vec<Edit>,
     sv: SuperVersion,
@@ -1384,6 +1507,105 @@ impl Inner {
                 .remove(&self.dir.join(manifest::manifest_name(old)))
                 .ok();
         }
+        Ok(())
+    }
+
+    /// Whether column family `id` has nothing anywhere: no entry or delete
+    /// in a memtable or a table, no range delete.
+    fn untouched(&self, sv: &SuperVersion, id: u32) -> bool {
+        let cf_of = |k: &[u8]| key::parse(k).map(|p| p.cf);
+        if sv.version.tombstones.iter().any(|t| t.cf == id) {
+            return false;
+        }
+        for mem in std::iter::once(&sv.mem).chain(&sv.imms) {
+            if mem.tombstones().iter().any(|t| t.cf == id) {
+                return false;
+            }
+            let mut it = memtable::MemIter::new(mem.clone());
+            it.seek_ge(&key::first_of(id, b""));
+            if it.valid() && cf_of(it.key()) == Some(id) {
+                return false;
+            }
+        }
+        !sv.version.levels.iter().flatten().any(|f| {
+            match (cf_of(&f.props.smallest), cf_of(&f.props.largest)) {
+                (Some(lo), Some(hi)) => lo <= id && id <= hi,
+                _ => true,
+            }
+        })
+    }
+
+    /// One chunk of an ingest, as table files: fsynced, directory synced.
+    fn ingest_chunk(
+        &self,
+        id: u32,
+        chunk: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<Vec<(u64, crate::sst::TableProps)>> {
+        let mut out =
+            compaction::OutputFiles::new(self.fs.as_ref(), &self.dir, self.target_file_size, 0);
+        let mut allocate = || self.allocate_file();
+        for (k, v) in chunk {
+            out.add(id, k, v, &mut allocate)?;
+        }
+        out.finish()
+    }
+
+    /// Put an ingest's files at the bottom level, in one MANIFEST record.
+    fn install_ingested(&self, id: u32, files: &mut [(u64, crate::sst::TableProps)]) -> Result<()> {
+        files.sort_by(|a, b| key::compare(&a.1.smallest, &b.1.smallest));
+        if files.is_empty() {
+            return Ok(());
+        }
+        let bottom = NUM_LEVELS - 1;
+        let tables: Vec<Arc<TableFile>> = files
+            .iter()
+            .map(|(number, props)| {
+                Arc::new(
+                    TableFile::new(
+                        self.fs.clone(),
+                        self.block_cache.clone(),
+                        &self.dir,
+                        *number,
+                        props.clone(),
+                    )
+                    .with_graveyard(self.graveyard.clone()),
+                )
+            })
+            .collect();
+        for table in &tables {
+            table.reader()?;
+        }
+        self.log_and_apply(
+            |sv| {
+                if !self.untouched(sv, id) {
+                    return Err(Error::InvalidArgument(
+                        "the column family was written to during the ingest".into(),
+                    ));
+                }
+                let edits = tables
+                    .iter()
+                    .map(|f| Edit::AddFile {
+                        level: bottom as u32,
+                        number: f.number,
+                        props: f.props.clone(),
+                    })
+                    .collect();
+                let mut version = (*sv.version).clone();
+                version.levels[bottom].extend(tables.iter().cloned());
+                version.levels[bottom].sort_by(by_smallest);
+                Ok(Some(VersionChange {
+                    edits,
+                    sv: SuperVersion {
+                        mem: sv.mem.clone(),
+                        imms: sv.imms.clone(),
+                        version: Arc::new(version),
+                    },
+                    retired: Vec::new(),
+                }))
+            },
+            || {},
+        )?;
+        self.notify_background();
         Ok(())
     }
 
