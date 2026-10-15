@@ -13,6 +13,24 @@
 //! file that overlaps nothing in the next level is moved there without being
 //! rewritten.
 //!
+//! # Zeroed sequence numbers
+//!
+//! A key with no older version below the output level and no range tombstone
+//! over it is written with sequence 0, as RocksDB does at the bottom of the
+//! tree: those eight bytes per entry are noise LZ4 cannot compress, 6.5% of
+//! SoliDB's compressed data. It is safe because:
+//!
+//! - nothing older than the entry can surface: no deeper level holds the key
+//!   (data only moves down, and level 0 is always compacted whole), and the
+//!   merge keeps only the newest version;
+//! - no reader sees the entry at a snapshot it should not: readers of the
+//!   input files keep those files, and a reader of the new version takes its
+//!   snapshot after it, above every sequence the inputs held;
+//! - no tombstone wrongly covers it: one already in the version over the key
+//!   keeps the entry's real sequence (reads compare every tombstone with the
+//!   entry, whatever the file's watermark), and any later tombstone is newer
+//!   than every entry in a table, zeroed or not.
+//!
 //! # Range tombstones
 //!
 //! Every file records the highest tombstone sequence applied when it was
@@ -424,6 +442,7 @@ fn merge_range(
     let mut allocate = || allocate();
     let mut live = LiveCf::new(live_cf);
     let mut last_id: Vec<u8> = Vec::new();
+    let mut zeroed: Vec<u8> = Vec::new();
     let mut have_last = false;
     while merged.valid() {
         let k = merged.key();
@@ -439,12 +458,21 @@ fn merge_range(
         last_id.extend_from_slice(id);
         have_last = true;
         let parsed = key::parse(k).ok_or_else(|| Error::Corruption("bad key in table".into()))?;
-        let covered =
-            covering_seq(&version.tombstones, parsed.cf, parsed.user_key, u64::MAX) > parsed.seq;
-        let dead_marker =
-            parsed.kind == Kind::Delete && !may_exist_below(version, compaction.output_level, id);
+        let cover = covering_seq(&version.tombstones, parsed.cf, parsed.user_key, u64::MAX);
+        let covered = cover > parsed.seq;
+        let bottom = !may_exist_below(version, compaction.output_level, id);
+        let dead_marker = parsed.kind == Kind::Delete && bottom;
         if !(covered || dead_marker || !live.check(parsed.cf)) {
-            out.add(parsed.cf, k, &merged.value(), &mut allocate)?;
+            if bottom && cover == 0 && parsed.seq != 0 {
+                // Nothing older below and no tombstone over the key: see
+                // "Zeroed sequence numbers" above.
+                zeroed.clear();
+                zeroed.extend_from_slice(&k[..k.len() - key::TRAILER_LEN]);
+                zeroed.extend_from_slice(&key::trailer_bytes(0, parsed.kind));
+                out.add(parsed.cf, &zeroed, &merged.value(), &mut allocate)?;
+            } else {
+                out.add(parsed.cf, k, &merged.value(), &mut allocate)?;
+            }
         }
         merged.next();
     }
@@ -571,5 +599,77 @@ impl<'a> OutputFiles<'a> {
             self.fs.sync_dir(self.dir)?;
         }
         Ok(self.written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::FaultFs;
+    use crate::sst::BlockCache;
+    use bytes::Bytes;
+
+    /// Compact one bottom-level table holding `k` at sequence 200 in place,
+    /// under `tombstones`, and return the output's sequence range.
+    fn rewrite_bottom(tombstones: Vec<RangeTombstone>) -> (u64, u64) {
+        let fs: Arc<dyn Fs> = Arc::new(FaultFs::new());
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let file = fs.create(&dir.join(table_name(7))).unwrap();
+        let mut builder = TableBuilder::new(file);
+        builder
+            .add(&key::encode(0, b"k", 200, Kind::Put), b"written after")
+            .unwrap();
+        let props = builder.finish().unwrap();
+        let cache = Arc::new(BlockCache::new(1 << 20));
+        let table = Arc::new(TableFile::new(fs.clone(), cache, dir, 7, props));
+        let mut version = Version::empty();
+        version.levels[NUM_LEVELS - 1].push(table.clone());
+        version.tombstones = tombstones;
+        let compaction = Compaction {
+            level: NUM_LEVELS - 1,
+            inputs: vec![table],
+            overlapping: Vec::new(),
+            output_level: NUM_LEVELS - 1,
+        };
+        let cfg = Config {
+            l0_trigger: 4,
+            level_base_bytes: 1 << 20,
+            level_multiplier: 10,
+            target_file_size: 1 << 20,
+            subcompactions: 1,
+            writeback: false,
+        };
+        let next = std::sync::atomic::AtomicU64::new(100);
+        let out = run(
+            &compaction,
+            &version,
+            &|_| true,
+            fs.as_ref(),
+            dir,
+            &cfg,
+            &|| next.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        (out[0].1.smallest_seq, out[0].1.largest_seq)
+    }
+
+    #[test]
+    fn the_bottom_level_zeroes_sequences() {
+        assert_eq!(rewrite_bottom(Vec::new()), (0, 0));
+    }
+
+    /// A tombstone older than the entry still covers its key: at sequence 0
+    /// the entry would read as deleted for as long as the tombstone lives.
+    #[test]
+    fn a_key_under_an_older_tombstone_keeps_its_sequence() {
+        let tombstone = RangeTombstone {
+            cf: 0,
+            start: Bytes::from_static(b"a"),
+            end: Bytes::from_static(b"z"),
+            seq: 100,
+        };
+        assert_eq!(rewrite_bottom(vec![tombstone]), (200, 200));
     }
 }

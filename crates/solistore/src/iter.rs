@@ -275,7 +275,10 @@ impl DbIterator {
     }
 
     fn visible(&self, user_key: &[u8], seq: u64, kind: Kind) -> bool {
-        kind == Kind::Put && covering_seq(&self.tombstones, self.cf, user_key, self.snapshot) < seq
+        // `<=`, as `get` does: no covering tombstone is 0, and since
+        // compaction writes sequence 0 at the bottom of the tree, an entry
+        // there with nothing over it must still be visible.
+        kind == Kind::Put && covering_seq(&self.tombstones, self.cf, user_key, self.snapshot) <= seq
     }
 
     fn same_key(&self, user_key: &[u8]) -> bool {

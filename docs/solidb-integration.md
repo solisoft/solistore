@@ -137,8 +137,20 @@ changes (d1fc8f5 to f3d1618):
 - Each table opened once, before it is installed.
 - A commit pipeline that holds up with more writers than cores.
 
-Still to do for S2: the CI job that runs SoliDB's tests on solistore,
-and a read-only open for S3.
+The CI job that runs SoliDB's tests on solistore (`test-solistore`) is in
+place, and the release job waits for it.
+
+Since then (2026-10-15):
+
+- Point reads copy a small value instead of handing out a slice that kept
+  its 4 KiB block or 1 MiB arena chunk alive (53fa0eb). At 5M documents,
+  with 64 connections each reading 5,000 documents per query, peak RSS went
+  from 1.27x RocksDB's to 0.66x.
+- A synced write in eventual mode fsyncs every older WAL itself (9ff023f).
+  It could rely on the background syncer's fsync of one, started but not
+  finished, and be lost with that WAL's tail. Seen once on macOS CI.
+- Compaction to the bottom of the tree writes sequence 0, as RocksDB does:
+  tables 1.07x RocksDB's size -> 1.02x after a 1M-document load.
 
 - `storage/kv/solistore.rs`: `Kv` over `solistore::Db`, behind a cargo
   feature `engine-solistore` (git dependency on
@@ -157,6 +169,13 @@ and a read-only open for S3.
   failure.
 
 ### S3 — Moving existing data
+
+**Done** (SoliDB `feat/storage-kv`, 942074d5): `solidb-migrate-engine`
+copies a stopped RocksDB data directory into solistore, verifies each
+column family (entries, bytes, a hash of every key and value), swaps the
+directories and keeps the RocksDB one as a backup. 1.47M entries took
+1.1 s; the server answered the same afterwards. It opens RocksDB itself
+(which takes its lock) rather than a checkpoint.
 
 - `solidb-migrate-engine <dir> --to solistore`: open the RocksDB read-only
   from a checkpoint, copy every column family in key order in 4 MiB
@@ -193,7 +212,12 @@ and a read-only open for S3.
 - Performance margins are thin on writes: load 0.81x and update 0.82x of
   RocksDB without sync (thresholds 0.8). Durable commits vary widely
   between runs (sync_commit_8t: 0.20x, 1.25x, 1.24x).
-- Tables are ~7% larger than RocksDB's for the same data.
+- Tables are ~2% larger than RocksDB's for the same data (was 7%, before
+  sequences were zeroed at the bottom of the tree). The rest is the index,
+  which keeps whole last keys where RocksDB keeps shortened separators.
+- The memtable's real footprint is above what it counts: a skiplist node
+  costs ~112 bytes, counted as 32 to flush as often as RocksDB. On write
+  phases at 5M documents, peak RSS is 1.05x RocksDB's.
 - Not done from the plan: dynamic level sizing, the arena skiplist proper
   (entries are arena-backed, nodes are not), `loom` on the commit path,
   Miri on the `unsafe` (one cast, one `sync_file_range` call), fuzzing of

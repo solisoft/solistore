@@ -19,7 +19,7 @@ use bytes::Bytes;
 /// Sequence numbers are 56 bits (the trailer keeps 8 for the kind). They
 /// start at 1, so 0 sorts after every real version of a key.
 pub const MAX_SEQ: u64 = (1 << 56) - 1;
-const TRAILER_LEN: usize = 8;
+pub const TRAILER_LEN: usize = 8;
 const CF_LEN: usize = 4;
 pub const MIN_LEN: usize = CF_LEN + TRAILER_LEN;
 
