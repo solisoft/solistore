@@ -1,0 +1,4 @@
+{"engine":"rocksdb","rep":1,"hwm_kb":2123580,"rss_kb":1987148,"disk_kb":1180164,"reopen_s":0.052,"engine_file":"rocksdb"}
+{"engine":"solistore","rep":1,"hwm_kb":1380572,"rss_kb":1154756,"disk_kb":1251976,"reopen_s":0.052,"engine_file":"solistore"}
+{"engine":"rocksdb","rep":2,"hwm_kb":2059412,"rss_kb":1890872,"disk_kb":1102240,"reopen_s":0.052,"engine_file":"rocksdb"}
+{"engine":"solistore","rep":2,"hwm_kb":1394696,"rss_kb":1194920,"disk_kb":1290864,"reopen_s":0.052,"engine_file":"solistore"}

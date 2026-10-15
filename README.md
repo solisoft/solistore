@@ -184,7 +184,11 @@ SDBQL queries, 64 connections (8 for the scan and aggregate):
 | `COLLECT` over 100,000 documents | 1.12× |
 
 solistore also uses less CPU per operation, for example 27 µs per update
-against 32 µs. Peak RSS is 1.02–1.08× RocksDB's. With 256 connections,
+against 32 µs. Peak RSS is 1.02–1.08× RocksDB's at 1M documents; at 5M,
+with 64 connections each reading 5,000 documents per query, it is 0.66×
+(1,355 MB against 2,042 MB), because point reads hand out a copy of a small
+value rather than a slice that keeps its 4 KiB block alive
+(`bench/results/2026-10-15-point-read-copies`). With 256 connections,
 RocksDB's p99 update latency is 4.4 ms and solistore's 3.0 ms.
 
 ### Storage engines alone
