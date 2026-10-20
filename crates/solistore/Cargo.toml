@@ -4,9 +4,11 @@ description = "Embedded LSM key-value store for SoliDB: pure Rust, durable on ev
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
 license-file = "../../LICENCE.md"
 repository.workspace = true
+readme = "../../README.md"
+keywords = ["lsm", "key-value", "storage-engine", "embedded", "database"]
+categories = ["database-implementations"]
 
 [dependencies]
 arc-swap = "1"

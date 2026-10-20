@@ -26,7 +26,7 @@ fsync. It is written to replace RocksDB under
 > gates against RocksDB 11.8.1 on 2026-10-14. SoliDB now runs on it behind
 > a feature flag, where it is ahead of RocksDB on every phase measured
 > (see [Benchmarks](#benchmarks)). The on-disk format may still change
-> before 1.0. See [the integration plan](docs/solidb-integration.md).
+> before 1.0. See [the integration plan](https://github.com/solisoft/solistore/blob/main/docs/solidb-integration.md).
 
 ## Why another storage engine
 
@@ -118,7 +118,7 @@ db.checkpoint(dir.join("backup"))?;
 ```
 
 The full program is
-[`crates/solistore/examples/quickstart.rs`](crates/solistore/examples/quickstart.rs).
+[`crates/solistore/examples/quickstart.rs`](https://github.com/solisoft/solistore/blob/main/crates/solistore/examples/quickstart.rs).
 Run it with `cargo run -p solistore --example quickstart`.
 
 ## How it is tested
@@ -303,6 +303,6 @@ docs/             integration plan for SoliDB
 
 ## Licence
 
-[O'Saasy License](LICENCE.md) © 2024-2026 SoliSoft SARL, the same as
+[O'Saasy License](https://github.com/solisoft/solistore/blob/main/LICENCE.md) © 2024-2026 SoliSoft SARL, the same as
 SoliDB. It is MIT-style, except that you may not offer the software itself
 as a competing hosted service.
