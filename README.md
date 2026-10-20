@@ -24,9 +24,9 @@ fsync. It is written to replace RocksDB under
 
 > **Status — not used in production yet.** solistore passed its go/no-go
 > gates against RocksDB 11.8.1 on 2026-10-14. SoliDB now runs on it behind
-> a feature flag, where it is ahead of RocksDB on every phase measured
-> (see [Benchmarks](#benchmarks)). The on-disk format may still change
-> before 1.0. See [the integration plan](https://github.com/solisoft/solistore/blob/main/docs/solidb-integration.md).
+> a feature flag, where it is ahead of RocksDB or level on every phase
+> measured (see [Benchmarks](#benchmarks)). The on-disk format may still
+> change before 1.0. See [the integration plan](https://github.com/solisoft/solistore/blob/main/docs/solidb-integration.md).
 
 ## Why another storage engine
 
@@ -294,8 +294,9 @@ docs/             integration plan for SoliDB
 - [x] M0–M7: WAL and group commit, tables, compaction, range tombstones,
   block cache, checkpoints and metrics, then the go/no-go benchmark.
 - [x] SoliDB on solistore behind a feature, with the engine recorded per
-  data directory. Ahead of RocksDB on every measured phase.
-- [ ] A migration tool from RocksDB data directories (in progress).
+  data directory. Ahead of RocksDB or level on every measured phase.
+- [x] A migration tool from RocksDB data directories
+  (`solidb-migrate-engine`, SoliDB 2.4).
 - [ ] A trial on real workloads, then removing RocksDB from SoliDB.
 - [ ] Dynamic level sizing, a fully arena-allocated skiplist, `loom` on the
   commit path, Miri on the `unsafe`, decoder fuzzing, and crash tests on

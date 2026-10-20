@@ -155,9 +155,8 @@ Since then (2026-10-15):
 - `storage/kv/solistore.rs`: `Kv` over `solistore::Db`, behind a cargo
   feature `engine-solistore` (git dependency on
   github.com/solisoft/solistore, crates.io once published).
-- Missing in solistore: a read-only open (for the migration tool), and the
-  `EngineProfile` knobs (prod/dev sizes) mapped onto `Options`.
-  `approximate_size` is done.
+- Missing in solistore: the `EngineProfile` knobs (prod/dev sizes) mapped
+  onto `Options`. `approximate_size` is done.
 - In SoliDB: `KvBatch::default()` cannot know its engine, so a batch takes
   its engine from the first column family written to it. Memory metrics
   move to a database-wide `Kv::metrics()`: solistore's figures are not
@@ -177,11 +176,13 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
 1.1 s; the server answered the same afterwards. It opens RocksDB itself
 (which takes its lock) rather than a checkpoint.
 
-- `solidb-migrate-engine <dir> --to solistore`: open the RocksDB read-only
-  from a checkpoint, copy every column family in key order in 4 MiB
-  batches, copy the sync log, write `ENGINE`, verify per keyspace
-  (key count and an xxh3 of keys and values), then swap directories. The
-  source stays as a backup until removed by hand.
+- `solidb-migrate-engine <dir>`: open the RocksDB directory (taking its
+  lock, so not while a server runs on it), build each column family into
+  solistore as bottom-level tables with `Db::ingest` on up to eight
+  threads, copy the sync log alongside, write `ENGINE`, verify per column
+  family in parallel (entry count and a hash of keys and values), then
+  swap directories. The source stays as a backup until removed by hand
+  (711c1548, SoliDB 2.4.1).
 - Logical `solidb-dump` / `solidb-restore` remain the fallback.
 
 ### S4 — Proving it on real workloads, then rolling out
