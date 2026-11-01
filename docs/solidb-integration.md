@@ -217,9 +217,9 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
   sequences were zeroed at the bottom of the tree). The rest is the index.
   It now stores shortened separators as RocksDB does, but that alone took
   only 0.5% off a table of the bench's key mix (index 8.3% → 7.9% of the
-  file). The index's real cost is that its entries share no prefix
-  (restart interval 1): at interval 16 it falls to 3.2% of the file, at
-  some point-read CPU still to be measured.
+  file). Index entries now share their prefix, restart every 4: tables
+  1.6% smaller on the quick bench, reads as fast (16 saved 0.4% more and
+  cost scans 3.5%).
 - The memtable counts what it holds. Its skiplist keeps each node's
   links, key and value in one arena allocation (~22 bytes of overhead)
   where the crossbeam one cost ~112 bytes per entry counted as 32. A

@@ -32,6 +32,15 @@ use crate::key::{self, Kind};
 use crate::memtable::Version;
 
 pub const BLOCK_SIZE: usize = 4096;
+/// Index entries stored whole every this many; those between share their
+/// prefix with the one before. Readers take any interval (the restart
+/// array is in the block), so old binaries read these tables.
+///
+/// Measured on the quick bench (1M documents, two runs each), against 1:
+/// at 4, tables 1.6% smaller and point reads and scans as fast or a little
+/// faster (a smaller index leaves more cache); 8 saves no more; at 16,
+/// scans lose 3.5% and hot point reads 5%, for 0.4% less disk.
+const INDEX_RESTART_INTERVAL: usize = 4;
 const FOOTER_LEN: usize = 64;
 const MAGIC: u64 = 0x736f_6c69_7374_6f72; // "solistor"
 const FORMAT_VERSION: u32 = 1;
@@ -109,7 +118,7 @@ impl TableBuilder {
             out: Vec::with_capacity(WRITE_CHUNK + BLOCK_SIZE * 2),
             offset: 0,
             data: BlockBuilder::new(RESTART_INTERVAL),
-            index: BlockBuilder::new(1),
+            index: BlockBuilder::new(INDEX_RESTART_INTERVAL),
             pending: None,
             hashes: Vec::new(),
             last_key: Vec::new(),
