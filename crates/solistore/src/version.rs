@@ -25,7 +25,7 @@ use crate::fs::Fs;
 use crate::iter::InternalIterator;
 use crate::key::{self, Kind};
 use crate::memtable::{covering_seq, MemIter, Memtable, RangeTombstone, Version as Found};
-use crate::sst::{BlockCache, TableIter, TableProps, TableReader};
+use crate::sst::{bloom, BlockCache, TableIter, TableProps, TableReader};
 
 pub const NUM_LEVELS: usize = 7;
 
@@ -109,6 +109,17 @@ impl TableFile {
         Ok(self.reader.get_or_init(|| Arc::new(reader)).clone())
     }
 
+    /// [`TableFile::reader`] by reference, for a point read that holds the
+    /// version naming this file for as long as it reads: cloning the `Arc`
+    /// writes its count, a line every thread reading the table contends on.
+    pub fn reader_ref(&self) -> Result<&TableReader> {
+        if let Some(reader) = self.reader.get() {
+            return Ok(reader);
+        }
+        self.reader()?;
+        Ok(self.reader.get().expect("opened just above"))
+    }
+
     /// No longer in the live version: delete the file when the last reader
     /// still holding it lets go.
     pub fn mark_obsolete(&self) {
@@ -186,27 +197,29 @@ impl SuperVersion {
     /// The newest version at or below `snapshot`: sources are searched newest
     /// first, so the first hit wins.
     fn newest(&self, cf: u32, user_key: &[u8], snapshot: u64) -> Result<Option<Found>> {
+        // One key for every source, and one bloom hash for every table,
+        // taken at the first table probed.
+        let lookup = key::LookupKey::new(cf, user_key, snapshot);
         for mem in std::iter::once(&self.mem).chain(&self.imms) {
-            if let Some(found) = mem.get(cf, user_key, snapshot) {
+            if let Some(found) = mem.get_at(&lookup) {
                 return Ok(Some(found));
             }
         }
-        let mut probe = Vec::with_capacity(4 + user_key.len());
-        probe.extend_from_slice(&cf.to_be_bytes());
-        probe.extend_from_slice(user_key);
+        let probe = lookup.id();
+        let mut hash = None;
+        let mut hash = || *hash.get_or_insert_with(|| bloom::hash(probe));
         for file in &self.version.levels[0] {
-            if file.may_hold(&probe) {
-                if let Some(found) = file.reader()?.get(cf, user_key, snapshot)? {
+            if file.may_hold(probe) {
+                if let Some(found) = file.reader_ref()?.get_at(&lookup, hash())? {
                     return Ok(Some(found));
                 }
             }
         }
         for level in &self.version.levels[1..] {
             // Sorted and disjoint: at most one file can hold the key.
-            let at = level
-                .partition_point(|f| key::cf_and_user_key(&f.props.largest) < probe.as_slice());
-            if let Some(file) = level.get(at).filter(|f| f.may_hold(&probe)) {
-                if let Some(found) = file.reader()?.get(cf, user_key, snapshot)? {
+            let at = level.partition_point(|f| key::cf_and_user_key(&f.props.largest) < probe);
+            if let Some(file) = level.get(at).filter(|f| f.may_hold(probe)) {
+                if let Some(found) = file.reader_ref()?.get_at(&lookup, hash())? {
                     return Ok(Some(found));
                 }
             }

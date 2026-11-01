@@ -16,6 +16,7 @@
 //! them in memory; data blocks are read with `pread` when needed. Every byte
 //! is checksummed before it is decoded.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -400,7 +401,10 @@ impl TableReader {
     /// to keep a block read from disk: compactions read everything once
     /// and would only push out what readers need.
     fn data_block(&self, handle_bytes: &[u8], fill: bool) -> Result<Block> {
-        let handle = Handle::decode(handle_bytes)?;
+        self.data_block_at(Handle::decode(handle_bytes)?, fill)
+    }
+
+    fn data_block_at(&self, handle: Handle, fill: bool) -> Result<Block> {
         if let Some((cache, number)) = &self.cache {
             if let Some(block) = cache.get(*number, handle.offset) {
                 return Ok(block);
@@ -428,43 +432,100 @@ impl TableReader {
     }
 
     /// The newest version of `user_key` at most `snapshot`, if this table has one.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn get(&self, cf: u32, user_key: &[u8], snapshot: u64) -> Result<Option<Version>> {
-        let target = key::at_snapshot(cf, user_key, snapshot);
-        if !bloom::may_contain(&self.filter, bloom::hash(key::cf_and_user_key(&target))) {
+        let lookup = key::LookupKey::new(cf, user_key, snapshot);
+        self.get_at(&lookup, bloom::hash(lookup.id()))
+    }
+
+    /// [`TableReader::get`] for a key a read built once for every table it
+    /// probes, `hash` being its bloom hash. The index and the block are
+    /// searched in place: the one handle taken is the data block's, from the
+    /// cache. Each handle is a write to a reference count shared by every
+    /// thread reading the table, and a read used to take six, on the reader,
+    /// the index and the block.
+    pub fn get_at(&self, lookup: &key::LookupKey<'_>, hash: u64) -> Result<Option<Version>> {
+        if !bloom::may_contain(&self.filter, hash) {
             return Ok(None);
         }
+        let target = lookup.internal();
+        let handle =
+            SEEK_KEY.with_borrow_mut(|key| match self.index.seek_entry(target, key)? {
+                Some((start, end)) => Handle::decode(&self.index.bytes()[start..end]).map(Some),
+                None => Ok(None),
+            })?;
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let block = self.data_block_at(handle, true)?;
+        let found = SEEK_KEY.with_borrow_mut(|key| -> Result<Option<Option<Version>>> {
+            let Some((start, end)) = block.seek_entry(target, key)? else {
+                return Ok(None);
+            };
+            let found =
+                key::parse(key).ok_or_else(|| Error::Corruption("bad key in table".into()))?;
+            Ok(Some(
+                (found.cf == lookup.cf && found.user_key == lookup.user_key).then(|| Version {
+                    seq: found.seq,
+                    kind: found.kind,
+                    value: detach_range(&block, start, end),
+                }),
+            ))
+        })?;
+        match found {
+            Some(version) => Ok(version),
+            None => self.get_after_block(lookup),
+        }
+    }
+
+    /// The end of a point read whose block holds nothing at or after the
+    /// target: every version in it is newer than the snapshot, or the target
+    /// falls between two blocks. The next block's first entry decides. Rare
+    /// enough to go through iterators.
+    fn get_after_block(&self, lookup: &key::LookupKey<'_>) -> Result<Option<Version>> {
         let mut index = self.index.iter();
-        index.seek(&target);
+        index.seek(lookup.internal());
         index.status()?;
         if !index.valid() {
             return Ok(None);
         }
+        index.next();
+        if !index.valid() {
+            index.status()?;
+            return Ok(None);
+        }
         let mut it = self.data_block(&index.value(), true)?.iter();
-        it.seek(&target);
+        it.seek_to_first();
         it.status()?;
         if !it.valid() {
-            // Every version in this block is newer than the snapshot; the
-            // next block may hold an older one.
-            index.next();
-            if !index.valid() {
-                return Ok(None);
-            }
-            it = self.data_block(&index.value(), true)?.iter();
-            it.seek_to_first();
-            it.status()?;
-            if !it.valid() {
-                return Ok(None);
-            }
+            return Ok(None);
         }
         let found =
             key::parse(it.key()).ok_or_else(|| Error::Corruption("bad key in table".into()))?;
         Ok(
-            (found.cf == cf && found.user_key == user_key).then(|| Version {
+            (found.cf == lookup.cf && found.user_key == lookup.user_key).then(|| Version {
                 seq: found.seq,
                 kind: found.kind,
                 value: crate::memtable::detach(it.value(), it.block_size()),
             }),
         )
+    }
+}
+
+thread_local! {
+    /// The key a point read decodes while it seeks, reused by every read on
+    /// the thread: a read allocates nothing to seek.
+    static SEEK_KEY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A value at `start..end` of `block`, copied out when it is a small part of
+/// the block, as [`crate::memtable::detach`] decides: a handle would keep the
+/// whole block alive, past its eviction from the cache.
+fn detach_range(block: &Block, start: usize, end: usize) -> Bytes {
+    if (end - start).saturating_mul(2) < block.size() {
+        Bytes::copy_from_slice(&block.bytes()[start..end])
+    } else {
+        block.slice(start..end)
     }
 }
 

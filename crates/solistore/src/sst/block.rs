@@ -191,6 +191,64 @@ impl Block {
             corrupt: false,
         }
     }
+
+    /// The block's bytes, which the value ranges below index into.
+    pub fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// A handle on part of the block, which keeps the whole block alive.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Bytes {
+        self.data.slice(range)
+    }
+
+    /// The first entry at or after `target`, read in place: its key is left
+    /// in `key` and its value's range in the block returned; `Ok(None)` when
+    /// every entry is before `target`. The search [`BlockIter::seek`] makes,
+    /// for a point read that needs one entry: it takes no handle on the
+    /// block. Each handle is a write to the block's shared reference count,
+    /// which every thread reading a hot block contends on.
+    pub fn seek_entry(&self, target: &[u8], key: &mut Vec<u8>) -> Result<Option<(usize, usize)>> {
+        // The last restart point whose key is before `target`.
+        let (mut left, mut right) = (0, self.num_restarts - 1);
+        while left < right {
+            let mid = (left + right).div_ceil(2);
+            let restart_key = self.restart_key(mid).ok_or_else(corrupt)?;
+            if key::compare(restart_key, target) == Ordering::Less {
+                left = mid;
+            } else {
+                right = mid - 1;
+            }
+        }
+        let data = &self.data[..self.restarts];
+        let mut at = self.restart_point(left);
+        key.clear();
+        while at < self.restarts {
+            let (value, next) = parse_entry(data, at, key).ok_or_else(corrupt)?;
+            if key::compare(key, target) != Ordering::Less {
+                return Ok(Some(value));
+            }
+            at = next;
+        }
+        Ok(None)
+    }
+}
+
+/// Decode the entry at `at` of a block's entries (`data`), rebuilding its
+/// key in `key` from the one before it. Returns the value's range and where
+/// the next entry starts; `None`, with `key` untouched, if the entry is
+/// malformed.
+fn parse_entry(data: &[u8], at: usize, key: &mut Vec<u8>) -> Option<((usize, usize), usize)> {
+    let (shared, unshared, value_len, header) = entry_header(data.get(at..)?)?;
+    let key_start = at.checked_add(header)?;
+    let value_start = key_start.checked_add(unshared)?;
+    let value_end = value_start.checked_add(value_len)?;
+    if shared > key.len() || value_end > data.len() {
+        return None;
+    }
+    key.truncate(shared);
+    key.extend_from_slice(&data[key_start..value_start]);
+    Some(((value_start, value_end), value_end))
 }
 
 /// A cursor over one block.
@@ -243,25 +301,14 @@ impl BlockIter {
             return false;
         }
         let data = &self.block.data[..self.block.restarts];
-        let Some((shared, unshared, value_len, header)) = entry_header(&data[self.offset..]) else {
-            return self.fail();
-        };
-        let key_start = self.offset + header;
-        let Some(value_end) = key_start
-            .checked_add(unshared)
-            .and_then(|v| v.checked_add(value_len))
-        else {
-            return self.fail();
-        };
-        if shared > self.key.len() || value_end > data.len() {
-            return self.fail();
+        match parse_entry(data, self.offset, &mut self.key) {
+            Some((value, next)) => {
+                self.value = value;
+                self.next_offset = next;
+                true
+            }
+            None => self.fail(),
         }
-        self.key.truncate(shared);
-        self.key
-            .extend_from_slice(&data[key_start..key_start + unshared]);
-        self.value = (key_start + unshared, value_end);
-        self.next_offset = value_end;
-        true
     }
 
     fn fail(&mut self) -> bool {
@@ -389,6 +436,36 @@ mod tests {
         }
         back.reverse();
         assert_eq!(back, ks);
+    }
+
+    /// The point read's in-place search lands where the iterator's seek
+    /// does, for every target: on a key, between keys, before the first
+    /// and past the last, with a key buffer left over from earlier reads.
+    #[test]
+    fn seek_entry_finds_what_the_iterator_seek_finds() {
+        let ks: Vec<_> = (0..300u64)
+            .map(|i| encode(0, format!("k{:04}", i * 3).as_bytes(), 9, Kind::Put))
+            .collect();
+        let block = build(&ks);
+        let mut key = b"left over from an earlier read".to_vec();
+        let mut targets: Vec<Vec<u8>> = (0..905u64)
+            .map(|i| encode(0, format!("k{i:04}").as_bytes(), 9, Kind::Put))
+            .collect();
+        targets.push(encode(0, b"a", 1, Kind::Put));
+        targets.push(encode(0, b"z", 1, Kind::Put));
+        // Newer and older than the stored version of a key.
+        targets.push(encode(0, b"k0003", 10, Kind::Put));
+        targets.push(encode(0, b"k0003", 8, Kind::Put));
+        for target in &targets {
+            let mut it = block.iter();
+            it.seek(target);
+            let found = block.seek_entry(target, &mut key).unwrap();
+            assert_eq!(found.is_some(), it.valid(), "{target:?}");
+            if let Some((start, end)) = found {
+                assert_eq!(key, it.key(), "{target:?}");
+                assert_eq!(&block.bytes()[start..end], &it.value()[..], "{target:?}");
+            }
+        }
     }
 
     #[test]

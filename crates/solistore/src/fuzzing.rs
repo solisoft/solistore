@@ -98,6 +98,9 @@ pub fn block(data: &[u8]) {
     it.seek(target);
     it.seek_for_prev(target);
     let _ = it.status();
+    // The point read's search, in place, against the iterator's.
+    let mut key = Vec::new();
+    let _ = block.seek_entry(target, &mut key);
 }
 
 /// A bloom filter, probed with hashes taken from the input.
