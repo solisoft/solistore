@@ -1622,7 +1622,7 @@ impl Inner {
     /// Give the group its sequence numbers and write it to the WAL, fsynced
     /// if the durability asks for it. Returns the group and each member's
     /// first sequence number.
-    fn write_group(&self, group: &[Arc<Member>]) -> Result<(Arc<Group>, Vec<u64>)> {
+    fn write_group(&self, group: &[crate::sync::Arc<Member>]) -> Result<(Arc<Group>, Vec<u64>)> {
         self.check()?;
         let mut commit = self.commit.lock();
         self.throttle()?;

@@ -477,7 +477,8 @@ mod loom_tests {
                     let q = q.clone();
                     thread::spawn(move || {
                         let abandoned = || false;
-                        match q.enter(id, false, usize::MAX, |_| 1, &abandoned) {
+                        let turn = q.enter(id, false, usize::MAX, |_| 1, &abandoned);
+                        match turn {
                             // The first leader gives up; a later one finishes.
                             Turn::Lead(lead) if id == 0 => drop(lead),
                             Turn::Lead(lead) => {
