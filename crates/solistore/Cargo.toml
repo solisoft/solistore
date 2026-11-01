@@ -30,6 +30,16 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# The commit queue's model checks, under `cargo test` only:
+# RUSTFLAGS="--cfg loom" cargo test --release --lib loom_tests. A dev
+# dependency: loom's `generator` builds C, which the engine's own graph must
+# not (scripts/check_no_c_toolchain.sh).
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
 [dev-dependencies]
 proptest = "1"
 rand = "0.8"

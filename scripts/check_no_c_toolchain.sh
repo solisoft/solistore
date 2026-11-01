@@ -12,7 +12,9 @@ cd "$(dirname "$0")/.."
 
 status=0
 for tool in cc cmake bindgen; do
-    if out=$(cargo tree -p solistore --target all -e normal,build -i "$tool" 2>/dev/null); then
+    # A tool the lock file holds for a dev dependency only (loom's builds C)
+    # prints nothing here and still succeeds: only a tree counts.
+    if out=$(cargo tree -p solistore --target all -e normal,build -i "$tool" 2>/dev/null) && [ -n "$out" ]; then
         echo "FAIL: solistore depends on \`$tool\`:" >&2
         echo "$out" >&2
         status=1

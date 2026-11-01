@@ -96,6 +96,18 @@ jobs:
             echo "$out" | grep -q '"torn_batch":false' || { echo "a batch applied in part"; exit 1; }
           done
 
+  # loom on the commit path's two protocols (crates/solistore/src/
+  # commit_queue.rs): leader election and publication, under every
+  # interleaving of a few writers.
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release -p solistore --lib loom_tests
+        env:
+          RUSTFLAGS: --cfg loom
+
   # Miri on the tests that cover the unsafe code: the memtable's skiplist
   # and arena, and the cursor reads through it. Undefined behaviour, a data
   # race or a leak fails the job. Sizes are scaled down under cfg(miri).
