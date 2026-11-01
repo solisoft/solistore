@@ -37,11 +37,27 @@ const TOMBSTONE_OVERHEAD: usize = std::mem::size_of::<RangeTombstone>();
 /// value that small costs nothing next to the decompression that produced
 /// it. A value that is most of its buffer is handed out as it is.
 pub(crate) fn detach(value: Bytes, backing: usize) -> Bytes {
-    if value.len().saturating_mul(2) < backing {
+    if copies(value.len(), backing) {
         Bytes::copy_from_slice(&value)
     } else {
         value
     }
+}
+
+/// [`detach`] for a value read in place: copy `value` out, or take
+/// `handle()` on its buffer of `backing` bytes, by the same rule.
+pub(crate) fn detach_from(value: &[u8], backing: usize, handle: impl FnOnce() -> Bytes) -> Bytes {
+    if copies(value.len(), backing) {
+        Bytes::copy_from_slice(value)
+    } else {
+        handle()
+    }
+}
+
+/// Whether a value of `len` bytes is copied out of its `backing` buffer
+/// rather than handed out as a slice of it.
+fn copies(len: usize, backing: usize) -> bool {
+    len.saturating_mul(2) < backing
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,14 +187,19 @@ impl Memtable {
     }
 
     /// The newest version of `key` with a sequence number at most `snapshot`.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn get(&self, cf: u32, key: &[u8], snapshot: u64) -> Option<Version> {
-        let probe = key::at_snapshot(cf, key, snapshot);
-        let at = self.map.seek_ge(&probe)?;
+        self.get_at(&key::LookupKey::new(cf, key, snapshot))
+    }
+
+    /// [`Memtable::get`] for a key a read built once for every source.
+    pub fn get_at(&self, lookup: &key::LookupKey<'_>) -> Option<Version> {
+        let at = self.map.seek_ge(lookup.internal())?;
         // SAFETY: `at` comes from `self.map`.
         let found = key::parse(unsafe { self.map.key(at) })?;
         // A copy, as RocksDB's bindings make: a slice of the arena would
         // keep the whole memtable alive past its flush.
-        (found.cf == cf && found.user_key == key).then(|| Version {
+        (found.cf == lookup.cf && found.user_key == lookup.user_key).then(|| Version {
             seq: found.seq,
             kind: found.kind,
             value: Bytes::copy_from_slice(unsafe { self.map.value(at) }),

@@ -338,6 +338,9 @@ mod soli {
             if let Some(n) = t.compactions {
                 opts.max_background_compactions = n;
             }
+            if let Some(n) = t.recycle_wals {
+                opts.recycle_wal_files = n;
+            }
             let db = Db::open(dir, opts).expect("open solistore");
             let cf = |name: &str| {
                 db.cf_handle(name)
@@ -432,7 +435,7 @@ mod soli {
             let s = self.db.stats();
             format!(
                 concat!(
-                    r#"{{"groups":{},"batches":{},"fsyncs":{},"l0_slowdowns":{},"l0_stop_ms":{},"#,
+                    r#"{{"groups":{},"batches":{},"fsyncs":{},"bg_fsyncs":{},"l0_slowdowns":{},"l0_stop_ms":{},"#,
                     r#""memtable_wait_ms":{},"flushes":{},"flushed_mb":{},"compactions":{},"#,
                     r#""compaction_read_mb":{},"compaction_written_mb":{},"compaction_ms":{},"#,
                     r#""files_per_level":{:?},"block_cache_mb":{},"memtable_mb":{},"table_mb":{},"largest_wal_mb":{}}}"#
@@ -440,6 +443,7 @@ mod soli {
                 s.commit_groups,
                 s.committed_batches,
                 s.wal_fsyncs,
+                s.wal_background_fsyncs,
                 s.l0_slowdowns,
                 s.l0_stop_micros / 1000,
                 s.memtable_wait_micros / 1000,
@@ -629,6 +633,8 @@ struct SoliTuning {
     buffer_mb: Option<usize>,
     /// Compactions allowed to run at once.
     compactions: Option<usize>,
+    /// Dead WAL files kept for reuse.
+    recycle_wals: Option<usize>,
 }
 
 /// RocksDB settings under test on top of the prod profile.
@@ -745,6 +751,7 @@ impl Params {
                 "--rx-hcc" => p.rocks.hyper_clock = value == "1",
                 "--sx-buffer-mb" => p.soli.buffer_mb = Some(value.parse().unwrap()),
                 "--sx-compactions" => p.soli.compactions = Some(value.parse().unwrap()),
+                "--sx-recycle-wals" => p.soli.recycle_wals = Some(value.parse().unwrap()),
                 flag => panic!("unknown flag {flag}"),
             }
             i += 2;
@@ -783,6 +790,9 @@ impl Params {
         }
         if let Some(n) = self.soli.compactions {
             args.extend(["--sx-compactions".to_string(), n.to_string()]);
+        }
+        if let Some(n) = self.soli.recycle_wals {
+            args.extend(["--sx-recycle-wals".to_string(), n.to_string()]);
         }
         args
     }

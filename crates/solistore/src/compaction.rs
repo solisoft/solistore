@@ -524,7 +524,7 @@ fn merge_range(
     if compaction.level == 0 {
         for f in &compaction.inputs {
             children.push(Box::new(
-                TableIter::new(f.reader()?).without_filling_cache(),
+                TableIter::new(f.reader()?.clone()).without_filling_cache(),
             ));
         }
     } else {

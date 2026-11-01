@@ -81,7 +81,7 @@ solistore answers each of these with a design choice:
 | Mode | A commit returns when… | Process crash | Power loss |
 |---|---|---|---|
 | `Durability::Full` (default) | its group's fsync completed | loses nothing | loses nothing acknowledged |
-| `Durability::Eventual { sync_interval }` | it reached the OS; a background thread fsyncs every interval | loses nothing | loses at most `sync_interval` of acknowledged writes, never a write without every later one |
+| `Durability::Eventual { sync_interval }` | it reached the OS; a background thread fsyncs every interval, and as soon as `wal_bytes_per_sync` (1 MiB) waits | loses nothing | loses at most `sync_interval` of acknowledged writes, never a write without every later one |
 
 In either mode, a write with `WriteOptions { sync: true }` waits for its own
 fsync. An fsync failure poisons the database, which then refuses further
@@ -216,28 +216,40 @@ RocksDB's p99 update latency is 4.4 ms and solistore's 3.0 ms.
 the document plus three index entries, and the phases are gets, scans,
 updates, fsynced transactions and a ~1,232-collection catalog.
 
-At 5M documents, medians of 3, the series of 2026-11-01
-(`bench/results/2026-11-01-all`, both engines in one series on the same
-machine, faithful builds):
+At 5M documents, medians of 3, the final series of 2026-11-01
+(`bench/results/2026-11-01-beat-rocksdb/final`, both engines alternating
+on the same machine):
 
-| Phase | Eventual vs RocksDB | Full vs RocksDB |
-|---|---:|---:|
-| bulk load | 1.31× | 0.49× |
-| updates | 1.53× | 0.48× |
-| mixed read/write | 1.31× | 0.93× |
-| get, uniform / hot / missing | 1.31× / 1.49× / 1.92× | 1.29× / 1.43× / 1.64× |
-| scans, ascending / descending | 1.65× / 1.44× | 1.54× / 1.46× |
-| fsynced commits, 8 threads | 3.40× | 3.08× |
-| fsynced commits, 1 thread | 0.89× | 2.24× |
+| Phase | Eventual vs RocksDB |
+|---|---:|
+| bulk load | 1.15× |
+| updates | 1.43× |
+| mixed read/write | 1.45× |
+| get, uniform / hot / missing | 1.33× / 1.63× / 2.34× |
+| scans, ascending / descending | 1.76× / 1.69× |
+| fsynced commits, 8 threads | 1.62× |
+| fsynced commits, 1 thread | 1.53× |
 
-In full durability mode solistore fsyncs *every* commit, where RocksDB's
-`sync=false` writes fsync none: the load and updates are slower for that
-alone. Its fsynced commits are 2–3× RocksDB's all the same.
+Ratios move with RocksDB's own spread from run to run. Its bulk-load
+median went from 428k to 512k documents a second between that day's
+series, which is why the load reads 1.31× in `2026-11-01-all` and 1.15×
+here. The A/B runs of these changes left solistore's own load within 2%.
 
-The eventual mode's single-thread fsynced commits are the one phase
-behind. It is 2,000 commits in about 0.1 s, which the first fsync after
-the unsynced load mostly decides: 19.9k, 13.1k and 21.2k commits a second
-over the three runs, against RocksDB's 22.4k, 26.5k and 20.6k.
+Each fsynced-commit phase is 2,000 commits, and one or two stalls a run
+decide it, for both engines: table writes from flush and compaction share
+the disks with the WAL's fsync. Over every comparable run of the day (16
+of solistore, 9 of RocksDB) the medians are 1.43× with one thread and
+1.62× with eight.
+
+The single-thread phase was the one behind at b29426d (0.89×,
+`bench/results/2026-11-01-all`). The first fsync after the unsynced load
+flushed up to 100 ms of WAL, about 30 MB. The eventual mode's background
+syncer now also fsyncs as soon as `wal_bytes_per_sync` (1 MiB) waits.
+
+In full durability mode (`2026-11-01-all`, b29426d) solistore fsyncs
+*every* commit, where RocksDB's `sync=false` writes fsync none. That
+alone makes the load 0.49× and the updates 0.48×. Its fsynced commits run
+at 2–3× RocksDB's all the same.
 
 On the go/no-go series of 2026-10-14 (`bench/results/2026-10-14-m7`),
 before the commit pipeline, the arena memtable and dynamic level targets,

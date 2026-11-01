@@ -62,6 +62,54 @@ pub fn at_snapshot(cf: u32, user_key: &[u8], snapshot: u64) -> Vec<u8> {
     encode(cf, user_key, snapshot.min(MAX_SEQ), Kind::Put)
 }
 
+/// Internal keys up to this long are built inline by [`LookupKey`].
+const LOOKUP_INLINE: usize = 128;
+
+/// What a point read seeks in every memtable and table it probes: the
+/// [`at_snapshot`] key of `(cf, user_key)`, built once per read. A short key
+/// lives inline, so a read allocates nothing for it; it used to build the
+/// same key once per memtable and once per table probed.
+pub struct LookupKey<'a> {
+    pub cf: u32,
+    pub user_key: &'a [u8],
+    buf: LookupBuf,
+}
+
+enum LookupBuf {
+    Inline([u8; LOOKUP_INLINE], u8),
+    Heap(Vec<u8>),
+}
+
+impl<'a> LookupKey<'a> {
+    pub fn new(cf: u32, user_key: &'a [u8], snapshot: u64) -> Self {
+        let len = MIN_LEN + user_key.len();
+        let buf = if len <= LOOKUP_INLINE {
+            let mut bytes = [0u8; LOOKUP_INLINE];
+            let end = CF_LEN + user_key.len();
+            bytes[..CF_LEN].copy_from_slice(&cf.to_be_bytes());
+            bytes[CF_LEN..end].copy_from_slice(user_key);
+            bytes[end..len].copy_from_slice(&trailer_bytes(snapshot.min(MAX_SEQ), Kind::Put));
+            LookupBuf::Inline(bytes, len as u8)
+        } else {
+            LookupBuf::Heap(at_snapshot(cf, user_key, snapshot))
+        };
+        LookupKey { cf, user_key, buf }
+    }
+
+    /// The internal key, as [`at_snapshot`] encodes it.
+    pub fn internal(&self) -> &[u8] {
+        match &self.buf {
+            LookupBuf::Inline(bytes, len) => &bytes[..*len as usize],
+            LookupBuf::Heap(key) => key,
+        }
+    }
+
+    /// `cf ‖ user_key`: what file bounds and bloom filters are keyed on.
+    pub fn id(&self) -> &[u8] {
+        cf_and_user_key(self.internal())
+    }
+}
+
 /// Sorts before every version of `user_key`.
 pub fn first_of(cf: u32, user_key: &[u8]) -> Vec<u8> {
     encode(cf, user_key, MAX_SEQ, Kind::Put)
