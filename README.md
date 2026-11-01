@@ -66,7 +66,10 @@ solistore answers each of these with a design choice:
   - Kept at the version level rather than in tables.
   - A file wholly covered by a delete is dropped without being read.
   - Files that straddle the deleted range are compacted first.
-- Leveled compaction with parallel subcompactions and trivial moves.
+- Leveled compaction with parallel subcompactions and trivial moves, and
+  level targets set from the bottom level (RocksDB's
+  `level_compaction_dynamic_level_bytes`): a small database is one sorted
+  run, and obsolete versions stay at about a tenth of the data.
   Writers are slowed and then stalled on level-0 backlog.
 - Point-in-time checkpoints made of hard links.
 - Metrics:
@@ -299,7 +302,7 @@ docs/             integration plan for SoliDB
 - [x] A migration tool from RocksDB data directories
   (`solidb-migrate-engine`, SoliDB 2.4).
 - [ ] A trial on real workloads, then removing RocksDB from SoliDB.
-- [ ] Dynamic level sizing, `loom` on the
+- [ ] `loom` on the
   commit path, Miri on the `unsafe`, decoder fuzzing, and crash tests on
   NTFS.
 

@@ -123,3 +123,91 @@ fn newer_versions_win_over_zeroed_ones() {
         assert_eq!(got.as_deref(), want, "after reopening: key {i}");
     }
 }
+
+/// A database written with fixed level targets, reopened with dynamic ones
+/// and written more: every read still sees the newest write, and once
+/// writes stop the upper levels drain into the bottom, which then holds
+/// most of the data.
+#[test]
+fn a_fixed_layout_drains_into_the_bottom_under_dynamic_targets() {
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let opts = |dynamic: bool| Options {
+        write_buffer_size: 16 << 10,
+        target_file_size: 8 << 10,
+        max_bytes_for_level_base: 64 << 10,
+        level_multiplier: 4,
+        level0_compaction_trigger: 2,
+        level_compaction_dynamic_level_bytes: dynamic,
+        ..Options::default()
+    };
+    let mut model: BTreeMap<u32, Option<Vec<u8>>> = BTreeMap::new();
+    let write = |db: &Db, model: &mut BTreeMap<u32, Option<Vec<u8>>>, round: u32| {
+        let cf = db.default_cf();
+        for chunk in (0..20_000u32).collect::<Vec<_>>().chunks(400) {
+            let mut batch = solistore::WriteBatch::new();
+            for &i in chunk {
+                let k = (i * 7919 + round * 13) % 20_000;
+                if (k + round).is_multiple_of(6) {
+                    batch.delete(&cf, key(k));
+                    model.insert(k, None);
+                } else {
+                    let v = format!("{k}:{round}").into_bytes();
+                    batch.put(&cf, key(k), &v);
+                    model.insert(k, Some(v));
+                }
+            }
+            db.write(batch).unwrap();
+        }
+    };
+    let check = |db: &Db, model: &BTreeMap<u32, Option<Vec<u8>>>, when: &str| {
+        let cf = db.default_cf();
+        for (k, v) in model.iter().step_by(3) {
+            assert_eq!(
+                db.get(&cf, key(*k)).unwrap().map(|b| b.to_vec()).as_ref(),
+                v.as_ref(),
+                "{when}: key {k}"
+            );
+        }
+    };
+    // Waits for `done`, not for the compaction count to stop moving: one
+    // compaction on a CI runner can outlast any quiet period short enough
+    // to keep the test fast.
+    let settle = |db: &Db, done: &dyn Fn(&[usize]) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let levels = db.files_per_level();
+            if done(&levels) || Instant::now() >= deadline {
+                return levels;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    {
+        let db = Db::open(dir.path(), opts(false)).unwrap();
+        for round in 0..3 {
+            write(&db, &mut model, round);
+        }
+        db.flush().unwrap();
+        let levels = settle(&db, &|l| l[0] < 2);
+        assert!(
+            levels[1] + levels[2] > 0,
+            "fixed targets fill the upper levels: {levels:?}"
+        );
+        assert_eq!(levels[6], 0, "and leave the bottom empty: {levels:?}");
+        check(&db, &model, "fixed");
+    }
+    let db = Db::open(dir.path(), opts(true)).unwrap();
+    check(&db, &model, "reopened");
+    for round in 3..6 {
+        write(&db, &mut model, round);
+        check(&db, &model, "while draining");
+    }
+    db.flush().unwrap();
+    let levels = settle(&db, &|l| l[0] < 2 && l[1..4].iter().all(|&n| n == 0));
+    check(&db, &model, "drained");
+    let (upper, bottom): (usize, usize) = (levels[1..4].iter().sum(), levels[6]);
+    assert_eq!(upper, 0, "levels 1-3 drained: {levels:?}");
+    assert!(bottom > 0, "the bottom holds the data: {levels:?}");
+}
