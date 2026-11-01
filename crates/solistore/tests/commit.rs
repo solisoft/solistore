@@ -422,11 +422,20 @@ fn compaction_moves_data_down_and_keeps_every_key() {
             .count()
     };
     let live = || db.files_per_level().iter().sum::<usize>();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while on_disk() != live() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
+    // The first database stopped with compactions still to do, and the
+    // reopened one runs them back to back: between two of them the counts
+    // agree only for an instant. 20 seconds were not always enough on CI
+    // runners (this test takes minutes on Windows), and comparing again
+    // after the loop could land in the next compaction. A leaked file never
+    // lets them agree: the directory cannot hold fewer files than the live
+    // ones plus the leaked ones.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut counts = (on_disk(), live());
+    while counts.0 != counts.1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+        counts = (on_disk(), live());
     }
-    assert_eq!(on_disk(), live());
+    assert_eq!(counts.0, counts.1, "table files on disk vs live");
 }
 
 /// A collection is a key prefix in a shared column family; dropping it is
