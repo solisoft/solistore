@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/solistore"]
-# The benchmark is its own workspace: it links RocksDB for the baseline, and
-# the engine's own build must never pay for that C++.
-exclude = ["bench"]
+# The benchmark and the fuzz targets are their own workspaces: they link
+# RocksDB and libFuzzer, and the engine's own build must never pay for that
+# C++.
+exclude = ["bench", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"
