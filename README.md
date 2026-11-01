@@ -81,7 +81,7 @@ solistore answers each of these with a design choice:
 | Mode | A commit returns when… | Process crash | Power loss |
 |---|---|---|---|
 | `Durability::Full` (default) | its group's fsync completed | loses nothing | loses nothing acknowledged |
-| `Durability::Eventual { sync_interval }` | it reached the OS; a background thread fsyncs every interval | loses nothing | loses at most `sync_interval` of acknowledged writes, never a write without every later one |
+| `Durability::Eventual { sync_interval }` | it reached the OS; a background thread fsyncs every interval, and as soon as `wal_bytes_per_sync` (1 MiB) waits | loses nothing | loses at most `sync_interval` of acknowledged writes, never a write without every later one |
 
 In either mode, a write with `WriteOptions { sync: true }` waits for its own
 fsync. An fsync failure poisons the database, which then refuses further
