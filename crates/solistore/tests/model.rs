@@ -333,10 +333,14 @@ fn eventual_mode_recovers_a_synced_prefix() {
         let fs = FaultFs::new();
         let opts = Options {
             fs: Arc::new(fs.clone()),
-            // Long enough that the background syncer never runs mid-test.
+            // An interval that never comes: the background syncer runs only
+            // when `wal_bytes_per_sync` bytes wait. That is never here for
+            // a third of the seeds, and after nearly every write for the
+            // rest, racing the writes and the crash.
             durability: Durability::Eventual {
                 sync_interval: std::time::Duration::from_secs(3600),
             },
+            wal_bytes_per_sync: [1 << 20, 1, 64][seed as usize % 3],
             ..Options::default()
         };
         let db = Db::open("/db", opts.clone()).unwrap();

@@ -432,7 +432,7 @@ mod soli {
             let s = self.db.stats();
             format!(
                 concat!(
-                    r#"{{"groups":{},"batches":{},"fsyncs":{},"l0_slowdowns":{},"l0_stop_ms":{},"#,
+                    r#"{{"groups":{},"batches":{},"fsyncs":{},"bg_fsyncs":{},"l0_slowdowns":{},"l0_stop_ms":{},"#,
                     r#""memtable_wait_ms":{},"flushes":{},"flushed_mb":{},"compactions":{},"#,
                     r#""compaction_read_mb":{},"compaction_written_mb":{},"compaction_ms":{},"#,
                     r#""files_per_level":{:?},"block_cache_mb":{},"memtable_mb":{},"table_mb":{},"largest_wal_mb":{}}}"#
@@ -440,6 +440,7 @@ mod soli {
                 s.commit_groups,
                 s.committed_batches,
                 s.wal_fsyncs,
+                s.wal_background_fsyncs,
                 s.l0_slowdowns,
                 s.l0_stop_micros / 1000,
                 s.memtable_wait_micros / 1000,

@@ -955,3 +955,106 @@ fn a_synced_write_does_not_rely_on_a_concurrent_fsync() {
         );
     }
 }
+
+/// Eventual mode with an interval that never comes: once
+/// `wal_bytes_per_sync` bytes wait, the leader wakes the syncer, which
+/// fsyncs them, and a crash keeps every write that fsync covered.
+#[test]
+fn eventual_mode_syncs_once_enough_bytes_wait() {
+    let fs = FaultFs::new();
+    let opts = Options {
+        fs: Arc::new(fs.clone()),
+        durability: Durability::Eventual {
+            sync_interval: Duration::from_secs(3600),
+        },
+        wal_bytes_per_sync: 16 << 10,
+        ..Options::default()
+    };
+    let db = Db::open(
+        "/db",
+        Options {
+            fs: Arc::new(fs.process()),
+            ..opts.clone()
+        },
+    )
+    .unwrap();
+    let cf = db.default_cf();
+    // Records of a little over 1 KiB: the threshold is crossed at the 16th.
+    let writes = 64u32;
+    for i in 0..writes {
+        db.put(&cf, i.to_be_bytes(), [i as u8; 1024]).unwrap();
+    }
+    assert_eq!(db.stats().wal_fsyncs, 0, "no write asked for an fsync");
+    // Counted once done: everything it covered is durable now. Generous,
+    // for a loaded runner; it takes microseconds.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while db.stats().wal_background_fsyncs == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no background fsync after 64 KiB"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    fs.crash(Torn::None);
+    drop(db);
+
+    let db = Db::open(
+        "/db",
+        Options {
+            fs: Arc::new(fs.process()),
+            ..opts
+        },
+    )
+    .unwrap();
+    let keys: Vec<u32> = db
+        .iterator(&db.default_cf(), IteratorMode::Start)
+        .unwrap()
+        .map(|r| u32::from_be_bytes(r.unwrap().0[..].try_into().unwrap()))
+        .collect();
+    assert!(
+        keys.len() >= 15,
+        "{} writes survived; the fsync was asked once 16 KiB waited",
+        keys.len()
+    );
+    assert_eq!(
+        keys,
+        (0..keys.len() as u32).collect::<Vec<_>>(),
+        "not a prefix"
+    );
+}
+
+/// The syncer sleeps on its own park token, which only a close sets when
+/// nothing is written: closing must wake it whatever its interval, even
+/// before it has parked the first time.
+#[test]
+fn closing_wakes_a_syncer_with_a_long_interval() {
+    let fs = FaultFs::new();
+    let opts = Options {
+        fs: Arc::new(fs.clone()),
+        durability: Durability::Eventual {
+            sync_interval: Duration::from_secs(3600),
+        },
+        ..Options::default()
+    };
+    let start = Instant::now();
+    for round in 0..50u32 {
+        let db = Db::open("/db", opts.clone()).unwrap();
+        if round % 2 == 1 {
+            db.put(&db.default_cf(), round.to_be_bytes(), b"v").unwrap();
+        }
+        drop(db);
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(60),
+        "50 opens and closes took {:?}",
+        start.elapsed()
+    );
+    let db = Db::open("/db", opts).unwrap();
+    assert_eq!(
+        db.iterator(&db.default_cf(), IteratorMode::Start)
+            .unwrap()
+            .count(),
+        25,
+        "every write before a clean close is kept"
+    );
+}

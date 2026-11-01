@@ -125,6 +125,16 @@ pub struct Options {
     /// Dead WAL files kept to be written over instead of creating new ones
     /// (RocksDB's `recycle_log_file_num`; SoliDB's profile sets 3).
     pub recycle_wal_files: usize,
+    /// In [`Durability::Eventual`], the background syncer also fsyncs the
+    /// WAL as soon as this many bytes wait for it, not only every
+    /// `sync_interval`. A synced write, or a crash, then finds at most
+    /// about this much to flush: after a burst of writes, the first synced
+    /// commit waited for the whole interval's backlog, tens of megabytes at
+    /// load speed (60 ms after the 5M benchmark's load). RocksDB's
+    /// `wal_bytes_per_sync` only starts the write-back; this makes the
+    /// bytes durable, so it also narrows what power loss can take. 0 syncs
+    /// on the interval alone.
+    pub wal_bytes_per_sync: u64,
 }
 
 impl Default for Options {
@@ -158,6 +168,7 @@ impl Default for Options {
             // reused file keeps the largest size it ever reached, and three of
             // them came to ~300 MB on the benchmark's disk measure.
             recycle_wal_files: 1,
+            wal_bytes_per_sync: 1 << 20,
         }
     }
 }
@@ -190,6 +201,7 @@ impl fmt::Debug for Options {
             .field("block_cache_size", &self.block_cache_size)
             .field("bytes_per_sync", &self.bytes_per_sync)
             .field("recycle_wal_files", &self.recycle_wal_files)
+            .field("wal_bytes_per_sync", &self.wal_bytes_per_sync)
             .finish()
     }
 }
@@ -210,7 +222,12 @@ pub struct Stats {
     pub committed_batches: u64,
     /// Bytes appended to WALs.
     pub wal_bytes: u64,
+    /// WAL fsyncs made by commit groups (every group in `Full`, synced
+    /// writes in `Eventual`).
     pub wal_fsyncs: u64,
+    /// WAL fsyncs made by the eventual-mode syncer, on its interval or
+    /// because `wal_bytes_per_sync` bytes were waiting. Counted once done.
+    pub wal_background_fsyncs: u64,
     /// Groups delayed 1 ms because level 0 passed the slowdown trigger.
     pub l0_slowdowns: u64,
     /// Microseconds writers were stopped by level 0 at the stop trigger.
@@ -234,6 +251,7 @@ struct Counters {
     committed_batches: AtomicU64,
     wal_bytes: AtomicU64,
     wal_fsyncs: AtomicU64,
+    wal_background_fsyncs: AtomicU64,
     l0_slowdowns: AtomicU64,
     l0_stop_micros: AtomicU64,
     memtable_wait_micros: AtomicU64,
@@ -380,6 +398,13 @@ struct Inner {
     current_wal: Mutex<Arc<WalFile>>,
     /// What must be durable before the current WAL may be fsynced.
     barrier: Mutex<SyncBarrier>,
+    /// Unsynced WAL bytes at which a leader wakes the syncer (0: never).
+    wal_bytes_per_sync: u64,
+    /// A leader asked the syncer for an fsync it has not started yet.
+    sync_wanted: AtomicBool,
+    /// The eventual-mode syncer, parked between fsyncs. Set before `open`
+    /// returns, so every writer and the close find it.
+    syncer: std::sync::OnceLock<std::thread::Thread>,
     /// Table files whose delete failed, retried by the background.
     graveyard: crate::version::Graveyard,
     /// A write, fsync or flush failed; see [`Error::Poisoned`].
@@ -427,6 +452,9 @@ struct WalFile {
     dirty: AtomicBool,
     /// Bytes appended to this WAL.
     written: AtomicU64,
+    /// `written` when its last fsync started: the bytes past it may not be
+    /// durable yet.
+    synced: AtomicU64,
 }
 
 /// The leader's working state. Only the current leader locks it (and a
@@ -638,6 +666,7 @@ impl Db {
             number: wal_no,
             dirty: AtomicBool::new(false),
             written: AtomicU64::new(0),
+            synced: AtomicU64::new(0),
         });
         let inner = Arc::new(Inner {
             dir,
@@ -684,6 +713,9 @@ impl Db {
             recycle_wal_files: opts.recycle_wal_files,
             current_wal: Mutex::new(wal),
             barrier: Mutex::new(SyncBarrier::default()),
+            wal_bytes_per_sync: opts.wal_bytes_per_sync,
+            sync_wanted: AtomicBool::new(false),
+            syncer: std::sync::OnceLock::new(),
             graveyard,
             poisoned: AtomicBool::new(false),
             poison_cause: Mutex::new(None),
@@ -713,12 +745,17 @@ impl Db {
         }
         if let Durability::Eventual { sync_interval } = opts.durability {
             let syncer = inner.clone();
-            threads.push(
-                std::thread::Builder::new()
-                    .name("solistore-wal-sync".into())
-                    .spawn(move || syncer.sync_loop(sync_interval))
-                    .map_err(Error::from)?,
-            );
+            let thread = std::thread::Builder::new()
+                .name("solistore-wal-sync".into())
+                .spawn(move || syncer.sync_loop(sync_interval))
+                .map_err(Error::from)?;
+            // Before any writer can look for it, and before a close could
+            // need to wake it.
+            inner
+                .syncer
+                .set(thread.thread().clone())
+                .expect("one syncer per database");
+            threads.push(thread);
         }
         Ok(Db {
             handle: Arc::new(Handle {
@@ -748,6 +785,7 @@ impl Db {
             committed_batches: get(&c.committed_batches),
             wal_bytes: get(&c.wal_bytes),
             wal_fsyncs: get(&c.wal_fsyncs),
+            wal_background_fsyncs: get(&c.wal_background_fsyncs),
             l0_slowdowns: get(&c.l0_slowdowns),
             l0_stop_micros: get(&c.l0_stop_micros),
             memtable_wait_micros: get(&c.memtable_wait_micros),
@@ -1262,6 +1300,12 @@ impl Drop for Handle {
     fn drop(&mut self) {
         self.inner.bg.lock().shutdown = true;
         self.inner.bg_cv.notify_all();
+        // The syncer sleeps on its own token, not on `bg_cv`. A token left
+        // before it parks makes its park return at once, so it cannot miss
+        // this.
+        if let Some(syncer) = self.inner.syncer.get() {
+            syncer.unpark();
+        }
         for thread in self.threads.lock().drain(..) {
             thread.join().ok();
         }
@@ -1423,7 +1467,43 @@ impl Inner {
             }
         }
         wal.dirty.store(false, Ordering::Release);
+        // Everything counted in `written` was appended before this fsync
+        // starts, so it is covered. A slower concurrent fsync must not move
+        // the mark back.
+        wal.synced
+            .fetch_max(wal.written.load(Ordering::Acquire), Ordering::Release);
         self.io(|| Ok(wal.file.sync()?))
+    }
+
+    /// In eventual mode, wake the syncer once `wal_bytes_per_sync` bytes of
+    /// `wal` wait for an fsync. Called by the leader after each unsynced
+    /// group: one atomic load when nothing is due, and the syncer is woken
+    /// once per request however many groups pass meanwhile.
+    fn request_sync_if_due(&self, wal: &WalFile) {
+        if self.wal_bytes_per_sync == 0 {
+            return;
+        }
+        let pending = wal
+            .written
+            .load(Ordering::Relaxed)
+            .saturating_sub(wal.synced.load(Ordering::Relaxed));
+        if pending >= self.wal_bytes_per_sync {
+            self.wake_syncer();
+        }
+    }
+
+    /// Ask the eventual-mode syncer for an fsync now. Waking it costs a
+    /// futex call, paid once per request: until the syncer takes it, later
+    /// callers find it pending and return.
+    fn wake_syncer(&self) {
+        let Some(syncer) = self.syncer.get() else {
+            return; // Full durability: every group fsyncs itself
+        };
+        if !self.sync_wanted.load(Ordering::Relaxed)
+            && !self.sync_wanted.swap(true, Ordering::AcqRel)
+        {
+            syncer.unpark();
+        }
     }
 
     fn append_edits(&self, structure: &mut Structure, edits: &[Edit]) -> Result<()> {
@@ -1652,7 +1732,9 @@ impl Inner {
 
         let sync = self.durability == Durability::Full || group.iter().any(|m| m.item.sync);
         self.io(|| Ok(wal.file.append(buf)?))?;
-        wal.written.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        // Release: whoever reads this count reads it after the bytes were
+        // appended, and may fsync them as counted (see `sync_wal_file`).
+        wal.written.fetch_add(buf.len() as u64, Ordering::Release);
         add(&self.counters.wal_bytes, buf.len() as u64);
         add(&self.counters.commit_groups, 1);
         add(&self.counters.committed_batches, group.len() as u64);
@@ -1661,6 +1743,7 @@ impl Inner {
             self.sync_wal_file(wal)?;
         } else {
             wal.dirty.store(true, Ordering::Release);
+            self.request_sync_if_due(wal);
         }
         if buf.capacity() > 2 * MAX_GROUP_BYTES {
             *buf = Vec::new();
@@ -1781,9 +1864,14 @@ impl Inner {
             number,
             dirty: AtomicBool::new(false),
             written: AtomicU64::new(0),
+            synced: AtomicU64::new(0),
         });
         commit.wal = wal.clone();
         *self.current_wal.lock() = wal;
+        // The old WAL's tail and the new name are durable once the syncer
+        // has run: have it run now rather than at the end of its interval,
+        // so the next synced write finds them done.
+        self.wake_syncer();
 
         self.install(|sv| SuperVersion {
             mem: Arc::new(Memtable::new(number)),
@@ -2164,24 +2252,29 @@ impl Inner {
         Ok(())
     }
 
+    /// Eventual mode's background fsync: every `interval`, and at once when
+    /// a leader asks (`wal_bytes_per_sync` bytes waiting, or a memtable
+    /// switch). It sleeps on its own park token: on the shared `bg_cv` every
+    /// flush and compaction woke it. Every request comes with an `unpark`,
+    /// so a request made during an fsync makes the next park return at once,
+    /// and no token is left over to cost an fsync nobody asked for.
     fn sync_loop(&self, interval: Duration) {
         loop {
-            {
-                let mut bg = self.bg.lock();
-                if !bg.shutdown {
-                    self.bg_cv.wait_for(&mut bg, interval);
-                }
-                if bg.shutdown {
-                    return;
-                }
-            }
-            if self.poisoned.load(Ordering::Acquire) {
+            std::thread::park_timeout(interval);
+            // From here on, a request wakes the next park; one made before
+            // this store is served by the fsync below, which counts the
+            // WAL after it.
+            self.sync_wanted.store(false, Ordering::Release);
+            if self.bg.lock().shutdown || self.poisoned.load(Ordering::Acquire) {
                 return;
             }
             let wal = self.current_wal.lock().clone();
             let behind = !self.barrier.lock().older.is_empty();
-            if (wal.dirty.load(Ordering::Acquire) || behind) && self.sync_wal_file(&wal).is_err() {
-                return;
+            if wal.dirty.load(Ordering::Acquire) || behind {
+                if self.sync_wal_file(&wal).is_err() {
+                    return;
+                }
+                add(&self.counters.wal_background_fsyncs, 1);
             }
         }
     }
