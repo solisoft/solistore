@@ -232,9 +232,12 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
   compaction writing (write amplification 2.57 against 3.06), scans 25% and
   updates 17% faster, and the database ended 17% smaller on disk (1,188 MB
   against 1,425 MB).
-- Not done from the plan: `loom` on the commit path,
-  Miri on the `unsafe` (one cast, one `sync_file_range` call), fuzzing of
-  the decoders.
+- Miri runs in CI on the skiplist and memtable tests, the crate's `unsafe`
+  (the old cast went with the crossbeam skiplist; `sync_file_range` is FFI,
+  out of Miri's reach). Stacked Borrows found nothing, data races and
+  leaks included.
+- Not done from the plan: `loom` on the commit path, fuzzing of the
+  decoders.
 - Windows: `StdFs::sync_dir` is a no-op there and `start_writeback` does
   nothing; the CI cross-check compiles and runs the tests on Windows, but
   no crash test has run on NTFS.
