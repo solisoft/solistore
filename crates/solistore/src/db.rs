@@ -444,8 +444,8 @@ struct Pending {
     sync: bool,
 }
 
-/// A writer's place in the commit queue.
-type Member = Ticket<Pending, Slot>;
+/// A writer's place in the commit queue (with `loom`, its `Arc` is loom's).
+type Member = crate::sync::Arc<Ticket<Pending, Slot>>;
 
 /// What a writer is told by its group's leader.
 #[derive(Clone)]
@@ -1584,8 +1584,7 @@ impl Inner {
             Turn::Lead(lead) => {
                 let written = self.write_group(&lead.group);
                 let leader_inserts = lead.group.len() > MAX_PARALLEL_INSERT;
-                let members = lead.group.clone();
-                let slot = lead.finish(|i, _| match &written {
+                let (slot, members) = lead.finish(|i, _| match &written {
                     Ok((group, firsts)) if leader_inserts => {
                         if i == 0 {
                             Slot::InsertAll(group.clone(), firsts.clone())
@@ -1603,7 +1602,12 @@ impl Inner {
                     self.publisher.publish(g.first, g.last);
                     return Ok(());
                 }
-                (slot, members[0].clone())
+                // `finish` returns the group with the leader's ticket first.
+                let me = members
+                    .into_iter()
+                    .next()
+                    .expect("the leader heads its group");
+                (slot, me)
             }
         };
         match slot {
@@ -1623,7 +1627,7 @@ impl Inner {
     /// Give the group its sequence numbers and write it to the WAL, fsynced
     /// if the durability asks for it. Returns the group and each member's
     /// first sequence number.
-    fn write_group(&self, group: &[crate::sync::Arc<Member>]) -> Result<(Arc<Group>, Vec<u64>)> {
+    fn write_group(&self, group: &[Member]) -> Result<(Arc<Group>, Vec<u64>)> {
         self.check()?;
         let mut commit = self.commit.lock();
         self.throttle()?;

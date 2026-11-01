@@ -158,8 +158,12 @@ impl<T, S: Clone> GroupQueue<T, S> {
 
 impl<T, S: Clone> Leadership<'_, T, S> {
     /// Give each member `slot(index, ticket)`, free the leader's place for
-    /// the next group, and return the leader's own slot (index 0).
-    pub fn finish(mut self, mut slot: impl FnMut(usize, &Ticket<T, S>) -> S) -> S {
+    /// the next group, and return the leader's own slot with the group,
+    /// whose first ticket is the leader's own.
+    pub fn finish(
+        mut self,
+        mut slot: impl FnMut(usize, &Ticket<T, S>) -> S,
+    ) -> (S, Vec<Arc<Ticket<T, S>>>) {
         let mut mine = None;
         let mut queue = self.queue.state.lock();
         for (i, ticket) in self.group.iter().enumerate() {
@@ -179,7 +183,10 @@ impl<T, S: Clone> Leadership<'_, T, S> {
         self.queue.leader_busy.store(false, Ordering::Release);
         drop(queue);
         self.queue.cv.notify_all();
-        mine.expect("the leader is in its own group")
+        (
+            mine.expect("the leader is in its own group"),
+            std::mem::take(&mut self.group),
+        )
     }
 }
 
@@ -296,7 +303,7 @@ mod tests {
         let mine = match turn {
             Turn::Lead(lead) => {
                 assert_eq!(lead.group.len(), 1);
-                lead.finish(|i, t| t.item * 10 + i as u32)
+                lead.finish(|i, t| t.item * 10 + i as u32).0
             }
             Turn::Followed(..) => panic!("alone, it leads"),
         };
@@ -381,8 +388,17 @@ mod loom_tests {
                             Turn::Lead(lead) => {
                                 assert!(!leading.swap(true, Ordering::AcqRel), "two leaders");
                                 handled.lock().extend(lead.group.iter().map(|t| t.item));
-                                leading.store(false, Ordering::Release);
-                                lead.finish(|i, t| (t.item, i as u32))
+                                let n = lead.group.len();
+                                // Cleared as the last slot goes out, still
+                                // under the queue lock: the check covers the
+                                // hand-out too, and not the next leader.
+                                lead.finish(|i, t| {
+                                    if i + 1 == n {
+                                        leading.store(false, Ordering::Release);
+                                    }
+                                    (t.item, i as u32)
+                                })
+                                .0
                             }
                             Turn::Followed(slot, _) => slot,
                         };
@@ -456,6 +472,7 @@ mod loom_tests {
                                 });
                                 drop(c);
                                 lead.finish(|i, _| Some((group.clone(), first + i as u64)))
+                                    .0
                             }
                             Turn::Followed(slot, _) => slot,
                         };
@@ -476,6 +493,43 @@ mod loom_tests {
                 w.join().unwrap();
             }
             assert_eq!(p.visible(), 2);
+        });
+    }
+
+    /// The path `Durability::Full` takes: a leader that finds fewer writers
+    /// waiting than the last group had spins for them outside the queue
+    /// lock. Writers arriving meanwhile join its group or the next one,
+    /// every item is handled once, and nobody is left behind.
+    #[test]
+    fn gathering_a_group_loses_and_doubles_nothing() {
+        model(|| {
+            let q: Arc<GroupQueue<u32, u32>> = Arc::new(GroupQueue::default());
+            q.last_group.store(2, Ordering::Relaxed);
+            let handled = Arc::new(Mutex::new(Vec::new()));
+            let writers: Vec<_> = (0..3u32)
+                .map(|id| {
+                    let (q, handled) = (q.clone(), handled.clone());
+                    thread::spawn(move || {
+                        let abandoned = || u32::MAX;
+                        let turn = q.enter(id, true, usize::MAX, |_| 1, &abandoned);
+                        let slot = match turn {
+                            Turn::Lead(lead) => {
+                                handled.lock().extend(lead.group.iter().map(|t| t.item));
+                                lead.finish(|_, t| t.item).0
+                            }
+                            Turn::Followed(slot, _) => slot,
+                        };
+                        assert_eq!(slot, id);
+                    })
+                })
+                .collect();
+            for w in writers {
+                w.join().unwrap();
+            }
+            let mut handled = handled.lock().clone();
+            handled.sort();
+            assert_eq!(handled, vec![0, 1, 2]);
+            assert_eq!(q.queued.load(Ordering::Relaxed), 0);
         });
     }
 
