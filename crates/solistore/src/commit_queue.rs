@@ -333,7 +333,17 @@ mod loom_tests {
                     thread::spawn(move || {
                         inserted[seq as usize].store(true, Ordering::Release);
                         p.publish(seq, seq);
-                        assert!(p.visible() >= seq, "returned before its write was visible");
+                        // A writer reads at least its own store: what it
+                        // sees visible must be inserted, its own group
+                        // and every one before it.
+                        let v = p.visible();
+                        assert!(v >= seq, "returned before its write was visible");
+                        for s in 1..=v {
+                            assert!(
+                                inserted[s as usize].load(Ordering::Acquire),
+                                "saw {s} early"
+                            );
+                        }
                     })
                 })
                 .collect();
