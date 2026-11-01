@@ -214,8 +214,12 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
   RocksDB without sync (thresholds 0.8). Durable commits vary widely
   between runs (sync_commit_8t: 0.20x, 1.25x, 1.24x).
 - Tables are ~2% larger than RocksDB's for the same data (was 7%, before
-  sequences were zeroed at the bottom of the tree). The rest is the index,
-  which keeps whole last keys where RocksDB keeps shortened separators.
+  sequences were zeroed at the bottom of the tree). The rest is the index.
+  It now stores shortened separators as RocksDB does, but that alone took
+  only 0.5% off a table of the bench's key mix (index 8.3% → 7.9% of the
+  file). The index's real cost is that its entries share no prefix
+  (restart interval 1): at interval 16 it falls to 3.2% of the file, at
+  some point-read CPU still to be measured.
 - The memtable's real footprint is above what it counts: a skiplist node
   costs ~112 bytes, counted as 32 to flush as often as RocksDB. On write
   phases at 5M documents, peak RSS is 1.05x RocksDB's.
