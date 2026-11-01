@@ -80,8 +80,19 @@ fn rename_durably(from: &Path, to: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
-    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
-    let (from, to) = (wide(from), wide(to));
+    // NUL-terminated, and refused with a NUL inside, as std does: the call
+    // would stop at it and rename some other path.
+    let wide = |p: &Path| -> io::Result<Vec<u16>> {
+        let w: Vec<u16> = p.as_os_str().encode_wide().collect();
+        if w.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a NUL in a path",
+            ));
+        }
+        Ok(w.into_iter().chain([0]).collect())
+    };
+    let (from, to) = (wide(from)?, wide(to)?);
     // SAFETY: both paths are NUL-terminated wide strings that outlive the
     // call; the function reads them and nothing else.
     let done = unsafe {
