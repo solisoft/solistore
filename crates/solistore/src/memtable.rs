@@ -37,11 +37,27 @@ const TOMBSTONE_OVERHEAD: usize = std::mem::size_of::<RangeTombstone>();
 /// value that small costs nothing next to the decompression that produced
 /// it. A value that is most of its buffer is handed out as it is.
 pub(crate) fn detach(value: Bytes, backing: usize) -> Bytes {
-    if value.len().saturating_mul(2) < backing {
+    if copies(value.len(), backing) {
         Bytes::copy_from_slice(&value)
     } else {
         value
     }
+}
+
+/// [`detach`] for a value read in place: copy `value` out, or take
+/// `handle()` on its buffer of `backing` bytes, by the same rule.
+pub(crate) fn detach_from(value: &[u8], backing: usize, handle: impl FnOnce() -> Bytes) -> Bytes {
+    if copies(value.len(), backing) {
+        Bytes::copy_from_slice(value)
+    } else {
+        handle()
+    }
+}
+
+/// Whether a value of `len` bytes is copied out of its `backing` buffer
+/// rather than handed out as a slice of it.
+fn copies(len: usize, backing: usize) -> bool {
+    len.saturating_mul(2) < backing
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

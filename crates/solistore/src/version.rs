@@ -96,28 +96,21 @@ impl TableFile {
         self
     }
 
-    pub fn reader(&self) -> Result<Arc<TableReader>> {
-        if let Some(reader) = self.reader.get() {
-            return Ok(reader.clone());
-        }
-        let _opening = self.opening.lock();
-        if let Some(reader) = self.reader.get() {
-            return Ok(reader.clone());
-        }
-        let reader = TableReader::open(self.fs.open_random(&self.path)?)?
-            .with_cache(self.cache.clone(), self.number);
-        Ok(self.reader.get_or_init(|| Arc::new(reader)).clone())
-    }
-
-    /// [`TableFile::reader`] by reference, for a point read that holds the
-    /// version naming this file for as long as it reads: cloning the `Arc`
-    /// writes its count, a line every thread reading the table contends on.
-    pub fn reader_ref(&self) -> Result<&TableReader> {
+    /// The table's reader, opened on first use. Lent: a point read holds
+    /// the version naming this file for as long as it reads, and cloning the
+    /// `Arc` would write its count, a line every thread reading the table
+    /// contends on. A cursor that outlives the call clones it.
+    pub fn reader(&self) -> Result<&Arc<TableReader>> {
         if let Some(reader) = self.reader.get() {
             return Ok(reader);
         }
-        self.reader()?;
-        Ok(self.reader.get().expect("opened just above"))
+        let _opening = self.opening.lock();
+        if let Some(reader) = self.reader.get() {
+            return Ok(reader);
+        }
+        let reader = TableReader::open(self.fs.open_random(&self.path)?)?
+            .with_cache(self.cache.clone(), self.number);
+        Ok(self.reader.get_or_init(|| Arc::new(reader)))
     }
 
     /// No longer in the live version: delete the file when the last reader
@@ -210,7 +203,7 @@ impl SuperVersion {
         let mut hash = || *hash.get_or_insert_with(|| bloom::hash(probe));
         for file in &self.version.levels[0] {
             if file.may_hold(probe) {
-                if let Some(found) = file.reader_ref()?.get_at(&lookup, hash())? {
+                if let Some(found) = file.reader()?.get_at(&lookup, hash())? {
                     return Ok(Some(found));
                 }
             }
@@ -219,7 +212,7 @@ impl SuperVersion {
             // Sorted and disjoint: at most one file can hold the key.
             let at = level.partition_point(|f| key::cf_and_user_key(&f.props.largest) < probe);
             if let Some(file) = level.get(at).filter(|f| f.may_hold(probe)) {
-                if let Some(found) = file.reader_ref()?.get_at(&lookup, hash())? {
+                if let Some(found) = file.reader()?.get_at(&lookup, hash())? {
                     return Ok(Some(found));
                 }
             }
@@ -260,7 +253,7 @@ impl SuperVersion {
         };
         for file in &self.version.levels[0] {
             if holds_cf(file) {
-                out.push(Box::new(TableIter::new(file.reader()?)));
+                out.push(Box::new(TableIter::new(file.reader()?.clone())));
             }
         }
         // A deeper level is one sorted run: one cursor that opens only the
@@ -307,7 +300,7 @@ impl LevelIter {
         self.current = None;
         match self.files[at].reader() {
             Ok(reader) => {
-                let it = TableIter::new(reader);
+                let it = TableIter::new(reader.clone());
                 self.current = Some(if self.fill_cache {
                     it
                 } else {

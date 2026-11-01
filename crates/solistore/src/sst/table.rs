@@ -449,28 +449,28 @@ impl TableReader {
             return Ok(None);
         }
         let target = lookup.internal();
-        let handle =
-            SEEK_KEY.with_borrow_mut(|key| match self.index.seek_entry(target, key)? {
-                Some((start, end)) => Handle::decode(&self.index.bytes()[start..end]).map(Some),
-                None => Ok(None),
-            })?;
+        let handle = with_seek_key(|key| match self.index.seek_entry(target, key)? {
+            Some(entry) => {
+                let (start, end) = entry.value;
+                Handle::decode(&self.index.bytes()[start..end]).map(Some)
+            }
+            None => Ok(None),
+        })?;
         let Some(handle) = handle else {
             return Ok(None);
         };
         let block = self.data_block_at(handle, true)?;
-        let found = SEEK_KEY.with_borrow_mut(|key| -> Result<Option<Option<Version>>> {
-            let Some((start, end)) = block.seek_entry(target, key)? else {
+        let found = with_seek_key(|key| -> Result<Option<Option<Version>>> {
+            let Some(entry) = block.seek_entry(target, key)? else {
                 return Ok(None);
             };
-            let found =
-                key::parse(key).ok_or_else(|| Error::Corruption("bad key in table".into()))?;
-            Ok(Some(
-                (found.cf == lookup.cf && found.user_key == lookup.user_key).then(|| Version {
-                    seq: found.seq,
-                    kind: found.kind,
-                    value: detach_range(&block, start, end),
-                }),
-            ))
+            let (start, end) = entry.value;
+            version_of(key, lookup, || {
+                crate::memtable::detach_from(&block.bytes()[start..end], block.size(), || {
+                    block.slice(start..end)
+                })
+            })
+            .map(Some)
         })?;
         match found {
             Some(version) => Ok(version),
@@ -500,32 +500,56 @@ impl TableReader {
         if !it.valid() {
             return Ok(None);
         }
-        let found =
-            key::parse(it.key()).ok_or_else(|| Error::Corruption("bad key in table".into()))?;
-        Ok(
-            (found.cf == lookup.cf && found.user_key == lookup.user_key).then(|| Version {
-                seq: found.seq,
-                kind: found.kind,
-                value: crate::memtable::detach(it.value(), it.block_size()),
-            }),
-        )
+        version_of(it.key(), lookup, || {
+            crate::memtable::detach(it.value(), it.block_size())
+        })
     }
 }
 
+/// The version `key` (an internal key found by a seek) is, if it is one of
+/// `lookup`'s key; `value` is called only then.
+fn version_of(
+    key: &[u8],
+    lookup: &key::LookupKey<'_>,
+    value: impl FnOnce() -> Bytes,
+) -> Result<Option<Version>> {
+    let found = key::parse(key).ok_or_else(|| Error::Corruption("bad key in table".into()))?;
+    Ok(
+        (found.cf == lookup.cf && found.user_key == lookup.user_key).then(|| Version {
+            seq: found.seq,
+            kind: found.kind,
+            value: value(),
+        }),
+    )
+}
+
+/// Keys up to this size stay in a thread's seek buffer between reads.
+const SEEK_KEY_KEPT: usize = 16 << 10;
+
 thread_local! {
-    /// The key a point read decodes while it seeks, reused by every read on
-    /// the thread: a read allocates nothing to seek.
+    /// The key a point read decodes while it seeks, reused by the thread's
+    /// next reads: a read allocates nothing to seek.
     static SEEK_KEY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// A value at `start..end` of `block`, copied out when it is a small part of
-/// the block, as [`crate::memtable::detach`] decides: a handle would keep the
-/// whole block alive, past its eviction from the cache.
-fn detach_range(block: &Block, start: usize, end: usize) -> Bytes {
-    if (end - start).saturating_mul(2) < block.size() {
-        Bytes::copy_from_slice(&block.bytes()[start..end])
-    } else {
-        block.slice(start..end)
+/// Run `f` with the thread's seek buffer, or a fresh one where it cannot be
+/// had (a read from a thread-local destructor, or one nested in another):
+/// those allocate, and nothing panics.
+fn with_seek_key<T>(f: impl FnOnce(&mut Vec<u8>) -> T) -> T {
+    let mut f = Some(f);
+    let kept = SEEK_KEY.try_with(|cell| {
+        let mut key = cell.try_borrow_mut().ok()?;
+        let out = (f.take().expect("called once"))(&mut key);
+        // One huge key read once must not pin its buffer for the thread's
+        // life.
+        if key.capacity() > SEEK_KEY_KEPT {
+            *key = Vec::new();
+        }
+        Some(out)
+    });
+    match kept {
+        Ok(Some(out)) => out,
+        _ => (f.take().expect("not called yet"))(&mut Vec::new()),
     }
 }
 

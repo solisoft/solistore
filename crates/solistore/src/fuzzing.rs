@@ -98,9 +98,23 @@ pub fn block(data: &[u8]) {
     it.seek(target);
     it.seek_for_prev(target);
     let _ = it.status();
-    // The point read's search, in place, against the iterator's.
+    // The point read's search, in place, agrees with a fresh iterator's.
+    let mut fresh = block.iter();
+    fresh.seek(target);
     let mut key = Vec::new();
-    let _ = block.seek_entry(target, &mut key);
+    match block.seek_entry(target, &mut key) {
+        Ok(Some(entry)) => {
+            assert!(
+                fresh.valid(),
+                "seek_entry found an entry the iterator did not"
+            );
+            assert_eq!(key, fresh.key());
+            let (start, end) = entry.value;
+            assert_eq!(&block.bytes()[start..end], &fresh.value()[..]);
+        }
+        Ok(None) => assert!(!fresh.valid() && fresh.status().is_ok()),
+        Err(_) => assert!(fresh.status().is_err()),
+    }
 }
 
 /// A bloom filter, probed with hashes taken from the input.

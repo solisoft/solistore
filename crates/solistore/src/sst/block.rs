@@ -203,12 +203,12 @@ impl Block {
     }
 
     /// The first entry at or after `target`, read in place: its key is left
-    /// in `key` and its value's range in the block returned; `Ok(None)` when
-    /// every entry is before `target`. The search [`BlockIter::seek`] makes,
-    /// for a point read that needs one entry: it takes no handle on the
-    /// block. Each handle is a write to the block's shared reference count,
-    /// which every thread reading a hot block contends on.
-    pub fn seek_entry(&self, target: &[u8], key: &mut Vec<u8>) -> Result<Option<(usize, usize)>> {
+    /// in `key`, and where it lies returned; `Ok(None)` when every entry is
+    /// before `target`. [`BlockIter::seek`] is this search; a point read
+    /// calls it directly, taking no handle on the block: each handle is a
+    /// write to the block's shared reference count, which every thread
+    /// reading a hot block contends on.
+    pub fn seek_entry(&self, target: &[u8], key: &mut Vec<u8>) -> Result<Option<Entry>> {
         // The last restart point whose key is before `target`.
         let (mut left, mut right) = (0, self.num_restarts - 1);
         while left < right {
@@ -226,12 +226,21 @@ impl Block {
         while at < self.restarts {
             let (value, next) = parse_entry(data, at, key).ok_or_else(corrupt)?;
             if key::compare(key, target) != Ordering::Less {
-                return Ok(Some(value));
+                return Ok(Some(Entry { offset: at, value }));
             }
             at = next;
         }
         Ok(None)
     }
+}
+
+/// Where [`Block::seek_entry`] found its entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entry {
+    /// The entry's first byte.
+    pub offset: usize,
+    /// Its value's range in the block; the next entry starts at the end.
+    pub value: (usize, usize),
 }
 
 /// Decode the entry at `at` of a block's entries (`data`), rebuilding its
@@ -361,25 +370,15 @@ impl BlockIter {
 
     /// The first entry with a key at or after `target`.
     pub fn seek(&mut self, target: &[u8]) {
-        // Last restart point whose key is before `target`, comparing the
-        // restart keys where they lie in the block.
-        let (mut left, mut right) = (0, self.block.num_restarts - 1);
-        while left < right {
-            let mid = (left + right).div_ceil(2);
-            let Some(restart_key) = self.block.restart_key(mid) else {
-                self.fail();
-                return;
-            };
-            if key::compare(restart_key, target) == Ordering::Less {
-                left = mid;
-            } else {
-                right = mid - 1;
+        match self.block.seek_entry(target, &mut self.key) {
+            Ok(Some(entry)) => {
+                self.offset = entry.offset;
+                self.value = entry.value;
+                self.next_offset = entry.value.1;
             }
-        }
-        self.seek_to_restart(left);
-        while self.parse_next() {
-            if key::compare(&self.key, target) != Ordering::Less {
-                return;
+            Ok(None) => self.invalidate(),
+            Err(_) => {
+                self.fail();
             }
         }
     }
@@ -461,7 +460,8 @@ mod tests {
             it.seek(target);
             let found = block.seek_entry(target, &mut key).unwrap();
             assert_eq!(found.is_some(), it.valid(), "{target:?}");
-            if let Some((start, end)) = found {
+            if let Some(entry) = found {
+                let (start, end) = entry.value;
                 assert_eq!(key, it.key(), "{target:?}");
                 assert_eq!(&block.bytes()[start..end], &it.value()[..], "{target:?}");
             }
