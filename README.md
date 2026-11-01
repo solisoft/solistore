@@ -146,6 +146,12 @@ code exercises failure paths:
   checks that no reader ever sees part of a batch.
 - **Mutation testing.** Bugs are injected on purpose to check that the tests
   above catch them.
+- **loom.** The commit path's two protocols, leader election in the
+  commit queue and publication of finished groups, are model-checked
+  under every interleaving of a few writers: one leader at a time, every
+  batch handled once, nothing visible before it is inserted, a memtable
+  switch waiting for the groups handed out, no lost wake-up. Mutations
+  of each are caught.
 - **Miri.** CI runs the tests of the memtable's skiplist and arena under
   Miri, the only `unsafe` in the crate besides one `sync_file_range` call
   (an FFI call Miri cannot run, which passes a file descriptor and two
@@ -307,7 +313,7 @@ docs/             integration plan for SoliDB
 - [x] A migration tool from RocksDB data directories
   (`solidb-migrate-engine`, SoliDB 2.4).
 - [ ] A trial on real workloads, then removing RocksDB from SoliDB.
-- [ ] `loom` on the commit path, decoder fuzzing, and crash tests on NTFS.
+- [ ] Decoder fuzzing, and crash tests on NTFS.
 
 ## Licence
 

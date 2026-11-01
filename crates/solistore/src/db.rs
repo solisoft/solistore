@@ -3,7 +3,8 @@
 //!
 //! # Commit path
 //!
-//! Writers queue up. The writer at the head of the queue becomes the leader,
+//! The protocol lives in [`crate::commit_queue`], where `loom` checks it;
+//! this module does the work each step stands for. Writers queue up. The writer at the head of the queue becomes the leader,
 //! takes every batch waiting behind it (up to [`MAX_GROUP_BYTES`]), gives each
 //! a contiguous run of sequence numbers, writes all of them to the WAL with
 //! one `write` and makes them durable with one `fdatasync`, then applies them
