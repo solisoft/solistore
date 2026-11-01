@@ -220,13 +220,13 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
   file). The index's real cost is that its entries share no prefix
   (restart interval 1): at interval 16 it falls to 3.2% of the file, at
   some point-read CPU still to be measured.
-- The memtable counts what it holds. Its skiplist now keeps each node's
-  links, key and value in one arena allocation (~22 bytes of overhead,
-  counted exactly) where the crossbeam one cost ~112 bytes per entry
-  counted as 32. A 64 MiB memtable of the bench's key mix holds 371k
-  entries (374k before, so flushes are as frequent) in 68 MB of RSS
-  instead of 104 MB. Peak RSS on write phases at 5M, 1.05x RocksDB's
-  before, is to be measured again.
+- The memtable counts what it holds. Its skiplist keeps each node's
+  links, key and value in one arena allocation (~22 bytes of overhead)
+  where the crossbeam one cost ~112 bytes per entry counted as 32. A
+  64 MiB memtable of the bench's key mix holds 369k entries (374k before:
+  flushes are as frequent) in 68 MB of RSS instead of 104 MB. On the
+  quick bench (1M documents), peak RSS is 0.88-0.97x what it was; peak
+  RSS at 5M against RocksDB (1.05x before) is to be measured again.
 - Not done from the plan: dynamic level sizing, `loom` on the commit path,
   Miri on the `unsafe` (one cast, one `sync_file_range` call), fuzzing of
   the decoders.
