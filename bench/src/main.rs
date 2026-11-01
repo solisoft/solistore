@@ -338,6 +338,9 @@ mod soli {
             if let Some(n) = t.compactions {
                 opts.max_background_compactions = n;
             }
+            if let Some(n) = t.recycle_wals {
+                opts.recycle_wal_files = n;
+            }
             let db = Db::open(dir, opts).expect("open solistore");
             let cf = |name: &str| {
                 db.cf_handle(name)
@@ -630,6 +633,8 @@ struct SoliTuning {
     buffer_mb: Option<usize>,
     /// Compactions allowed to run at once.
     compactions: Option<usize>,
+    /// Dead WAL files kept for reuse.
+    recycle_wals: Option<usize>,
 }
 
 /// RocksDB settings under test on top of the prod profile.
@@ -746,6 +751,7 @@ impl Params {
                 "--rx-hcc" => p.rocks.hyper_clock = value == "1",
                 "--sx-buffer-mb" => p.soli.buffer_mb = Some(value.parse().unwrap()),
                 "--sx-compactions" => p.soli.compactions = Some(value.parse().unwrap()),
+                "--sx-recycle-wals" => p.soli.recycle_wals = Some(value.parse().unwrap()),
                 flag => panic!("unknown flag {flag}"),
             }
             i += 2;
@@ -784,6 +790,9 @@ impl Params {
         }
         if let Some(n) = self.soli.compactions {
             args.extend(["--sx-compactions".to_string(), n.to_string()]);
+        }
+        if let Some(n) = self.soli.recycle_wals {
+            args.extend(["--sx-recycle-wals".to_string(), n.to_string()]);
         }
         args
     }
