@@ -223,7 +223,12 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
 - The memtable's real footprint is above what it counts: a skiplist node
   costs ~112 bytes, counted as 32 to flush as often as RocksDB. On write
   phases at 5M documents, peak RSS is 1.05x RocksDB's.
-- Not done from the plan: dynamic level sizing, the arena skiplist proper
+- Level targets are dynamic (RocksDB's `level_compaction_dynamic_level_bytes`,
+  on by default): at 5M documents the load ran 17% faster with a third less
+  compaction writing (write amplification 2.57 against 3.06), scans 25% and
+  updates 17% faster, and the database ended 17% smaller on disk (1,188 MB
+  against 1,425 MB).
+- Not done from the plan: the arena skiplist proper
   (entries are arena-backed, nodes are not), `loom` on the commit path,
   Miri on the `unsafe` (one cast, one `sync_file_range` call), fuzzing of
   the decoders.

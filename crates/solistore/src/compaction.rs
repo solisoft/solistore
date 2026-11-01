@@ -22,8 +22,14 @@
 //! with little below, and its bottom level was not the largest.
 //!
 //! The base level is never above the first level holding data, so data
-//! only moves down: a database written with fixed targets drains its upper
-//! levels, which are then over their (smaller) targets, into the bottom.
+//! only moves down. A database written with fixed targets keeps compacting
+//! level 0 into level 1 until its upper levels have drained into the
+//! bottom. Those levels are above the dynamic base, where nothing should
+//! be: they score between 1 and 2 whatever their size, so they drain when
+//! nothing more pressing is due, and level 0 comes first once it holds
+//! twice its trigger. Scored against their computed targets (a few KB for
+//! level 1 under a few GB) they ranked above level 0 by four orders of
+//! magnitude and starved it until writers stalled.
 //!
 //! The merge keeps only the newest version of each key (see
 //! [`crate::version`] for why no older one can still be needed), drops what
@@ -55,8 +61,8 @@
 //! Every file records the highest tombstone sequence applied when it was
 //! written (its watermark). A file that overlaps a tombstone above its
 //! watermark, and holds entries older than it, may hold covered data: such
-//! files are compacted before anything else — level 0 into level 1 as
-//! usual, a deeper file rewritten in place. The output's watermark covers the
+//! files are compacted before anything else — level 0 into the base level
+//! as usual, a deeper file rewritten in place. The output's watermark covers the
 //! tombstone, so a file is never picked twice for one tombstone, and once no
 //! file is left that may hold covered data, the tombstone itself is dropped.
 
@@ -92,16 +98,23 @@ pub struct Compaction {
     pub inputs: Vec<Arc<TableFile>>,
     /// Files of the output level overlapping the inputs.
     pub overlapping: Vec<Arc<TableFile>>,
-    /// `level + 1`, or `level` for a file rewritten in place.
+    /// `level + 1`; the base level for level 0, which may be several levels
+    /// down; or `level` for a file rewritten in place.
     pub output_level: usize,
 }
 
 impl Compaction {
     /// One file, nothing under it: move it down instead of rewriting it.
     /// Level 0 may skip levels, down to the base level: those between are
-    /// empty.
+    /// empty. Not into the bottom level, though: a level-0 file still holds
+    /// delete markers and real sequence numbers, which only a rewrite at
+    /// the bottom drops and zeroes, and the bottom is never compacted for
+    /// size again. A small database's level-0 files are small to rewrite.
     pub fn is_trivial_move(&self) -> bool {
-        self.output_level > self.level && self.inputs.len() == 1 && self.overlapping.is_empty()
+        self.output_level > self.level
+            && !(self.level == 0 && self.output_level == NUM_LEVELS - 1)
+            && self.inputs.len() == 1
+            && self.overlapping.is_empty()
     }
 
     pub fn all_inputs(&self) -> impl Iterator<Item = (usize, &Arc<TableFile>)> {
@@ -131,10 +144,20 @@ pub fn level_bytes(files: &[Arc<TableFile>]) -> u64 {
 pub struct Targets {
     pub base_level: usize,
     pub bytes: [u64; NUM_LEVELS],
+    /// Each level's size, as the targets were computed from.
+    sizes: [u64; NUM_LEVELS],
+    /// Levels above this one should be empty (dynamic targets only): the
+    /// base level the sizes call for, before it is clamped to data.
+    dynamic_base: usize,
+    level_base_bytes: u64,
 }
 
 impl Targets {
     pub fn of(version: &Version, cfg: &Config) -> Targets {
+        let mut sizes = [0u64; NUM_LEVELS];
+        for (l, size) in sizes.iter_mut().enumerate() {
+            *size = level_bytes(&version.levels[l]);
+        }
         let mut bytes = [0u64; NUM_LEVELS];
         if !cfg.dynamic {
             let mut target = cfg.level_base_bytes;
@@ -145,33 +168,43 @@ impl Targets {
             return Targets {
                 base_level: 1,
                 bytes,
+                sizes,
+                dynamic_base: 1,
+                level_base_bytes: cfg.level_base_bytes,
             };
         }
         let bottom = NUM_LEVELS - 1;
-        let largest = (1..NUM_LEVELS)
-            .map(|l| level_bytes(&version.levels[l]))
-            .max()
-            .unwrap_or(0);
-        bytes[bottom] = largest;
+        bytes[bottom] = sizes[1..].iter().copied().max().unwrap_or(0);
         for l in (1..bottom).rev() {
             bytes[l] = bytes[l + 1] / cfg.level_multiplier;
         }
-        let mut base_level = bottom;
-        while base_level > 1 && bytes[base_level] > cfg.level_base_bytes {
-            base_level -= 1;
+        let mut dynamic_base = bottom;
+        while dynamic_base > 1 && bytes[dynamic_base] > cfg.level_base_bytes {
+            dynamic_base -= 1;
         }
         // Data only moves down: never compact level 0 below data.
-        if let Some(first) = (1..NUM_LEVELS).find(|&l| !version.levels[l].is_empty()) {
-            base_level = base_level.min(first);
+        let first_data = (1..NUM_LEVELS).find(|&l| sizes[l] > 0).unwrap_or(bottom);
+        Targets {
+            base_level: dynamic_base.min(first_data),
+            bytes,
+            sizes,
+            dynamic_base,
+            level_base_bytes: cfg.level_base_bytes,
         }
-        Targets { base_level, bytes }
     }
 
     /// How far `level` is over its target; at least 1.0 means compact it.
-    fn score(&self, version: &Version, level: usize) -> f64 {
-        let size = level_bytes(&version.levels[level]);
+    fn score(&self, level: usize) -> f64 {
+        let size = self.sizes[level];
         if size == 0 {
             return 0.0;
+        }
+        if level < self.dynamic_base {
+            // Above the dynamic base: to drain, but after level 0 once it
+            // holds twice its trigger (see the module docs). Strictly
+            // between 1 and 2, growing with the level's size.
+            let base = self.level_base_bytes.max(1) as f64;
+            return 1.0 + size as f64 / (size as f64 + base);
         }
         size as f64 / self.bytes[level].max(1) as f64
     }
@@ -249,11 +282,14 @@ pub fn pick(
 
 /// A file that may hold data a range tombstone deletes.
 pub fn pick_for_tombstones(version: &Version, cfg: &Config, busy: Busy<'_>) -> Option<Compaction> {
+    let mut base_level = None;
     for t in &version.tombstones {
         for (level, files) in version.levels.iter().enumerate() {
             for f in files.iter().filter(|f| may_hold_covered(f, t)) {
                 let candidate = if level == 0 {
-                    level0(version, Targets::of(version, cfg).base_level)
+                    let base =
+                        *base_level.get_or_insert_with(|| Targets::of(version, cfg).base_level);
+                    level0(version, base)
                 } else {
                     Some(Compaction {
                         level,
@@ -333,7 +369,7 @@ fn pick_by_size(
     }
     // The bottom level has nowhere to go.
     for level in 1..NUM_LEVELS - 1 {
-        let score = targets.score(version, level);
+        let score = targets.score(level);
         if score >= 1.0 {
             scored.push((score, level));
         }
@@ -381,8 +417,8 @@ fn may_exist_below(version: &Version, output_level: usize, id: &[u8]) -> bool {
 ///
 /// The key space is split at input file boundaries into up to
 /// `cfg.subcompactions` ranges merged in parallel: a compaction from level 0
-/// rewrites most of level 1 and would otherwise run on one core while
-/// writers wait on it.
+/// rewrites most of the base level and would otherwise run on one core
+/// while writers wait on it.
 pub fn run(
     compaction: &Compaction,
     version: &Version,
@@ -814,21 +850,42 @@ mod tests {
         // The largest level sets the bottom's target, and the upper levels
         // are over theirs: they drain down.
         assert_eq!(t.bytes[NUM_LEVELS - 1], 3000 * MIB);
-        assert!(t.score(&v, 1) > 1.0 && t.score(&v, 2) > 1.0);
+        // They drain, but level 0 goes first once it holds twice its trigger.
+        for level in [1, 2] {
+            let score = t.score(level);
+            assert!(score > 1.0 && score < 2.0, "level {level}: {score}");
+        }
     }
 
     #[test]
-    fn level_zero_goes_straight_to_the_base_level_as_a_trivial_move() {
+    fn level_zero_skips_empty_levels_down_to_the_base_level() {
         let bottom = NUM_LEVELS - 1;
-        let mut v = version_with(&[(0, MIB)]);
+        // 2 GiB at the bottom puts the base one level up; a level-0 file
+        // with nothing under it moves there as it is.
+        let v = version_with(&[(0, MIB), (bottom, 2048 * MIB)]);
         let c = level0(&v, Targets::of(&v, &cfg(true)).base_level).unwrap();
-        assert_eq!(c.output_level, bottom);
+        assert_eq!(c.output_level, bottom - 1);
         assert!(c.is_trivial_move());
-        // With data at the bottom overlapping it, it is a merge.
-        v.levels[bottom] = version_with(&[(0, MIB)]).levels[0].clone();
+        // Into the bottom it is rewritten, to drop delete markers and zero
+        // sequences there, even with nothing to merge with.
+        let v = version_with(&[(0, MIB)]);
         let c = level0(&v, Targets::of(&v, &cfg(true)).base_level).unwrap();
-        assert_eq!((c.output_level, c.overlapping.len()), (bottom, 1));
+        assert_eq!((c.output_level, c.overlapping.len()), (bottom, 0));
         assert!(!c.is_trivial_move());
+    }
+
+    #[test]
+    fn a_draining_level_does_not_starve_level_zero() {
+        // Laid out with fixed targets, then opened with dynamic ones.
+        let mut sizes = vec![(1, 300 * MIB), (2, 3000 * MIB)];
+        sizes.extend((0..8).map(|_| (0, MIB)));
+        let v = version_with(&sizes);
+        let c = cfg(true);
+        let picked = pick_by_size(&v, &[], &c, &|_| false).unwrap();
+        assert_eq!(
+            picked.level, 0,
+            "8 level-0 files, twice the trigger, go first"
+        );
     }
 
     #[test]
