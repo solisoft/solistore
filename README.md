@@ -146,6 +146,11 @@ code exercises failure paths:
   checks that no reader ever sees part of a batch.
 - **Mutation testing.** Bugs are injected on purpose to check that the tests
   above catch them.
+- **Miri.** CI runs the tests of the memtable's skiplist and arena under
+  Miri, the only `unsafe` in the crate besides one `sync_file_range` call
+  (an FFI call Miri cannot run, which passes a file descriptor and two
+  offsets and no pointer). They include concurrent inserts with readers,
+  at sizes scaled down for Miri.
 
 ## Benchmarks
 
@@ -302,9 +307,7 @@ docs/             integration plan for SoliDB
 - [x] A migration tool from RocksDB data directories
   (`solidb-migrate-engine`, SoliDB 2.4).
 - [ ] A trial on real workloads, then removing RocksDB from SoliDB.
-- [ ] `loom` on the
-  commit path, Miri on the `unsafe`, decoder fuzzing, and crash tests on
-  NTFS.
+- [ ] `loom` on the commit path, decoder fuzzing, and crash tests on NTFS.
 
 ## Licence
 
