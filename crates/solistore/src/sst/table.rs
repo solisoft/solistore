@@ -4,8 +4,10 @@
 //! table   := data block* | filter | properties | index | footer
 //! each block on disk := contents | type u8 | crc32c u32 (of contents and type)
 //!   type 0: contents is the block;  type 1: varint raw length | LZ4 block
-//! index   := a block whose entries map the last key of each data block to
-//!            its handle (offset varint, length varint)
+//! index   := a block with one entry per data block: a separator key, at or
+//!            after every key of the block and before every key of the
+//!            next one, mapped to the block's handle (offset varint,
+//!            length varint). The last block's separator is its last key.
 //! footer  := index handle | filter handle | properties handle   (u64 LE pairs)
 //!            | format version u32 | crc32c u32 (of the 52 bytes before) | magic u64
 //! ```
@@ -81,6 +83,9 @@ pub struct TableBuilder {
     offset: u64,
     data: BlockBuilder,
     index: BlockBuilder,
+    /// The block just written, whose index entry waits for the next key:
+    /// its separator is chosen between the two.
+    pending: Option<Handle>,
     hashes: Vec<u64>,
     last_key: Vec<u8>,
     smallest: Option<Vec<u8>>,
@@ -105,6 +110,7 @@ impl TableBuilder {
             offset: 0,
             data: BlockBuilder::new(RESTART_INTERVAL),
             index: BlockBuilder::new(1),
+            pending: None,
             hashes: Vec::new(),
             last_key: Vec::new(),
             smallest: None,
@@ -144,6 +150,14 @@ impl TableBuilder {
         if self.smallest.is_none() {
             self.smallest = Some(key.to_vec());
         }
+        if let Some(handle) = self.pending.take() {
+            let separator = key::separator(&self.last_key, key);
+            add_index_entry(
+                &mut self.index,
+                separator.as_deref().unwrap_or(&self.last_key),
+                handle,
+            );
+        }
         self.smallest_seq = self.smallest_seq.min(parsed.seq);
         self.largest_seq = self.largest_seq.max(parsed.seq);
         self.entries += 1;
@@ -169,10 +183,7 @@ impl TableBuilder {
             return Ok(());
         }
         let contents = self.data.finish();
-        let handle = self.write_block(&contents, self.compress)?;
-        let mut encoded = Vec::new();
-        handle.encode(&mut encoded);
-        self.index.add(&self.last_key, &encoded);
+        self.pending = Some(self.write_block(&contents, self.compress)?);
         Ok(())
     }
 
@@ -225,6 +236,12 @@ impl TableBuilder {
     /// Write the filter, properties, index and footer, and fsync the file.
     pub fn finish(mut self) -> Result<TableProps> {
         self.finish_data_block()?;
+        // No key follows the last block: its last key stands. A shorter
+        // successor would save a few bytes per file and make every seek past
+        // the file's end read its last block.
+        if let Some(handle) = self.pending.take() {
+            add_index_entry(&mut self.index, &self.last_key, handle);
+        }
         let filter = self.write_block(&bloom::build(&self.hashes), false)?;
         let mut props = Vec::new();
         for v in [
@@ -266,6 +283,12 @@ impl TableBuilder {
             tombstone_watermark: 0,
         })
     }
+}
+
+fn add_index_entry(index: &mut BlockBuilder, separator: &[u8], handle: Handle) {
+    let mut encoded = Vec::new();
+    handle.encode(&mut encoded);
+    index.add(separator, &encoded);
 }
 
 pub struct TableReader {
@@ -713,6 +736,149 @@ mod tests {
         for snapshot in [1u64, 2, 500, 1999, 2000, 5000] {
             let got = table.get(0, b"hot", snapshot).unwrap().unwrap();
             assert_eq!(got.seq, snapshot.min(2000));
+        }
+    }
+
+    /// Keys that leave gaps at block boundaries, so the index holds
+    /// shortened separators: sparse names, two versions for one key in
+    /// three, three column families, and one hot key whose versions span
+    /// blocks.
+    fn gappy_entries() -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut e = Vec::new();
+        for cf in 0..3u32 {
+            for i in 0..1500u32 {
+                let user = format!("user:{:05}:{}", i * 7, "z".repeat((i % 9) as usize));
+                let versions = if i % 3 == 0 { 2 } else { 1 };
+                for seq in (1..=versions).map(|v| u64::from(i) * 2 + v) {
+                    e.push((
+                        key::encode(cf, user.as_bytes(), seq, Kind::Put),
+                        format!("{cf}/{user}/{seq}").into_bytes(),
+                    ));
+                }
+            }
+        }
+        for seq in 1..=400u64 {
+            e.push((key::encode(1, b"user:hot", seq, Kind::Put), vec![b'h'; 40]));
+        }
+        sorted(e)
+    }
+
+    /// Every index entry separates its block from the next one, and most
+    /// are shorter than the block's last key.
+    #[test]
+    fn index_entries_are_separators() {
+        let fs = FaultFs::new();
+        let data = gappy_entries();
+        let (_, table) = write_table(&fs, &data, true);
+        let mut index = table.index.iter();
+        index.seek_to_first();
+        let (mut blocks, mut shortened) = (0, 0);
+        let mut previous: Option<Vec<u8>> = None;
+        while index.valid() {
+            let separator = index.key().to_vec();
+            let mut it = table.data_block(&index.value(), false).unwrap().iter();
+            it.seek_to_first();
+            let first = it.key().to_vec();
+            if let Some(p) = &previous {
+                assert_eq!(key::compare(p, &first), Ordering::Less, "block {blocks}");
+            }
+            it.seek_to_last();
+            let last = it.key().to_vec();
+            assert_ne!(
+                key::compare(&last, &separator),
+                Ordering::Greater,
+                "block {blocks}"
+            );
+            if separator.len() < last.len() {
+                shortened += 1;
+            }
+            previous = Some(separator);
+            blocks += 1;
+            index.next();
+        }
+        assert_eq!(previous.as_deref(), data.last().map(|e| e.0.as_slice()));
+        assert!(blocks > 20, "{blocks} blocks");
+        assert!(shortened * 2 > blocks, "{shortened} of {blocks} shortened");
+    }
+
+    /// Seeks in both directions and gets, at every key, every separator and
+    /// around both, agree with a sorted list of the entries.
+    #[test]
+    fn seeks_and_gets_agree_with_the_entries_around_separators() {
+        let fs = FaultFs::new();
+        let data = gappy_entries();
+        let (_, table) = write_table(&fs, &data, true);
+
+        let mut targets = Vec::new();
+        let mut index = table.index.iter();
+        index.seek_to_first();
+        while index.valid() {
+            let id = key::cf_and_user_key(index.key()).to_vec();
+            targets.push(index.key().to_vec());
+            for seq in [0, 1, 7, key::MAX_SEQ] {
+                for kind in [Kind::Put, Kind::Delete] {
+                    let mut t = id.clone();
+                    t.extend_from_slice(&key::trailer_bytes(seq, kind));
+                    targets.push(t);
+                }
+            }
+            // The separator's key cut one byte shorter, and one byte longer.
+            if id.len() > 4 {
+                targets.push(key::first_of_id(&id[..id.len() - 1]));
+            }
+            let mut longer = id.clone();
+            longer.push(0);
+            targets.push(key::first_of_id(&longer));
+            index.next();
+        }
+        for (k, _) in data.iter().step_by(13) {
+            let p = key::parse(k).unwrap();
+            targets.push(k.clone());
+            targets.push(key::first_of(p.cf, p.user_key));
+            targets.push(key::last_of(p.cf, p.user_key));
+            for len in 0..p.user_key.len() {
+                targets.push(key::first_of(p.cf, &p.user_key[..len]));
+            }
+        }
+
+        let mut it = TableIter::new(table.clone());
+        for t in &targets {
+            let at_or_after = data
+                .iter()
+                .find(|e| key::compare(&e.0, t) != Ordering::Less);
+            it.seek_ge(t);
+            it.status().unwrap();
+            assert_eq!(
+                it.valid().then(|| it.key().to_vec()),
+                at_or_after.map(|e| e.0.clone())
+            );
+
+            let at_or_before = data
+                .iter()
+                .rev()
+                .find(|e| key::compare(&e.0, t) != Ordering::Greater);
+            it.seek_le(t);
+            it.status().unwrap();
+            assert_eq!(
+                it.valid().then(|| it.key().to_vec()),
+                at_or_before.map(|e| e.0.clone())
+            );
+
+            if let Some(p) = key::parse(t) {
+                let probe = key::at_snapshot(p.cf, p.user_key, p.seq);
+                let want = data
+                    .iter()
+                    .find(|e| key::compare(&e.0, &probe) != Ordering::Less)
+                    .and_then(|e| {
+                        let q = key::parse(&e.0).unwrap();
+                        (q.cf == p.cf && q.user_key == p.user_key).then(|| e.1.clone())
+                    });
+                let got = table
+                    .get(p.cf, p.user_key, p.seq)
+                    .unwrap()
+                    .map(|v| v.value.to_vec());
+                assert_eq!(got, want);
+            }
         }
     }
 
