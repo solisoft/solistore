@@ -171,18 +171,18 @@ fn a_fixed_layout_drains_into_the_bottom_under_dynamic_targets() {
             );
         }
     };
-    let settle = |db: &Db| {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut last = (u64::MAX, Vec::new());
-        while Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(200));
-            let now = (db.stats().compactions, db.files_per_level());
-            if now == last {
-                return now.1;
+    // Waits for `done`, not for the compaction count to stop moving: one
+    // compaction on a CI runner can outlast any quiet period short enough
+    // to keep the test fast.
+    let settle = |db: &Db, done: &dyn Fn(&[usize]) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let levels = db.files_per_level();
+            if done(&levels) || Instant::now() >= deadline {
+                return levels;
             }
-            last = now;
+            std::thread::sleep(Duration::from_millis(20));
         }
-        last.1
     };
     {
         let db = Db::open(dir.path(), opts(false)).unwrap();
@@ -190,7 +190,7 @@ fn a_fixed_layout_drains_into_the_bottom_under_dynamic_targets() {
             write(&db, &mut model, round);
         }
         db.flush().unwrap();
-        let levels = settle(&db);
+        let levels = settle(&db, &|l| l[0] < 2);
         assert!(
             levels[1] + levels[2] > 0,
             "fixed targets fill the upper levels: {levels:?}"
@@ -205,7 +205,7 @@ fn a_fixed_layout_drains_into_the_bottom_under_dynamic_targets() {
         check(&db, &model, "while draining");
     }
     db.flush().unwrap();
-    let levels = settle(&db);
+    let levels = settle(&db, &|l| l[0] < 2 && l[1..4].iter().all(|&n| n == 0));
     check(&db, &model, "drained");
     let (upper, bottom): (usize, usize) = (levels[1..4].iter().sum(), levels[6]);
     assert_eq!(upper, 0, "levels 1-3 drained: {levels:?}");
