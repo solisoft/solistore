@@ -216,33 +216,41 @@ RocksDB's p99 update latency is 4.4 ms and solistore's 3.0 ms.
 the document plus three index entries, and the phases are gets, scans,
 updates, fsynced transactions and a ~1,232-collection catalog.
 
-At 5M documents, medians of 3, the go/no-go series of 2026-10-14
-(`bench/results/2026-10-14-m7`):
+At 5M documents, medians of 3, the series of 2026-11-01
+(`bench/results/2026-11-01-all`, both engines in one series on the same
+machine, faithful builds):
 
-| Phase | Eventual vs RocksDB |
-|---|---:|
-| bulk load | 0.81× |
-| updates | 0.82× |
-| mixed read/write | 1.09× |
-| get, uniform / hot / missing | 1.03× / 1.23× / 1.65× |
-| scans | 1.34–1.43× |
-| fsynced commits, 1 / 8 threads | 1.21× / 1.24× |
+| Phase | Eventual vs RocksDB | Full vs RocksDB |
+|---|---:|---:|
+| bulk load | 1.31× | 0.49× |
+| updates | 1.53× | 0.48× |
+| mixed read/write | 1.31× | 0.93× |
+| get, uniform / hot / missing | 1.31× / 1.49× / 1.92× | 1.29× / 1.43× / 1.64× |
+| scans, ascending / descending | 1.65× / 1.44× | 1.54× / 1.46× |
+| fsynced commits, 8 threads | 3.40× | 3.08× |
+| fsynced commits, 1 thread | 0.89× | 2.24× |
 
-In full durability mode, solistore fsyncs *every* commit. It still runs
-2.9× (1 thread) and 1.4× (8 threads) RocksDB's fsynced-commit throughput.
+In full durability mode solistore fsyncs *every* commit, where RocksDB's
+`sync=false` writes fsync none: the load and updates are slower for that
+alone. Its fsynced commits are 2–3× RocksDB's all the same.
+
+The eventual mode's single-thread fsynced commits are the one phase
+behind. It is 2,000 commits in about 0.1 s, which the first fsync after
+the unsynced load mostly decides: 19.9k, 13.1k and 21.2k commits a second
+over the three runs, against RocksDB's 22.4k, 26.5k and 20.6k.
+
+On the go/no-go series of 2026-10-14 (`bench/results/2026-10-14-m7`),
+before the commit pipeline, the arena memtable and dynamic level targets,
+the bulk load was 0.81× and the updates 0.82×.
 
 The gates that block integration all passed:
 
-- 100 SIGKILL crashes with 14.87M acknowledged writes: 0 lost, 0 torn
+- 100 SIGKILL crashes with 14.98M acknowledged writes: 0 lost, 0 torn
   batches.
-- 0 visibility violations in 42M checks.
-- Reopen under 0.03 s.
-- 260 MB reclaimed after a drop.
-- RSS 0.95× RocksDB's, disk 1.09×.
-
-The engine-only bench predates the commit-pipeline and memtable-sizing
-work that put solistore ahead inside SoliDB; it has not been rerun at 5M
-since.
+- 0 visibility violations in 47.7M checks.
+- Reopen under 0.005 s.
+- 202 MB reclaimed after a drop, ending 10% smaller than RocksDB.
+- Peak RSS 0.98× RocksDB's, disk 0.95×.
 
 ### Against SurrealKV
 

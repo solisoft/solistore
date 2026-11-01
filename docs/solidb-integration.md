@@ -210,9 +210,10 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
 
 ## Open items in solistore before S2
 
-- Performance margins are thin on writes: load 0.81x and update 0.82x of
-  RocksDB without sync (thresholds 0.8). Durable commits vary widely
-  between runs (sync_commit_8t: 0.20x, 1.25x, 1.24x).
+- Write margins, thin at the go/no-go (load 0.81x, update 0.82x of
+  RocksDB without sync), are now wide: 1.31x and 1.53x at 5M, medians of
+  3 (2026-11-01). Durable commits from 8 threads are 3.4x; from one thread
+  in eventual mode 0.89x, a 0.1 s phase the first fsync decides.
 - Tables are ~2% larger than RocksDB's for the same data (was 7%, before
   sequences were zeroed at the bottom of the tree). The rest is the index.
   It now stores shortened separators as RocksDB does, but that alone took
