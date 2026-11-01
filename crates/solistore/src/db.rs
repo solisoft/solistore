@@ -497,6 +497,14 @@ enum Slot {
 /// benchmark, and spent most of its off-CPU time waiting for publication.
 const MAX_PARALLEL_INSERT: usize = 8;
 
+/// What a leader's WAL write hands back: the group, each member's first
+/// sequence number, and whether the syncer is due (see `wal_bytes_per_sync`).
+struct Written {
+    group: Arc<Group>,
+    firsts: Vec<u64>,
+    wake_syncer: bool,
+}
+
 /// A commit group after its WAL write: its members insert in parallel, and
 /// the last one to finish publishes it, after the group before it.
 struct Group {
@@ -1448,6 +1456,10 @@ impl Inner {
     /// memtable switch left unsynced (see [`SyncBarrier`]). Poisons the
     /// database on failure.
     fn sync_wal_file(&self, wal: &WalFile) -> Result<()> {
+        // What is counted in `written` was appended before this fsync, so
+        // it will be covered: from here on no leader asks again for it,
+        // while the older WALs and the directory are synced first.
+        Self::mark_syncing(wal);
         {
             let mut barrier = self.barrier.lock();
             // Every one, whatever its dirty flag says. A clear flag only
@@ -1467,29 +1479,27 @@ impl Inner {
             }
         }
         wal.dirty.store(false, Ordering::Release);
-        // Everything counted in `written` was appended before this fsync
-        // starts, so it is covered. A slower concurrent fsync must not move
-        // the mark back.
-        wal.synced
-            .fetch_max(wal.written.load(Ordering::Acquire), Ordering::Release);
         self.io(|| Ok(wal.file.sync()?))
     }
 
-    /// In eventual mode, wake the syncer once `wal_bytes_per_sync` bytes of
-    /// `wal` wait for an fsync. Called by the leader after each unsynced
-    /// group: one atomic load when nothing is due, and the syncer is woken
-    /// once per request however many groups pass meanwhile.
-    fn request_sync_if_due(&self, wal: &WalFile) {
-        if self.wal_bytes_per_sync == 0 {
-            return;
-        }
-        let pending = wal
-            .written
-            .load(Ordering::Relaxed)
-            .saturating_sub(wal.synced.load(Ordering::Relaxed));
-        if pending >= self.wal_bytes_per_sync {
-            self.wake_syncer();
-        }
+    /// Record that an fsync covering everything counted in `written` so far
+    /// has started. Only decides when the syncer is woken; a slower
+    /// concurrent fsync must not move it back.
+    fn mark_syncing(wal: &WalFile) {
+        wal.synced
+            .fetch_max(wal.written.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    /// Whether `wal_bytes_per_sync` bytes of `wal` wait for an fsync no one
+    /// has started. Checked by the leader after each unsynced group, under
+    /// the commit lock; the wake-up itself waits for the lock's release.
+    fn sync_due(&self, wal: &WalFile) -> bool {
+        self.wal_bytes_per_sync > 0
+            && wal
+                .written
+                .load(Ordering::Relaxed)
+                .saturating_sub(wal.synced.load(Ordering::Relaxed))
+                >= self.wal_bytes_per_sync
     }
 
     /// Ask the eventual-mode syncer for an fsync now. Waking it costs a
@@ -1665,16 +1675,21 @@ impl Inner {
                 let written = self.write_group(&lead.group);
                 let leader_inserts = lead.group.len() > MAX_PARALLEL_INSERT;
                 let (slot, members) = lead.finish(|i, _| match &written {
-                    Ok((group, firsts)) if leader_inserts => {
+                    Ok(w) if leader_inserts => {
                         if i == 0 {
-                            Slot::InsertAll(group.clone(), firsts.clone())
+                            Slot::InsertAll(w.group.clone(), w.firsts.clone())
                         } else {
-                            Slot::Wait(group.clone())
+                            Slot::Wait(w.group.clone())
                         }
                     }
-                    Ok((group, firsts)) => Slot::Insert(group.clone(), firsts[i]),
+                    Ok(w) => Slot::Insert(w.group.clone(), w.firsts[i]),
                     Err(e) => Slot::Failed(e.clone()),
                 });
+                // Out of the commit lock and the leader's place: the futex
+                // call delays neither the members nor the next group.
+                if written.as_ref().is_ok_and(|w| w.wake_syncer) {
+                    self.wake_syncer();
+                }
                 if let Slot::InsertAll(g, firsts) = &slot {
                     for (member, &first) in members.iter().zip(firsts) {
                         apply(&g.mem, member.item.batch.ops(), first, |_| true);
@@ -1705,14 +1720,18 @@ impl Inner {
     }
 
     /// Give the group its sequence numbers and write it to the WAL, fsynced
-    /// if the durability asks for it. Returns the group and each member's
-    /// first sequence number.
-    fn write_group(&self, group: &[Member]) -> Result<(Arc<Group>, Vec<u64>)> {
+    /// if the durability asks for it. Returns the group, each member's
+    /// first sequence number, and whether to wake the syncer.
+    fn write_group(&self, group: &[Member]) -> Result<Written> {
         self.check()?;
         let mut commit = self.commit.lock();
         self.throttle()?;
+        // A switch leaves the old WAL's tail and the new name to the syncer:
+        // have it run now, unless it is to keep to its interval.
+        let mut wake_syncer = false;
         if self.sv.load().mem.approximate_size() >= self.write_buffer_size {
             self.switch_memtable(&mut commit)?;
+            wake_syncer = self.wal_bytes_per_sync > 0;
         }
         let CommitState { wal, last_seq, buf } = &mut *commit;
         let wal_no = file_no_u32(wal.number)?;
@@ -1743,7 +1762,7 @@ impl Inner {
             self.sync_wal_file(wal)?;
         } else {
             wal.dirty.store(true, Ordering::Release);
-            self.request_sync_if_due(wal);
+            wake_syncer |= self.sync_due(wal);
         }
         if buf.capacity() > 2 * MAX_GROUP_BYTES {
             *buf = Vec::new();
@@ -1754,15 +1773,16 @@ impl Inner {
         // already handed out to be published: this memtable stays the one
         // this group belongs in until it is.
         let mem = self.sv.load().mem.clone();
-        Ok((
-            Arc::new(Group {
+        Ok(Written {
+            group: Arc::new(Group {
                 mem,
                 first,
                 last: seq,
                 remaining: AtomicUsize::new(group.len()),
             }),
             firsts,
-        ))
+            wake_syncer,
+        })
     }
 
     /// Insert one member's batch; the group's last member to finish
@@ -1868,10 +1888,6 @@ impl Inner {
         });
         commit.wal = wal.clone();
         *self.current_wal.lock() = wal;
-        // The old WAL's tail and the new name are durable once the syncer
-        // has run: have it run now rather than at the end of its interval,
-        // so the next synced write finds them done.
-        self.wake_syncer();
 
         self.install(|sv| SuperVersion {
             mem: Arc::new(Memtable::new(number)),
@@ -2256,19 +2272,19 @@ impl Inner {
     /// a leader asks (`wal_bytes_per_sync` bytes waiting, or a memtable
     /// switch). It sleeps on its own park token: on the shared `bg_cv` every
     /// flush and compaction woke it. Every request comes with an `unpark`,
-    /// so a request made during an fsync makes the next park return at once,
-    /// and no token is left over to cost an fsync nobody asked for.
+    /// so a request made while it syncs makes the next park return at once.
     fn sync_loop(&self, interval: Duration) {
         loop {
             std::thread::park_timeout(interval);
-            // From here on, a request wakes the next park; one made before
-            // this store is served by the fsync below, which counts the
-            // WAL after it.
+            let wal = self.current_wal.lock().clone();
+            // The mark first, then the flag: a leader asks again only for
+            // bytes past what this round covers, not for the same bytes
+            // while the older WALs and the directory are synced first.
+            Self::mark_syncing(&wal);
             self.sync_wanted.store(false, Ordering::Release);
             if self.bg.lock().shutdown || self.poisoned.load(Ordering::Acquire) {
                 return;
             }
-            let wal = self.current_wal.lock().clone();
             let behind = !self.barrier.lock().older.is_empty();
             if wal.dirty.load(Ordering::Acquire) || behind {
                 if self.sync_wal_file(&wal).is_err() {

@@ -343,7 +343,16 @@ fn eventual_mode_recovers_a_synced_prefix() {
             wal_bytes_per_sync: [1 << 20, 1, 64][seed as usize % 3],
             ..Options::default()
         };
-        let db = Db::open("/db", opts.clone()).unwrap();
+        // A process handle: whatever the syncer is doing when the crash
+        // comes fails, rather than reaching the disk that survives it.
+        let db = Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts.clone()
+            },
+        )
+        .unwrap();
         let cf = db.default_cf();
         let mut history = vec![BTreeMap::<Vec<u8>, Vec<u8>>::new()];
         let mut synced = 0;
@@ -367,7 +376,14 @@ fn eventual_mode_recovers_a_synced_prefix() {
         }
         fs.crash(Torn::Seeded(seed));
         drop(db);
-        let db = Db::open("/db", opts).unwrap();
+        let db = Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts
+            },
+        )
+        .unwrap();
         let got: BTreeMap<Vec<u8>, Vec<u8>> = db
             .iterator(&db.default_cf(), IteratorMode::Start)
             .unwrap()
