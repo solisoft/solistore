@@ -32,6 +32,9 @@ use crate::key::{self, Kind};
 use crate::memtable::Version;
 
 pub const BLOCK_SIZE: usize = 4096;
+/// Index entries stored whole every this many; those between share their
+/// prefix with the one before.
+const INDEX_RESTART_INTERVAL: usize = 1;
 const FOOTER_LEN: usize = 64;
 const MAGIC: u64 = 0x736f_6c69_7374_6f72; // "solistor"
 const FORMAT_VERSION: u32 = 1;
@@ -109,7 +112,7 @@ impl TableBuilder {
             out: Vec::with_capacity(WRITE_CHUNK + BLOCK_SIZE * 2),
             offset: 0,
             data: BlockBuilder::new(RESTART_INTERVAL),
-            index: BlockBuilder::new(1),
+            index: BlockBuilder::new(INDEX_RESTART_INTERVAL),
             pending: None,
             hashes: Vec::new(),
             last_key: Vec::new(),
