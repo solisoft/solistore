@@ -101,7 +101,9 @@ jobs:
       - run: |
           cd fuzz
           for t in log_records write_batch version_edits block bloom table open; do
-            cargo +nightly fuzz run -O "$t" -- -max_total_time=30 -malloc_limit_mb=256
+            # The prebuilt cargo-fuzz is a musl binary and would target musl.
+            cargo +nightly fuzz run -O --target x86_64-unknown-linux-gnu "$t" -- \
+              -max_total_time=30 -malloc_limit_mb=256
           done
 
   # The benchmark compiles against both engines; it is never run in CI.
