@@ -1386,17 +1386,16 @@ fn tidy(change: &mut VersionChange) {
 /// Apply decoded ops to a memtable, numbering them from `first_seq`.
 fn apply(mem: &Memtable, ops: Vec<BatchOp<'_>>, first_seq: u64, live: impl Fn(u32) -> bool) {
     // Each entry is written once, straight into its skiplist node.
-    let mut bytes = 0;
     for (seq, op) in (first_seq..).zip(&ops) {
-        bytes += match *op {
+        match *op {
             BatchOp::Put { cf, key, value } if live(cf) => {
                 mem.insert_entry(cf, key, seq, Kind::Put, value)
             }
             BatchOp::Delete { cf, key } if live(cf) => {
                 mem.insert_entry(cf, key, seq, Kind::Delete, b"")
             }
-            _ => 0,
-        };
+            _ => {}
+        }
     }
     let mut last = 0;
     for (seq, op) in (first_seq..).zip(ops) {
@@ -1407,7 +1406,7 @@ fn apply(mem: &Memtable, ops: Vec<BatchOp<'_>>, first_seq: u64, live: impl Fn(u3
         }
         last = seq;
     }
-    mem.account(bytes, last);
+    mem.account(last);
 }
 
 impl Inner {

@@ -20,29 +20,36 @@
 //! Nothing is ever removed, so a node, once reachable, stays valid until the
 //! list is dropped; readers only follow `Acquire` loads of the links.
 //!
-//! The arena hands each thread a block at a time, so concurrent writers do
-//! not share a counter per entry.
+//! The arena hands out memory through a few shards, each with its own
+//! block and lock, and a thread always uses the same shard: concurrent
+//! writers rarely meet, and a thread writing to two lists in turn keeps a
+//! block in each. Everything the arena hands out counts toward its usage,
+//! padding and abandoned tails included, except what the shards' open
+//! blocks have not handed out yet: at most `SHARDS × BLOCK` per list.
 
 use std::alloc::{self, Layout};
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::mem::{align_of, size_of};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::*};
 
 use parking_lot::Mutex;
 
 use crate::key;
 
-/// Enough for 4^12 = 16M entries at a branching factor of 4.
-pub const MAX_HEIGHT: usize = 12;
+/// Enough for 4^16 = 4G entries at a branching factor of 4. Searches start
+/// from the tallest node's level, so unused levels cost nothing.
+pub const MAX_HEIGHT: usize = 16;
 /// Each level holds a quarter of the nodes of the one below.
 const BRANCHING: u64 = 4;
 
-/// What a thread takes from the arena at a time.
+/// What a shard takes from the arena's chunks at a time.
 const BLOCK: usize = 32 << 10;
-/// Allocations above this go to the arena directly rather than through a
-/// thread's block, so a block's unused tail stays small.
+/// Shards of an arena; threads are spread over them.
+const SHARDS: usize = 16;
+/// Allocations above this go to the chunks directly rather than through a
+/// shard's block, so a block's unused tail stays small.
 const LARGE: usize = BLOCK / 4;
 /// The arena's chunks double from this size up to `MAX_CHUNK`, so a small
 /// memtable (tests use tiny ones) costs little.
@@ -84,36 +91,59 @@ unsafe fn key_of<'a>(node: *const Node) -> &'a [u8] {
 
 /// SAFETY: as [`key_of`].
 unsafe fn value_of<'a>(node: *const Node) -> &'a [u8] {
-    let key = key_of(node);
-    std::slice::from_raw_parts(key.as_ptr().add(key.len()), (*node).value_len as usize)
+    // From the node's own pointer, not the key slice's: that one may only
+    // reach the key's bytes.
+    let at = (node as *const u8).add(HEADER + (*node).key_len as usize);
+    std::slice::from_raw_parts(at, (*node).value_len as usize)
 }
 
-static NEXT_ARENA: AtomicU64 = AtomicU64::new(1);
+static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
-    /// The block this thread allocates from: the arena's id, the next free
-    /// byte and the bytes left. Ids are never reused, so a block of a
-    /// dropped arena is never used again.
-    static LOCAL: Cell<(u64, *mut u8, usize)> = const { Cell::new((0, ptr::null_mut(), 0)) };
+    /// The shard this thread allocates from, in every arena.
+    static SHARD: usize = NEXT_SHARD.fetch_add(1, Relaxed) % SHARDS;
+}
+
+/// The unused end of a block or chunk.
+struct Free {
+    at: *mut u8,
+    left: usize,
+}
+
+// SAFETY: a `Free` is only touched under its owner's mutex, and the memory
+// it points to belongs to the arena.
+unsafe impl Send for Free {}
+
+/// A shard: its open block, and what it handed out. On its own cache line,
+/// so two shards in use do not share one.
+#[repr(align(128))]
+struct Shard {
+    block: Mutex<Free>,
+    used: AtomicUsize,
 }
 
 struct Arena {
-    id: u64,
-    inner: Mutex<Chunks>,
+    shards: [Shard; SHARDS],
+    chunks: Mutex<Chunks>,
+    /// Bytes handed out by the chunks directly (large allocations) or
+    /// lost at the end of a chunk.
+    used: AtomicUsize,
 }
 
 struct Chunks {
     owned: Vec<(NonNull<u8>, Layout)>,
-    at: *mut u8,
-    left: usize,
+    free: Free,
     next_size: usize,
 }
 
 impl Chunks {
-    /// `size` bytes, aligned, from the current chunk or a new one.
-    fn take(&mut self, size: usize) -> *mut u8 {
+    /// `size` bytes, aligned, from the current chunk or a new one; returns
+    /// the bytes left unused at the end of a chunk given up on.
+    fn take(&mut self, size: usize) -> (*mut u8, usize) {
         debug_assert_eq!(size % ALIGN, 0);
-        if self.left < size {
+        let mut lost = 0;
+        if self.free.left < size {
+            lost = self.free.left;
             let chunk = size.max(self.next_size);
             self.next_size = (self.next_size * 2).min(MAX_CHUNK);
             let layout = Layout::from_size_align(chunk, ALIGN).expect("chunk layout");
@@ -121,54 +151,91 @@ impl Chunks {
             let p = NonNull::new(unsafe { alloc::alloc(layout) })
                 .unwrap_or_else(|| alloc::handle_alloc_error(layout));
             self.owned.push((p, layout));
-            self.at = p.as_ptr();
-            self.left = chunk;
+            self.free = Free {
+                at: p.as_ptr(),
+                left: chunk,
+            };
         }
-        let p = self.at;
+        let p = self.free.at;
         // SAFETY: `size <= left`, so this stays inside the chunk.
-        self.at = unsafe { self.at.add(size) };
-        self.left -= size;
-        p
+        self.free.at = unsafe { self.free.at.add(size) };
+        self.free.left -= size;
+        (p, lost)
     }
 }
 
 impl Arena {
     fn new() -> Self {
         Arena {
-            id: NEXT_ARENA.fetch_add(1, Relaxed),
-            inner: Mutex::new(Chunks {
+            shards: std::array::from_fn(|_| Shard {
+                block: Mutex::new(Free {
+                    at: ptr::null_mut(),
+                    left: 0,
+                }),
+                used: AtomicUsize::new(0),
+            }),
+            chunks: Mutex::new(Chunks {
                 owned: Vec::new(),
-                at: ptr::null_mut(),
-                left: 0,
+                free: Free {
+                    at: ptr::null_mut(),
+                    left: 0,
+                },
                 next_size: FIRST_CHUNK,
             }),
+            used: AtomicUsize::new(0),
         }
+    }
+
+    fn take_from_chunks(&self, size: usize) -> *mut u8 {
+        let (p, lost) = self.chunks.lock().take(size);
+        self.used.fetch_add(size + lost, Relaxed);
+        p
     }
 
     /// `size` bytes (a multiple of [`ALIGN`]), valid until the arena drops.
     fn alloc(&self, size: usize) -> *mut u8 {
         if size > LARGE {
-            return self.inner.lock().take(size);
+            return self.take_from_chunks(size);
         }
-        LOCAL.with(|local| {
-            let (id, at, left) = local.get();
-            if id == self.id && left >= size {
-                // SAFETY: the block belongs to this arena, which is alive
-                // (`&self`), and has `left >= size` bytes past `at`.
-                local.set((id, unsafe { at.add(size) }, left - size));
-                return at;
-            }
-            let block = self.inner.lock().take(BLOCK);
-            // SAFETY: a fresh block of BLOCK > LARGE >= size bytes.
-            local.set((self.id, unsafe { block.add(size) }, BLOCK - size));
-            block
-        })
+        let shard = &self.shards[SHARD.with(|s| *s)];
+        let mut block = shard.block.lock();
+        let mut handed = size;
+        if block.left < size {
+            // The old block's tail is lost: count it.
+            handed += block.left;
+            *block = Free {
+                at: self.take_from_chunks(BLOCK),
+                left: BLOCK,
+            };
+            // `take_from_chunks` counted the whole block; this shard counts what
+            // it hands out of it instead.
+            self.used.fetch_sub(BLOCK, Relaxed);
+        }
+        let p = block.at;
+        // SAFETY: `size <= left`, so this stays inside the block.
+        block.at = unsafe { block.at.add(size) };
+        block.left -= size;
+        // Written under the shard's lock, so only readers of the total
+        // touch this line besides the shard's own writers.
+        shard.used.fetch_add(handed, Relaxed);
+        p
+    }
+
+    /// Bytes handed out so far, including padding and abandoned tails, but
+    /// not what the shards' open blocks hold in reserve.
+    fn usage(&self) -> usize {
+        self.used.load(Relaxed)
+            + self
+                .shards
+                .iter()
+                .map(|s| s.used.load(Relaxed))
+                .sum::<usize>()
     }
 }
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        for (p, layout) in self.inner.get_mut().owned.drain(..) {
+        for (p, layout) in self.chunks.get_mut().owned.drain(..) {
             // SAFETY: allocated in `take` with this layout, freed once.
             unsafe { alloc::dealloc(p.as_ptr(), layout) };
         }
@@ -203,6 +270,10 @@ fn random_height() -> usize {
 }
 
 /// An entry of a [`SkipList`], valid as long as the list it came from.
+///
+/// It carries no lifetime, so that a cursor can sit next to the `Arc` that
+/// keeps its list alive (see `MemIter`); the methods that read through one
+/// are `unsafe` for that reason.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cursor(NonNull<Node>);
 
@@ -217,11 +288,14 @@ pub struct SkipList {
     arena: Arena,
     /// A node of full height with an empty key, before every entry.
     head: NonNull<Node>,
+    /// The tallest node's height: searches start there. Read `Relaxed`: a
+    /// stale value only starts a search lower, which is still correct.
+    height: AtomicUsize,
 }
 
 // SAFETY: nodes are written once before they are published with a
 // `Release` swap and never changed afterwards except through their atomic
-// links; the arena is guarded by its mutex and per-thread blocks.
+// links; the arena is guarded by its shards' and chunks' mutexes.
 unsafe impl Send for SkipList {}
 unsafe impl Sync for SkipList {}
 
@@ -234,25 +308,42 @@ impl Default for SkipList {
 impl SkipList {
     pub fn new() -> Self {
         let arena = Arena::new();
-        let head = new_node(&arena, MAX_HEIGHT, &[], &[]);
-        SkipList { arena, head }
+        let (head, _) = new_node(&arena, MAX_HEIGHT, &[], &[]);
+        SkipList {
+            arena,
+            head,
+            height: AtomicUsize::new(1),
+        }
+    }
+
+    /// Bytes the list's arena has handed out for entries: every node with
+    /// its padding, and the tails of blocks and chunks it gave up on. The
+    /// head is left out, so an empty list counts nothing.
+    pub fn memory_usage(&self) -> usize {
+        self.arena.usage() - node_size(MAX_HEIGHT, 0, 0)
     }
 
     /// Insert the key made of `key_parts` (concatenated) with `value`.
-    /// Returns the bytes the entry takes, or 0 if the key was already
-    /// there (the list is left as it was, apart from the unused node).
-    pub fn insert(&self, key_parts: &[&[u8]], value: &[u8]) -> usize {
+    /// Returns false if the key was already there: the list is left as it
+    /// was, and the unused node still counts in [`SkipList::memory_usage`].
+    pub fn insert(&self, key_parts: &[&[u8]], value: &[u8]) -> bool {
         let height = random_height();
-        let key_len: usize = key_parts.iter().map(|p| p.len()).sum();
-        let size = node_size(height, key_len, value.len());
-        let node = new_node(&self.arena, height, key_parts, value).as_ptr();
+        let node = new_node(&self.arena, height, key_parts, value).0.as_ptr();
         // SAFETY: `node` was just initialised and is not yet shared.
         let key = unsafe { key_of(node) };
+        // A read first: the height rarely grows, and an unconditional
+        // `fetch_max` would write one shared cache line on every insert.
+        let mut top = self.height.load(Relaxed);
+        if height > top {
+            top = self.height.fetch_max(height, Relaxed).max(height);
+        }
 
+        // Levels at or above `top` keep the head and a null successor: if a
+        // taller node lands there meanwhile, the swap fails and searches.
         let mut prev = [self.head.as_ptr(); MAX_HEIGHT];
         let mut next = [ptr::null_mut(); MAX_HEIGHT];
         let mut x = self.head.as_ptr();
-        for level in (0..MAX_HEIGHT).rev() {
+        for level in (0..top).rev() {
             let (p, n) = self.find_splice(key, x, level);
             prev[level] = p;
             next[level] = n;
@@ -261,7 +352,7 @@ impl SkipList {
         for level in 0..height {
             loop {
                 if level == 0 && self.equals(next[0], key) {
-                    return 0;
+                    return false;
                 }
                 // SAFETY: `node` has `height > level` links; `prev[level]`
                 // is the head or a published node, whose height is above
@@ -287,7 +378,7 @@ impl SkipList {
                 }
             }
         }
-        size
+        true
     }
 
     fn equals(&self, node: *mut Node, key: &[u8]) -> bool {
@@ -322,7 +413,7 @@ impl SkipList {
     /// key before its target, and a point read would miss the key after it.
     fn search(&self, before: impl Fn(&[u8]) -> bool) -> (*mut Node, *mut Node) {
         let mut x = self.head.as_ptr();
-        let mut level = MAX_HEIGHT - 1;
+        let mut level = self.height.load(Relaxed) - 1;
         loop {
             // SAFETY: as in `find_splice`.
             let n = unsafe { link(x, level).load(Acquire) };
@@ -374,37 +465,55 @@ impl SkipList {
         self.cursor(self.search(|k| key::compare(k, target) == Ordering::Less).0)
     }
 
-    /// The entry after `at`. `at` must come from this list.
-    pub fn next(&self, at: Cursor) -> Option<Cursor> {
+    /// The entry after `at`.
+    ///
+    /// # Safety
+    /// `at` came from this list.
+    pub unsafe fn next(&self, at: Cursor) -> Option<Cursor> {
         // SAFETY: `at` is a published node of this list, alive with `self`.
         self.cursor(unsafe { link(at.0.as_ptr(), 0).load(Acquire) })
     }
 
-    /// The key at `at`, which must come from this list.
-    pub fn key(&self, at: Cursor) -> &[u8] {
+    /// The key at `at`.
+    ///
+    /// # Safety
+    /// `at` came from this list.
+    pub unsafe fn key(&self, at: Cursor) -> &[u8] {
         // SAFETY: as in `next`; the bytes live as long as `self`.
         unsafe { key_of(at.0.as_ptr()) }
     }
 
-    /// The value at `at`, which must come from this list.
-    pub fn value(&self, at: Cursor) -> &[u8] {
+    /// The value at `at`.
+    ///
+    /// # Safety
+    /// `at` came from this list.
+    pub unsafe fn value(&self, at: Cursor) -> &[u8] {
         // SAFETY: as in `key`.
         unsafe { value_of(at.0.as_ptr()) }
     }
 
     /// Every entry in order.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
-        std::iter::successors(self.first(), |&c| self.next(c)).map(|c| (self.key(c), self.value(c)))
+        // SAFETY: every cursor here comes from this list.
+        std::iter::successors(self.first(), |&c| unsafe { self.next(c) })
+            .map(|c| unsafe { (self.key(c), self.value(c)) })
     }
 }
 
-/// Allocate and fill a node; its links start null.
-fn new_node(arena: &Arena, height: usize, key_parts: &[&[u8]], value: &[u8]) -> NonNull<Node> {
+/// Allocate and fill a node; its links start null. Returns it with the
+/// bytes it takes.
+fn new_node(
+    arena: &Arena,
+    height: usize,
+    key_parts: &[&[u8]],
+    value: &[u8],
+) -> (NonNull<Node>, usize) {
     let key_len: usize = key_parts.iter().map(|p| p.len()).sum();
     // A WAL record's length is a u32, so no key or value it carried is longer.
     let key_len32 = u32::try_from(key_len).expect("a key under 4 GiB");
     let value_len32 = u32::try_from(value.len()).expect("a value under 4 GiB");
-    let p = arena.alloc(node_size(height, key_len, value.len()));
+    let size = node_size(height, key_len, value.len());
+    let p = arena.alloc(size);
     // SAFETY: `p` is aligned and has room for `height` links, the header,
     // the key and the value; each is written once, in place, before the
     // node is shared.
@@ -422,7 +531,7 @@ fn new_node(arena: &Arena, height: usize, key_parts: &[&[u8]], value: &[u8]) -> 
             at = at.add(part.len());
         }
         ptr::copy_nonoverlapping(value.as_ptr(), at, value.len());
-        NonNull::new_unchecked(node)
+        (NonNull::new_unchecked(node), size)
     }
 }
 
@@ -432,6 +541,15 @@ mod tests {
     use crate::key::{encode, Kind};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    // Every cursor in these tests comes from the list it is read with.
+    fn key(list: &SkipList, c: Cursor) -> Vec<u8> {
+        unsafe { list.key(c) }.to_vec()
+    }
+
+    fn value(list: &SkipList, c: Cursor) -> Vec<u8> {
+        unsafe { list.value(c) }.to_vec()
+    }
 
     fn ik(i: u32) -> Vec<u8> {
         encode(
@@ -448,7 +566,7 @@ mod tests {
         assert!(list.is_empty());
         let mut keys: Vec<u32> = (0..2000).map(|i| (i * 7919) % 2000).collect();
         for &i in &keys {
-            assert!(list.insert(&[&ik(i)], format!("v{i}").as_bytes()) > 0);
+            assert!(list.insert(&[&ik(i)], format!("v{i}").as_bytes()));
         }
         keys.sort();
         let got: Vec<_> = list.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
@@ -457,7 +575,7 @@ mod tests {
             .map(|&i| (ik(i), format!("v{i}").into_bytes()))
             .collect();
         assert_eq!(got, want);
-        assert_eq!(list.key(list.last().unwrap()), &ik(1999)[..]);
+        assert_eq!(key(&list, list.last().unwrap()), ik(1999));
     }
 
     #[test]
@@ -465,12 +583,17 @@ mod tests {
         let list = SkipList::new();
         let whole = encode(3, b"user", 9, Kind::Delete);
         let (a, b) = whole.split_at(5);
-        assert!(list.insert(&[a, b], b"") > 0);
-        assert_eq!(list.insert(&[&whole], b"other"), 0);
+        assert!(list.insert(&[a, b], b""));
+        let before = list.memory_usage();
+        assert!(!list.insert(&[&whole], b"other"));
+        assert!(
+            list.memory_usage() > before,
+            "the refused node still counts"
+        );
         let c = list.first().unwrap();
-        assert_eq!(list.key(c), &whole[..]);
-        assert_eq!(list.value(c), b"");
-        assert_eq!(list.next(c), None);
+        assert_eq!(key(&list, c), whole);
+        assert_eq!(value(&list, c), b"");
+        assert_eq!(unsafe { list.next(c) }, None);
     }
 
     #[test]
@@ -481,7 +604,7 @@ mod tests {
             list.insert(&[&ik(i)], &[]);
             model.insert(i, ());
         }
-        let key_at = |c: Option<Cursor>| c.map(|c| list.key(c).to_vec());
+        let key_at = |c: Option<Cursor>| c.map(|c| key(&list, c));
         for probe in 0..3005u32 {
             let t = ik(probe);
             let ge = model.range(probe..).next().map(|(&i, _)| ik(i));
@@ -513,20 +636,31 @@ mod tests {
             let value: Vec<u8> = (0..len).map(|b| (b * 31 + i) as u8).collect();
             list.insert(&[&ik(i as u32)], &value);
             let c = list.seek_ge(&ik(i as u32)).unwrap();
-            assert_eq!(list.value(c), &value[..], "len {len}");
+            assert_eq!(self::value(&list, c), value, "len {len}");
         }
     }
 
     #[test]
-    fn the_size_is_what_the_node_takes() {
+    fn the_usage_is_what_the_nodes_take() {
         let list = SkipList::new();
-        let size = list.insert(&[&ik(1)], b"12345");
-        assert!(size >= HEADER + 8 + ik(1).len() + 5, "{size}");
-        assert!(
-            size <= HEADER + 8 * MAX_HEIGHT + ik(1).len() + 5 + ALIGN,
-            "{size}"
-        );
-        assert_eq!(size % ALIGN, 0);
+        let empty = list.memory_usage();
+        assert_eq!(empty, 0, "the head is not counted");
+        list.insert(&[&ik(1)], b"12345");
+        let one = list.memory_usage() - empty;
+        assert!(one >= node_size(1, ik(1).len(), 5), "{one}");
+        assert!(one <= node_size(MAX_HEIGHT, ik(1).len(), 5), "{one}");
+        assert_eq!(one % ALIGN, 0);
+        // Many entries: the usage is their nodes, plus at most a lost tail
+        // per block taken.
+        let list = SkipList::new();
+        let mut least = 0;
+        for i in 0..50_000u32 {
+            list.insert(&[&ik(i)], &[7; 100]);
+            least += node_size(1, ik(i).len(), 100);
+        }
+        let usage = list.memory_usage();
+        assert!(usage >= least, "{usage} < {least}");
+        assert!(usage < least * 13 / 10, "{usage} vs {least}");
     }
 
     #[test]
@@ -568,7 +702,7 @@ mod tests {
                     for i in 0..per {
                         // Interleaved key ranges, so writers contend.
                         let k = i * threads + t;
-                        assert!(list.insert(&[&ik(k)], &k.to_le_bytes()) > 0);
+                        assert!(list.insert(&[&ik(k)], &k.to_le_bytes()));
                     }
                 })
             })
@@ -609,9 +743,9 @@ mod tests {
                     while !stop.load(Relaxed) {
                         let p = progress[(seeks as usize + r) % 3].load(Relaxed);
                         let target = ik((p + 1).min(n) * 4);
-                        let found = list.seek_ge(&target).map(|c| list.key(c).to_vec());
+                        let found = list.seek_ge(&target).map(|c| key(&list, c));
                         assert_eq!(found.as_deref(), Some(&target[..]), "seek_ge");
-                        let found = list.seek_le(&target).map(|c| list.key(c).to_vec());
+                        let found = list.seek_le(&target).map(|c| key(&list, c));
                         assert_eq!(found.as_deref(), Some(&target[..]), "seek_le");
                         seeks += 1;
                     }
@@ -653,6 +787,9 @@ mod tests {
             c.insert(&[&ik(i)], b"c");
         }
         assert!(a.iter().all(|(_, v)| v == b"a"));
+        // Each list kept its own block: alternating did not cost a block
+        // per insert (that was 32 KiB each, 160 MB here).
+        assert!(a.memory_usage() < 1 << 20, "{}", a.memory_usage());
         assert!(c.iter().all(|(_, v)| v == b"c"));
         assert_eq!(a.iter().count(), 5000);
     }

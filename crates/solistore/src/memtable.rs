@@ -83,14 +83,15 @@ pub struct Version {
 }
 
 pub struct Memtable {
-    /// Keys, values and nodes, all in the list's arena: what `size` counts
-    /// is what the entries take.
+    /// Keys, values and nodes, all in the list's arena, which counts what
+    /// it hands out.
     map: SkipList,
     tombstones: RwLock<Vec<RangeTombstone>>,
     /// `tombstones` is not empty. Lets every point read skip the lock: a
     /// read lock is a write to a shared cache line, on every get.
     has_tombstones: AtomicBool,
-    size: AtomicUsize,
+    /// Bytes held by range tombstones; entries are counted by `map`.
+    tombstone_bytes: AtomicUsize,
     /// The highest sequence number inserted.
     max_seq: AtomicU64,
     /// The first WAL file holding any of this memtable's writes: once it is
@@ -104,7 +105,7 @@ impl Memtable {
             map: SkipList::new(),
             tombstones: RwLock::new(Vec::new()),
             has_tombstones: AtomicBool::new(false),
-            size: AtomicUsize::new(0),
+            tombstone_bytes: AtomicUsize::new(0),
             max_seq: AtomicU64::new(0),
             first_wal,
         }
@@ -121,29 +122,30 @@ impl Memtable {
 
     #[cfg(test)]
     pub fn insert(&self, cf: u32, key: &[u8], seq: u64, kind: Kind, value: &[u8]) {
-        let bytes = self.insert_entry(cf, key, seq, kind, value);
-        self.account(bytes, seq);
+        self.insert_entry(cf, key, seq, kind, value);
+        self.account(seq);
     }
 
-    /// Insert without updating the shared size and sequence counters;
-    /// returns the bytes to [`Memtable::account`] for. Writers inserting a
-    /// batch account once for all of it: eight writers bumping the same two
-    /// atomics for every entry would bounce their cache line between cores.
-    pub fn insert_entry(&self, cf: u32, key: &[u8], seq: u64, kind: Kind, value: &[u8]) -> usize {
+    /// Insert without updating the highest sequence number, which
+    /// [`Memtable::account`] does once for a whole batch: eight writers
+    /// bumping the same atomic for every entry would bounce its cache line
+    /// between cores. The arena counts the entry's size in the writer's
+    /// shard.
+    pub fn insert_entry(&self, cf: u32, key: &[u8], seq: u64, kind: Kind, value: &[u8]) {
+        // A batch never repeats a sequence number, so the key is new.
         self.map.insert(
             &[&cf.to_be_bytes(), key, &key::trailer_bytes(seq, kind)],
             value,
-        )
+        );
     }
 
-    pub fn account(&self, bytes: usize, max_seq: u64) {
-        self.size.fetch_add(bytes, Ordering::Relaxed);
+    pub fn account(&self, max_seq: u64) {
         self.max_seq.fetch_max(max_seq, Ordering::Relaxed);
     }
 
     pub fn insert_range_tombstone(&self, cf: u32, start: &[u8], end: &[u8], seq: u64) {
         self.max_seq.fetch_max(seq, Ordering::Relaxed);
-        self.size.fetch_add(
+        self.tombstone_bytes.fetch_add(
             start.len() + end.len() + TOMBSTONE_OVERHEAD,
             Ordering::Relaxed,
         );
@@ -156,9 +158,12 @@ impl Memtable {
         });
     }
 
-    /// Approximate memory held, in bytes.
+    /// Memory held, in bytes: what the arena handed out for entries
+    /// (padding and lost tails included) and the range tombstones. Not
+    /// counted: what the arena's open blocks still hold in reserve, at most
+    /// 512 KiB.
     pub fn approximate_size(&self) -> usize {
-        self.size.load(Ordering::Relaxed)
+        self.map.memory_usage() + self.tombstone_bytes.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -169,13 +174,14 @@ impl Memtable {
     pub fn get(&self, cf: u32, key: &[u8], snapshot: u64) -> Option<Version> {
         let probe = key::at_snapshot(cf, key, snapshot);
         let at = self.map.seek_ge(&probe)?;
-        let found = key::parse(self.map.key(at))?;
+        // SAFETY: `at` comes from `self.map`.
+        let found = key::parse(unsafe { self.map.key(at) })?;
         // A copy, as RocksDB's bindings make: a slice of the arena would
         // keep the whole memtable alive past its flush.
         (found.cf == cf && found.user_key == key).then(|| Version {
             seq: found.seq,
             kind: found.kind,
-            value: Bytes::copy_from_slice(self.map.value(at)),
+            value: Bytes::copy_from_slice(unsafe { self.map.value(at) }),
         })
     }
 
@@ -204,12 +210,18 @@ impl Memtable {
 /// back links.
 pub struct MemIter {
     mem: Arc<Memtable>,
+    /// Always a cursor of `mem.map`, which `mem` keeps alive: every
+    /// `unsafe` read below relies on it.
     at: Option<Cursor>,
 }
 
 impl MemIter {
     pub fn new(mem: Arc<Memtable>) -> Self {
         MemIter { mem, at: None }
+    }
+
+    fn current(&self) -> Cursor {
+        self.at.expect("valid")
     }
 }
 
@@ -228,13 +240,15 @@ impl InternalIterator for MemIter {
 
     fn next(&mut self) {
         if let Some(at) = self.at {
-            self.at = self.mem.map.next(at);
+            // SAFETY: `at` is a cursor of `mem.map`.
+            self.at = unsafe { self.mem.map.next(at) };
         }
     }
 
     fn prev(&mut self) {
         if let Some(at) = self.at {
-            self.at = self.mem.map.seek_lt(self.mem.map.key(at));
+            // SAFETY: as in `next`.
+            self.at = self.mem.map.seek_lt(unsafe { self.mem.map.key(at) });
         }
     }
 
@@ -243,11 +257,13 @@ impl InternalIterator for MemIter {
     }
 
     fn key(&self) -> &[u8] {
-        self.mem.map.key(self.at.expect("valid"))
+        // SAFETY: as in `next`.
+        unsafe { self.mem.map.key(self.current()) }
     }
 
     fn value(&self) -> Bytes {
-        Bytes::copy_from_slice(self.mem.map.value(self.at.expect("valid")))
+        // SAFETY: as in `next`.
+        Bytes::copy_from_slice(unsafe { self.mem.map.value(self.current()) })
     }
 
     fn status(&self) -> Result<()> {
