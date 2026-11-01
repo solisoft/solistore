@@ -159,12 +159,19 @@ pub fn parse(key: &[u8]) -> Option<Parsed<'_>> {
 
 /// The column family and user key, without the trailer: what identifies a
 /// key across its versions, and what the bloom filter hashes.
+///
+/// Total over any bytes: a key shorter than a trailer, which only a corrupt
+/// block or MANIFEST holds, is all identity and no trailer. [`compare`]
+/// stays a total order on such keys, and [`parse`] reports them, instead of
+/// a slice out of bounds in the middle of a seek (found by fuzzing).
 pub fn cf_and_user_key(key: &[u8]) -> &[u8] {
-    &key[..key.len() - TRAILER_LEN]
+    &key[..key.len().saturating_sub(TRAILER_LEN)]
 }
 
 fn trailer(key: &[u8]) -> u64 {
-    u64::from_le_bytes(key[key.len() - TRAILER_LEN..].try_into().expect("8 bytes"))
+    key.len().checked_sub(TRAILER_LEN).map_or(0, |at| {
+        u64::from_le_bytes(key[at..].try_into().expect("8 bytes"))
+    })
 }
 
 pub fn compare(a: &[u8], b: &[u8]) -> Ordering {
@@ -358,6 +365,30 @@ mod tests {
         // Out of order: no separator, and no panic.
         assert_eq!(separator(&k(b"ab"), &k(b"a")), None);
         assert_eq!(separator(&k(b"b"), &k(b"a")), None);
+    }
+
+    /// Found by fuzzing: keys shorter than a trailer, which only corrupt
+    /// data holds, made `compare` slice out of bounds. They compare as all
+    /// identity, in a total order, and do not parse.
+    #[test]
+    fn keys_shorter_than_a_trailer_compare_and_do_not_parse() {
+        let mut keys: Vec<Vec<u8>> = vec![
+            vec![],
+            b"a".to_vec(),
+            b"abcdefg".to_vec(),
+            ik(0, b"a", 1),
+            vec![0xff; 3],
+        ];
+        keys.sort_by(|a, b| compare(a, b));
+        for w in keys.windows(2) {
+            assert_ne!(compare(&w[0], &w[1]), Ordering::Greater);
+            assert_eq!(compare(&w[0], &w[1]), compare(&w[1], &w[0]).reverse());
+        }
+        assert_eq!(compare(b"abc", b"abc"), Ordering::Equal);
+        assert!(keys
+            .iter()
+            .filter(|k| k.len() < MIN_LEN)
+            .all(|k| parse(k).is_none()));
     }
 
     #[test]

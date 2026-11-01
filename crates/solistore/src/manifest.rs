@@ -360,6 +360,15 @@ pub fn read(fs: &dyn Fs, dir: &Path, no: u64) -> Result<ManifestState> {
         }
     }
     state.next_file = state.next_file.max(no + 1);
+    // Every database has its default column family, and callers rely on
+    // it (`Db::default_cf`): a MANIFEST that dropped it was not written by
+    // this crate.
+    if !state.cfs.values().any(|name| name == DEFAULT_CF) {
+        return Err(Error::Corruption(format!(
+            "{} has no {DEFAULT_CF:?} column family",
+            manifest_name(no)
+        )));
+    }
     Ok(state)
 }
 
@@ -428,6 +437,22 @@ impl ManifestWriter {
 mod tests {
     use super::*;
     use crate::fs::{FaultFs, Torn};
+
+    /// Found by fuzzing: a MANIFEST that drops the default column family
+    /// opened, and `Db::default_cf` then panicked.
+    #[test]
+    fn a_manifest_without_the_default_column_family_is_corrupt() {
+        let fs = FaultFs::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let mut writer =
+            ManifestWriter::install(&fs, dir, 1, &ManifestState::new_database()).unwrap();
+        writer.append(&[Edit::DropCf { id: 0 }]).unwrap();
+        match read(&fs, dir, 1) {
+            Err(Error::Corruption(why)) => assert!(why.contains("default"), "{why}"),
+            other => panic!("expected corruption, got {:?}", other.map(|s| s.cfs)),
+        }
+    }
 
     #[test]
     fn edits_round_trip() {
