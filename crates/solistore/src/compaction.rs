@@ -74,7 +74,7 @@ use crate::error::{Error, Result};
 use crate::fs::Fs;
 use crate::iter::{InternalIterator, MergingIterator};
 use crate::key::{self, Kind};
-use crate::memtable::{covering_seq, RangeTombstone};
+use crate::memtable::RangeTombstone;
 use crate::sst::{TableBuilder, TableIter, TableProps};
 use crate::version::{table_name, LevelIter, TableFile, Version, NUM_LEVELS};
 
@@ -244,13 +244,19 @@ pub fn file_bounds(f: &TableFile) -> Option<(u32, &[u8], &[u8])> {
 
 /// Whether `f` may hold an entry `t` deletes.
 pub fn may_hold_covered(f: &TableFile, t: &RangeTombstone) -> bool {
-    if f.props.tombstone_watermark >= t.seq || f.props.smallest_seq >= t.seq {
-        return false;
-    }
-    match file_bounds(f) {
+    covered_floor(f, t).is_some_and(|floor| t.seq > floor)
+}
+
+/// For a file whose keys may fall in `t`'s range, the sequence number a
+/// tombstone of that range must exceed to cover any of its data: the
+/// file's tombstone watermark or its oldest entry, whichever is higher.
+/// `None` when no key of the file can fall in the range.
+pub fn covered_floor(f: &TableFile, t: &RangeTombstone) -> Option<u64> {
+    let overlaps = match file_bounds(f) {
         Some((cf, lo, hi)) => cf == t.cf && lo < &t.end[..] && hi >= &t.start[..],
         None => true,
-    }
+    };
+    overlaps.then(|| f.props.tombstone_watermark.max(f.props.smallest_seq))
 }
 
 /// Whether every entry of `f` is deleted by `t`: the file can go as is.
@@ -283,9 +289,17 @@ pub fn pick(
 /// A file that may hold data a range tombstone deletes.
 pub fn pick_for_tombstones(version: &Version, cfg: &Config, busy: Busy<'_>) -> Option<Compaction> {
     let mut base_level = None;
-    for t in &version.tombstones {
+    // One test per distinct range, against its newest tombstone: a file may
+    // hold data some tombstone of the range covers iff it may for the
+    // newest, since `may_hold_covered` only gets truer as `seq` grows.
+    for t in version
+        .tombstone_index()
+        .groups()
+        .iter()
+        .map(|g| g.newest())
+    {
         for (level, files) in version.levels.iter().enumerate() {
-            for f in files.iter().filter(|f| may_hold_covered(f, t)) {
+            for f in files.iter().filter(|f| may_hold_covered(f, &t)) {
                 let candidate = if level == 0 {
                     let base =
                         *base_level.get_or_insert_with(|| Targets::of(version, cfg).base_level);
@@ -544,6 +558,7 @@ fn merge_range(
     }
 
     let watermark = version.tombstones.iter().map(|t| t.seq).max().unwrap_or(0);
+    let tombstones = version.tombstone_index();
     let mut out =
         OutputFiles::with_writeback(fs, dir, cfg.target_file_size, watermark, cfg.writeback);
     let mut allocate = || allocate();
@@ -565,7 +580,7 @@ fn merge_range(
         last_id.extend_from_slice(id);
         have_last = true;
         let parsed = key::parse(k).ok_or_else(|| Error::Corruption("bad key in table".into()))?;
-        let cover = covering_seq(&version.tombstones, parsed.cf, parsed.user_key, u64::MAX);
+        let cover = tombstones.covering_seq(parsed.cf, parsed.user_key, u64::MAX);
         let covered = cover > parsed.seq;
         let bottom = !may_exist_below(version, compaction.output_level, id);
         let dead_marker = parsed.kind == Kind::Delete && bottom;

@@ -13,7 +13,7 @@ use crate::compaction::{LiveCf, OutputFiles};
 use crate::error::Result;
 use crate::fs::Fs;
 use crate::key;
-use crate::memtable::{covering_seq, Memtable};
+use crate::memtable::Memtable;
 use crate::sst::TableProps;
 
 /// Write the memtable's live entries as tables of about `target_size`
@@ -29,7 +29,7 @@ pub fn write_tables(
     watermark: u64,
     mut allocate: impl FnMut() -> u64,
 ) -> Result<Vec<(u64, TableProps)>> {
-    let tombstones = mem.tombstones();
+    let tombstones = mem.tombstone_index();
     let mut out = OutputFiles::new(fs, dir, target_size, watermark);
     let mut live = LiveCf::new(live_cf);
     let mut last_id: Vec<u8> = Vec::new();
@@ -44,7 +44,7 @@ pub fn write_tables(
             continue;
         };
         if !live.check(parsed.cf)
-            || covering_seq(&tombstones, parsed.cf, parsed.user_key, u64::MAX) > parsed.seq
+            || tombstones.covering_seq(parsed.cf, parsed.user_key, u64::MAX) > parsed.seq
         {
             continue;
         }

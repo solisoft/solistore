@@ -25,6 +25,7 @@ mod manifest;
 mod memtable;
 mod skiplist;
 mod sst;
+mod tombstones;
 mod version;
 
 pub use batch::WriteBatch;

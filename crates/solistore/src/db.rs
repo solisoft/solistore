@@ -48,7 +48,7 @@ use crate::iter::{DbIterator, InternalIterator, IteratorMode, ReadOptions};
 use crate::key::{self, Kind, MAX_SEQ};
 use crate::log::{self, encode_record_parts, read_records};
 use crate::manifest::{self, file_no_u32, Edit, ManifestState, ManifestWriter, DEFAULT_CF};
-use crate::memtable::{self, Memtable};
+use crate::memtable::{self, Memtable, RangeTombstone};
 use crate::sst::BlockCache;
 use crate::version::{by_smallest, table_name, SuperVersion, TableFile, Version, NUM_LEVELS};
 
@@ -81,6 +81,12 @@ pub struct Options {
     pub fs: Arc<dyn Fs>,
     /// Memtable size at which it is sealed and flushed.
     pub write_buffer_size: usize,
+    /// Range tombstones at which a memtable is sealed and flushed, whatever
+    /// its size (RocksDB's `memtable_max_range_deletions`; 0 for no limit).
+    /// Range tombstones take almost no room, so `write_buffer_size` alone let
+    /// a memtable gather tens of thousands of them, and the memtable's index
+    /// over them is rebuilt on the first read after each one.
+    pub max_range_tombstones_per_memtable: usize,
     /// Sealed memtables allowed to wait for a flush before writers stall.
     pub max_immutable_memtables: usize,
     /// Size at which a flush or compaction starts a new table file.
@@ -134,6 +140,7 @@ impl Default for Options {
             durability: Durability::Full,
             fs: Arc::new(StdFs),
             write_buffer_size: 64 << 20,
+            max_range_tombstones_per_memtable: 4096,
             // Three memtables at most, as SoliDB's RocksDB profile
             // (max_write_buffer_number = 3).
             max_immutable_memtables: 2,
@@ -169,6 +176,10 @@ impl fmt::Debug for Options {
             .field("durability", &self.durability)
             .field("fs", &self.fs)
             .field("write_buffer_size", &self.write_buffer_size)
+            .field(
+                "max_range_tombstones_per_memtable",
+                &self.max_range_tombstones_per_memtable,
+            )
             .field("max_immutable_memtables", &self.max_immutable_memtables)
             .field("target_file_size", &self.target_file_size)
             .field("level0_compaction_trigger", &self.level0_compaction_trigger)
@@ -348,6 +359,7 @@ struct Inner {
     fs: Arc<dyn Fs>,
     durability: Durability,
     write_buffer_size: usize,
+    max_mem_tombstones: usize,
     max_imms: usize,
     target_file_size: u64,
     block_cache: Arc<BlockCache>,
@@ -699,6 +711,7 @@ impl Db {
             fs,
             durability: opts.durability,
             write_buffer_size: opts.write_buffer_size.max(1),
+            max_mem_tombstones: opts.max_range_tombstones_per_memtable,
             max_imms: opts.max_immutable_memtables.max(1),
             target_file_size: opts.target_file_size.max(1),
             block_cache,
@@ -1367,6 +1380,9 @@ pub struct IngestReport {
 /// about `2 * threads` of these in memory.
 const INGEST_CHUNK_BYTES: usize = 96 << 20;
 
+/// A range tombstone's column family and bounds, without its sequence.
+type RangeKey<'a> = (u32, &'a [u8], &'a [u8]);
+
 struct VersionChange {
     edits: Vec<Edit>,
     sv: SuperVersion,
@@ -1376,12 +1392,37 @@ struct VersionChange {
 /// Finish a change against the range tombstones it leaves: drop every file
 /// a tombstone deletes entirely, and every tombstone no file may hold
 /// covered data for any more.
+///
+/// Both tests are made once per distinct range rather than once per
+/// tombstone, which was tombstones × files on every flush and compaction.
+/// They agree with the per-tombstone tests: `fully_covered` only gets truer
+/// as the sequence number grows, so a range's newest tombstone deletes
+/// every file any of its tombstones does; and `may_hold_covered(f, t)` is
+/// `t.seq > covered_floor(f, t)`, so a tombstone is still needed iff its
+/// sequence number is above the lowest floor among the files its range
+/// overlaps.
 fn tidy(change: &mut VersionChange) {
     let mut version = (*change.sv.version).clone();
-    for t in version.tombstones.clone() {
+    let mut newest: HashMap<(u32, Bytes, Bytes), u64> = HashMap::new();
+    for t in &version.tombstones {
+        let seq = newest
+            .entry((t.cf, t.start.clone(), t.end.clone()))
+            .or_insert(t.seq);
+        *seq = (*seq).max(t.seq);
+    }
+    let ranges: Vec<RangeTombstone> = newest
+        .into_iter()
+        .map(|((cf, start, end), seq)| RangeTombstone {
+            cf,
+            start,
+            end,
+            seq,
+        })
+        .collect();
+    for t in &ranges {
         for (level, files) in version.levels.iter_mut().enumerate() {
             files.retain(|f| {
-                let doomed = compaction::fully_covered(f, &t);
+                let doomed = compaction::fully_covered(f, t);
                 if doomed {
                     change.edits.push(Edit::DeleteFile {
                         level: level as u32,
@@ -1394,13 +1435,26 @@ fn tidy(change: &mut VersionChange) {
         }
     }
     let files: Vec<Arc<TableFile>> = version.files().cloned().collect();
-    version.tombstones.retain(|t| {
-        let needed = files.iter().any(|f| compaction::may_hold_covered(f, t));
-        if !needed {
+    let floors: HashMap<RangeKey<'_>, Option<u64>> = ranges
+        .iter()
+        .map(|t| {
+            let floor = files
+                .iter()
+                .filter_map(|f| compaction::covered_floor(f, t))
+                .min();
+            ((t.cf, &t.start[..], &t.end[..]), floor)
+        })
+        .collect();
+    let mut kept = Vec::with_capacity(version.tombstones.len());
+    for t in std::mem::take(&mut version.tombstones) {
+        let floor = floors[&(t.cf, &t.start[..], &t.end[..])];
+        if floor.is_some_and(|floor| t.seq > floor) {
+            kept.push(t);
+        } else {
             change.edits.push(Edit::RemoveRangeTombstone { seq: t.seq });
         }
-        needed
-    });
+    }
+    version.tombstones = kept;
     change.sv.version = Arc::new(version);
 }
 
@@ -1725,6 +1779,14 @@ impl Inner {
         }
     }
 
+    /// The active memtable has reached its size, or its range tombstone
+    /// limit.
+    fn memtable_full(&self) -> bool {
+        let sv = self.sv.load();
+        sv.mem.approximate_size() >= self.write_buffer_size
+            || (self.max_mem_tombstones > 0 && sv.mem.tombstone_count() >= self.max_mem_tombstones)
+    }
+
     /// Give the group its sequence numbers and write it to the WAL, fsynced
     /// if the durability asks for it. Returns the group and each member's
     /// first sequence number.
@@ -1732,7 +1794,7 @@ impl Inner {
         self.check()?;
         let mut commit = self.commit.lock();
         self.throttle()?;
-        if self.sv.load().mem.approximate_size() >= self.write_buffer_size {
+        if self.memtable_full() {
             self.switch_memtable(&mut commit)?;
         }
         let CommitState { wal, last_seq, buf } = &mut *commit;

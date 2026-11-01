@@ -211,3 +211,57 @@ fn a_fixed_layout_drains_into_the_bottom_under_dynamic_targets() {
     assert_eq!(upper, 0, "levels 1-3 drained: {levels:?}");
     assert!(bottom > 0, "the bottom holds the data: {levels:?}");
 }
+
+/// The truncate pattern: the same ranges deleted again and again, a few
+/// writes in between. Range tombstones take almost no room, so the size
+/// limit alone never sealed such a memtable; the tombstone limit does, and
+/// reads stay right across the flushes it causes.
+#[test]
+fn many_range_tombstones_seal_the_memtable() {
+    fn truncate_rounds(limit: usize) -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(
+            dir.path(),
+            Options {
+                max_range_tombstones_per_memtable: limit,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let cf = db.default_cf();
+        for round in 0..20u32 {
+            let mut batch = solistore::WriteBatch::new();
+            for coll in 0..12u32 {
+                batch.delete_range(&cf, key(coll * 100), key(coll * 100 + 100));
+            }
+            db.write(batch).unwrap();
+            for coll in 0..12u32 {
+                db.put(&cf, key(coll * 100 + round), b"v").unwrap();
+            }
+        }
+        // Only the last round's keys survive its truncate.
+        for coll in 0..12u32 {
+            for round in 0..20u32 {
+                assert_eq!(
+                    db.get(&cf, key(coll * 100 + round)).unwrap().is_some(),
+                    round == 19,
+                    "limit {limit}: collection {coll} round {round}"
+                );
+            }
+        }
+        let n = db
+            .iterator(&cf, solistore::IteratorMode::Start)
+            .unwrap()
+            .count();
+        assert_eq!(n, 12, "limit {limit}: keys iterated");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while limit > 0 && db.stats().flushes == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        db.stats().flushes
+    }
+    // 240 tombstones against a limit of 24: sealed several times over.
+    assert!(truncate_rounds(24) > 0, "the tombstone limit never sealed");
+    // No limit, a 64 MiB buffer, a few kilobytes written: never sealed.
+    assert_eq!(truncate_rounds(0), 0);
+}
