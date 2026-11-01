@@ -95,7 +95,12 @@ pub fn last_of(cf: u32, user_key: &[u8]) -> Vec<u8> {
 /// It is derived from `last` rather than from `next` on purpose: a prefix of
 /// `next` would also separate the blocks, but a seek to exactly that prefix —
 /// the commonest seek there is — would then land on the earlier block and
-/// read it for nothing.
+/// read it for nothing. Any separator leaves such a gap: a seek to a key
+/// after `last` and at or before the separator still reads the earlier
+/// block, but no key of the table starts with the separator's own prefix.
+///
+/// It never cuts inside the column family, so the result is always a whole
+/// internal key that [`parse`] accepts.
 pub fn separator(last: &[u8], next: &[u8]) -> Option<Vec<u8>> {
     let (a, b) = (cf_and_user_key(last), cf_and_user_key(next));
     let p = a.iter().zip(b).take_while(|(x, y)| x == y).count();
@@ -104,8 +109,12 @@ pub fn separator(last: &[u8], next: &[u8]) -> Option<Vec<u8>> {
     if p >= a.len() {
         return None;
     }
-    debug_assert!(p < b.len() && a[p] < b[p], "keys out of order");
-    let cut = if a[p].checked_add(1).is_some_and(|c| c < b[p]) {
+    // Out of order: `next` is not above `last`. Never so from a table
+    // builder, but this indexes `b[p]`, so it is checked in release too.
+    if p >= b.len() || a[p] > b[p] {
+        return None;
+    }
+    let mut cut = if a[p].checked_add(1).is_some_and(|c| c < b[p]) {
         // a[..p] ‖ a[p]+1 sorts after `a` and before `b`.
         p
     } else {
@@ -113,6 +122,12 @@ pub fn separator(last: &[u8], next: &[u8]) -> Option<Vec<u8>> {
         // byte of `a` to get above it.
         (p + 1..a.len()).find(|&i| a[i] != 0xff)?
     };
+    // Column families that differ in a high byte: bump within the last cf
+    // byte or the user key instead. Any byte after `p` keeps `a[..=p]`, so
+    // the result stays below `b`.
+    if cut < CF_LEN - 1 {
+        cut = (CF_LEN - 1..a.len()).find(|&i| a[i] != 0xff)?;
+    }
     // Bumping the last byte keeps the length: nothing gained.
     if cut + 1 >= a.len() {
         return None;
@@ -281,13 +296,28 @@ mod tests {
         )
     }
 
+    /// Column families that differ in their last byte and in higher ones.
+    fn cf() -> impl Strategy<Value = u32> {
+        prop::sample::select(vec![
+            0u32,
+            1,
+            2,
+            0xff,
+            0x100,
+            0x200,
+            0x1_0000,
+            0x0200_0000,
+            u32::MAX,
+        ])
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(4096))]
 
         #[test]
         fn a_separator_is_shorter_and_sits_between_the_keys(
-            cf_a in 0u32..3, a in id(), (seq_a, kind_a) in seq_and_kind(),
-            cf_b in 0u32..3, b in id(), (seq_b, kind_b) in seq_and_kind(),
+            cf_a in cf(), a in id(), (seq_a, kind_a) in seq_and_kind(),
+            cf_b in cf(), b in id(), (seq_b, kind_b) in seq_and_kind(),
         ) {
             let (x, y) = (encode(cf_a, &a, seq_a, kind_a), encode(cf_b, &b, seq_b, kind_b));
             let (last, next) = match compare(&x, &y) {
@@ -297,6 +327,7 @@ mod tests {
             };
             if let Some(s) = separator(&last, &next) {
                 prop_assert!(s.len() < last.len());
+                prop_assert!(parse(&s).is_some(), "not an internal key: {:?}", s);
                 prop_assert_eq!(compare(&last, &s), Ordering::Less);
                 prop_assert_eq!(compare(&s, &next), Ordering::Less);
                 // Not just these two versions: every version of either key.
@@ -319,9 +350,9 @@ mod tests {
     }
 
     /// Length of the shortest byte string strictly between `a` and `b`
-    /// (bytewise) that is not a prefix of `b`, by brute force over the
-    /// prefixes of `a` bumped by one: any shorter key above `a` is at least
-    /// one of those.
+    /// (bytewise) that is not a prefix of `b` and keeps a whole column
+    /// family, by brute force over the prefixes of `a` bumped by one: any
+    /// shorter key above `a` is at least one of those.
     fn shortest_between(a: &[u8], b: &[u8]) -> usize {
         (0..a.len())
             .filter(|&i| a[i] != 0xff)
@@ -330,6 +361,7 @@ mod tests {
                 s[i] += 1;
                 s
             })
+            .filter(|s| s.len() >= CF_LEN)
             .filter(|s| s.as_slice() > a && s.as_slice() < b && !b.starts_with(s))
             .map(|s| s.len())
             .min()
@@ -366,6 +398,17 @@ mod tests {
             ),
             Some(first_of_id(&[0, 0, 0, 1]))
         );
+        // Column families that differ in a high byte: the cut moves down to
+        // the last cf byte, so the result is still a whole internal key.
+        let s = separator(
+            &encode(0, b"x", 1, Kind::Put),
+            &encode(0x200, b"a", 1, Kind::Put),
+        );
+        assert_eq!(s, Some(first_of_id(&[0, 0, 0, 1])));
+        assert!(parse(&s.unwrap()).is_some());
+        // Out of order: no separator, and no panic.
+        assert_eq!(separator(&k(b"ab"), &k(b"a")), None);
+        assert_eq!(separator(&k(b"b"), &k(b"a")), None);
     }
 
     #[test]
