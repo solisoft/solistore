@@ -42,21 +42,32 @@ pub fn log_records(data: &[u8]) {
 
 /// A WAL record's payload: a write batch.
 pub fn write_batch(data: &[u8]) {
+    // Applied to a memtable, as replaying the WAL does.
     if let Ok(batch) = batch::decode(data) {
-        for op in &batch.ops {
-            let _ = op;
+        let mem = crate::memtable::Memtable::new(1);
+        for (seq, op) in (batch.first_seq..).zip(&batch.ops) {
+            match *op {
+                batch::BatchOp::Put { cf, key, value } => {
+                    mem.insert_entry(cf, key, seq, key::Kind::Put, value)
+                }
+                batch::BatchOp::Delete { cf, key } => {
+                    mem.insert_entry(cf, key, seq, key::Kind::Delete, b"")
+                }
+                batch::BatchOp::DeleteRange { cf, start, end } => {
+                    mem.insert_range_tombstone(cf, start, end, seq)
+                }
+            }
         }
+        let _ = mem.get(0, b"k", u64::MAX);
     }
 }
 
-/// A MANIFEST record's payload: version edits, applied to a new state.
+/// MANIFEST records' payloads: the new database's snapshot, then the
+/// input's pieces, replayed and checked as an open does.
 pub fn version_edits(data: &[u8]) {
-    if let Ok(edits) = manifest::decode_edits(data) {
-        let mut state = manifest::ManifestState::new_database();
-        for edit in &edits {
-            state.apply(edit);
-        }
-        // What an open does with the state next.
+    let snapshot = manifest::encode_edits(&manifest::ManifestState::new_database().snapshot());
+    let records = std::iter::once(&snapshot[..]).chain(pieces(data));
+    if let Ok(state) = manifest::replay(records) {
         let _ = state.snapshot();
     }
 }
@@ -120,7 +131,11 @@ pub fn table(data: &[u8]) {
     it.seek_ge(&key::first_of(0, b""));
     let mut n = 0;
     while it.valid() && n < 10_000 {
-        let _ = reader.get(0, &it.key()[..it.key().len().min(4)], u64::MAX);
+        // Read back what the iterator found, through the bloom filter and
+        // the index.
+        if let Some(p) = key::parse(it.key()) {
+            let _ = reader.get(p.cf, p.user_key, p.seq);
+        }
         it.next();
         n += 1;
     }

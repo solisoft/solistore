@@ -162,8 +162,9 @@ pub fn parse(key: &[u8]) -> Option<Parsed<'_>> {
 ///
 /// Total over any bytes: a key shorter than a trailer, which only a corrupt
 /// block or MANIFEST holds, is all identity and no trailer. [`compare`]
-/// stays a total order on such keys, and [`parse`] reports them, instead of
-/// a slice out of bounds in the middle of a seek (found by fuzzing).
+/// stays a total order on such keys, equal only for equal bytes, and
+/// [`parse`] reports them, instead of a slice out of bounds in the middle
+/// of a seek (found by fuzzing).
 pub fn cf_and_user_key(key: &[u8]) -> &[u8] {
     &key[..key.len().saturating_sub(TRAILER_LEN)]
 }
@@ -179,6 +180,10 @@ pub fn compare(a: &[u8], b: &[u8]) -> Ordering {
     cf_and_user_key(a)
         .cmp(cf_and_user_key(b))
         .then_with(|| trailer(b).cmp(&trailer(a)))
+        // Only a key shorter than a trailer ties with a different one
+        // (`abc` and `abc` followed by a zero trailer); well-formed keys
+        // that tie are equal and of one length.
+        .then_with(|| a.len().cmp(&b.len()))
 }
 
 #[cfg(test)]
@@ -385,6 +390,9 @@ mod tests {
             assert_eq!(compare(&w[0], &w[1]), compare(&w[1], &w[0]).reverse());
         }
         assert_eq!(compare(b"abc", b"abc"), Ordering::Equal);
+        // Equal only for equal bytes, even against a zero trailer.
+        let padded = [&b"abc"[..], &[0; TRAILER_LEN]].concat();
+        assert_ne!(compare(b"abc", &padded), Ordering::Equal);
         assert!(keys
             .iter()
             .filter(|k| k.len() < MIN_LEN)

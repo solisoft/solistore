@@ -353,20 +353,35 @@ pub fn read(fs: &dyn Fs, dir: &Path, no: u64) -> Result<ManifestState> {
             manifest_name(no)
         )));
     }
+    let mut state = replay(log.records)?;
+    state.next_file = state.next_file.max(no + 1);
+    Ok(state)
+}
+
+/// The state a MANIFEST's records describe, checked as `read` needs it.
+pub fn replay<'a>(records: impl IntoIterator<Item = &'a [u8]>) -> Result<ManifestState> {
     let mut state = ManifestState::empty();
-    for record in log.records {
+    for record in records {
         for edit in decode_edits(record)? {
             state.apply(&edit);
         }
     }
-    state.next_file = state.next_file.max(no + 1);
     // Every database has its default column family, and callers rely on
-    // it (`Db::default_cf`): a MANIFEST that dropped it was not written by
-    // this crate.
-    if !state.cfs.values().any(|name| name == DEFAULT_CF) {
+    // it (`Db::default_cf`), and column families are found by name: a
+    // MANIFEST without it, or with a name twice, was not written by this
+    // crate (found by fuzzing: the first opened, then `default_cf`
+    // panicked).
+    let mut names = std::collections::HashSet::new();
+    for name in state.cfs.values() {
+        if !names.insert(name.as_str()) {
+            return Err(Error::Corruption(format!(
+                "column family {name:?} appears twice"
+            )));
+        }
+    }
+    if !names.contains(DEFAULT_CF) {
         return Err(Error::Corruption(format!(
-            "{} has no {DEFAULT_CF:?} column family",
-            manifest_name(no)
+            "no {DEFAULT_CF:?} column family"
         )));
     }
     Ok(state)
@@ -452,6 +467,24 @@ mod tests {
             Err(Error::Corruption(why)) => assert!(why.contains("default"), "{why}"),
             other => panic!("expected corruption, got {:?}", other.map(|s| s.cfs)),
         }
+    }
+
+    /// Column families are found by name: two with one name would shadow
+    /// each other's data.
+    #[test]
+    fn a_column_family_name_twice_is_corrupt() {
+        let fs = FaultFs::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let mut writer =
+            ManifestWriter::install(&fs, dir, 1, &ManifestState::new_database()).unwrap();
+        writer
+            .append(&[Edit::CreateCf {
+                id: 5,
+                name: DEFAULT_CF.into(),
+            }])
+            .unwrap();
+        assert!(matches!(read(&fs, dir, 1), Err(Error::Corruption(_))));
     }
 
     #[test]
