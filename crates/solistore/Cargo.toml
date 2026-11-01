@@ -26,6 +26,13 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# The commit queue's model checks: RUSTFLAGS="--cfg loom" cargo test --lib loom.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
 [dev-dependencies]
 proptest = "1"
 rand = "0.8"
