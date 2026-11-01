@@ -577,6 +577,16 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    /// A test size, smaller under Miri, which runs ~1000x slower: still
+    /// enough to cross blocks and chunks, and to interleave threads.
+    fn scaled(full: u32, miri: u32) -> u32 {
+        if cfg!(miri) {
+            miri
+        } else {
+            full
+        }
+    }
+
     // Every cursor in these tests comes from the list it is read with.
     fn key(list: &SkipList, c: Cursor) -> Vec<u8> {
         unsafe { list.key(c) }.to_vec()
@@ -599,7 +609,8 @@ mod tests {
     fn entries_come_back_in_key_order() {
         let list = SkipList::new();
         assert!(list.is_empty());
-        let mut keys: Vec<u32> = (0..2000).map(|i| (i * 7919) % 2000).collect();
+        let n = scaled(2000, 300);
+        let mut keys: Vec<u32> = (0..n).map(|i| (i * 7919) % n).collect();
         for &i in &keys {
             assert!(list.insert(&[&ik(i)], format!("v{i}").as_bytes()));
         }
@@ -610,7 +621,7 @@ mod tests {
             .map(|&i| (ik(i), format!("v{i}").into_bytes()))
             .collect();
         assert_eq!(got, want);
-        assert_eq!(key(&list, list.last().unwrap()), ik(1999));
+        assert_eq!(key(&list, list.last().unwrap()), ik(n - 1));
     }
 
     #[test]
@@ -635,12 +646,13 @@ mod tests {
     fn seeks_agree_with_a_sorted_map() {
         let list = SkipList::new();
         let mut model = BTreeMap::new();
-        for i in (0..3000u32).step_by(3) {
+        let n = scaled(3000, 300);
+        for i in (0..n).step_by(3) {
             list.insert(&[&ik(i)], &[]);
             model.insert(i, ());
         }
         let key_at = |c: Option<Cursor>| c.map(|c| key(&list, c));
-        for probe in 0..3005u32 {
+        for probe in 0..n + 5 {
             let t = ik(probe);
             let ge = model.range(probe..).next().map(|(&i, _)| ik(i));
             let le = model.range(..=probe).next_back().map(|(&i, _)| ik(i));
@@ -663,12 +675,16 @@ mod tests {
             LARGE - 1,
             LARGE + 1,
             BLOCK,
-            3 * MAX_CHUNK,
+            // Its own chunk, past the largest size (smaller under Miri).
+            scaled(3 * MAX_CHUNK as u32, MAX_CHUNK as u32 + 8) as usize,
         ]
         .into_iter()
         .enumerate()
         {
-            let value: Vec<u8> = (0..len).map(|b| (b * 31 + i) as u8).collect();
+            let mut value = vec![i as u8; len];
+            if let Some(last) = value.last_mut() {
+                *last = 0xa5;
+            }
             list.insert(&[&ik(i as u32)], &value);
             let c = list.seek_ge(&ik(i as u32)).unwrap();
             assert_eq!(self::value(&list, c), value, "len {len}");
@@ -689,7 +705,7 @@ mod tests {
         // per block taken.
         let list = SkipList::new();
         let mut least = 0;
-        for i in 0..50_000u32 {
+        for i in 0..scaled(50_000, 2_000) {
             list.insert(&[&ik(i)], &[7; 100]);
             least += node_size(1, ik(i).len(), 100);
         }
@@ -700,7 +716,7 @@ mod tests {
 
     #[test]
     fn heights_follow_a_branching_of_four() {
-        let n = 100_000;
+        let n = scaled(100_000, 20_000) as usize;
         let total: usize = (0..n).map(|_| random_height()).sum();
         let mean = total as f64 / n as f64;
         assert!((1.28..1.39).contains(&mean), "mean height {mean}");
@@ -711,8 +727,8 @@ mod tests {
     #[test]
     fn concurrent_inserts_and_readers() {
         let list = Arc::new(SkipList::new());
-        let threads = 8u32;
-        let per = 5000u32;
+        let threads = scaled(8, 4);
+        let per = scaled(5000, 150);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let readers: Vec<_> = (0..2)
             .map(|_| {
@@ -764,7 +780,7 @@ mod tests {
     fn a_seek_is_not_fooled_by_a_neighbour_inserted_meanwhile() {
         use std::sync::atomic::AtomicU32;
         let list = Arc::new(SkipList::new());
-        let n = 200_000u32;
+        let n = scaled(200_000, 1_500);
         for i in 0..=n {
             list.insert(&[&ik(i * 4)], b"");
         }
@@ -804,7 +820,7 @@ mod tests {
         }
         stop.store(true, Relaxed);
         let seeks: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
-        assert!(seeks > 1000, "{seeks} seeks");
+        assert!(seeks > scaled(1000, 3) as u64, "{seeks} seeks");
         assert_eq!(list.iter().count(), 4 * n as usize + 1);
     }
 
@@ -812,10 +828,12 @@ mod tests {
     /// cap, and the next lists reuse them with their own contents.
     #[test]
     fn chunks_go_back_to_a_bounded_pool_and_are_reused() {
-        for round in 0..6u32 {
+        // Under Miri, two rounds of just enough data to reach a full-size
+        // chunk (they double from 64 KiB to 4 MiB).
+        for round in 0..scaled(6, 2) {
             let list = SkipList::new();
             let value = vec![round as u8; 1000];
-            for i in 0..30_000u32 {
+            for i in 0..scaled(30_000, 9_000) {
                 list.insert(&[&ik(i)], &value);
             }
             assert!(list.iter().all(|(_, v)| v == &value[..]), "round {round}");
@@ -828,13 +846,14 @@ mod tests {
     #[test]
     fn interleaved_lists_keep_their_own_blocks() {
         let (a, b) = (SkipList::new(), SkipList::new());
-        for i in 0..5000u32 {
+        let n = scaled(5000, 500);
+        for i in 0..n {
             a.insert(&[&ik(i)], b"a");
             b.insert(&[&ik(i)], b"b");
         }
         drop(b);
         let c = SkipList::new();
-        for i in 0..5000u32 {
+        for i in 0..n {
             c.insert(&[&ik(i)], b"c");
         }
         assert!(a.iter().all(|(_, v)| v == b"a"));
@@ -842,6 +861,6 @@ mod tests {
         // per insert (that was 32 KiB each, 160 MB here).
         assert!(a.memory_usage() < 1 << 20, "{}", a.memory_usage());
         assert!(c.iter().all(|(_, v)| v == b"c"));
-        assert_eq!(a.iter().count(), 5000);
+        assert_eq!(a.iter().count(), n as usize);
     }
 }
