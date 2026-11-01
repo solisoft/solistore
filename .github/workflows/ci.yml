@@ -74,6 +74,18 @@ jobs:
       - run: cargo check --all-targets --target ${{ matrix.target }}
         if: matrix.target == 'x86_64-unknown-linux-musl'
 
+  # loom on the commit path's two protocols (crates/solistore/src/
+  # commit_queue.rs): leader election and publication, under every
+  # interleaving of a few writers.
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release -p solistore --lib loom_tests
+        env:
+          RUSTFLAGS: --cfg loom
+
   # Miri on the tests that cover the unsafe code: the memtable's skiplist
   # and arena, and the cursor reads through it. Undefined behaviour, a data
   # race or a leak fails the job. Sizes are scaled down under cfg(miri).

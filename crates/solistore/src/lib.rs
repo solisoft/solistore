@@ -10,6 +10,7 @@
 
 mod batch;
 mod coding;
+mod commit_queue;
 mod compaction;
 mod db;
 mod error;
@@ -25,6 +26,7 @@ mod manifest;
 mod memtable;
 mod skiplist;
 mod sst;
+mod sync;
 mod version;
 
 pub use batch::WriteBatch;
