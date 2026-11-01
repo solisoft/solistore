@@ -242,6 +242,9 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
 - `loom` checks the commit path's leader election and publication
   (`commit_queue.rs`, extracted from `db.rs` for it), memtable switch
   included.
-- Windows: `StdFs::sync_dir` is a no-op there and `start_writeback` does
-  nothing; the CI cross-check compiles and runs the tests on Windows, but
-  no crash test has run on NTFS.
+- Windows: `StdFs::sync_dir` flushes the directory (`FlushFileBuffers` on
+  a handle opened with `FILE_FLAG_BACKUP_SEMANTICS`; a file system without
+  it, FAT or some shares, is left as before). CI runs the crash test on
+  NTFS, 20 process kills: recovery is checked there, power loss is not.
+  `start_writeback` is still nothing on Windows (an optimisation, off by
+  default).

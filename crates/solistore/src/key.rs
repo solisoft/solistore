@@ -166,7 +166,10 @@ pub fn parse(key: &[u8]) -> Option<Parsed<'_>> {
 /// [`parse`] reports them, instead of a slice out of bounds in the middle
 /// of a seek (found by fuzzing).
 pub fn cf_and_user_key(key: &[u8]) -> &[u8] {
-    &key[..key.len().saturating_sub(TRAILER_LEN)]
+    match key.len().checked_sub(TRAILER_LEN) {
+        Some(end) => &key[..end],
+        None => key,
+    }
 }
 
 fn trailer(key: &[u8]) -> u64 {
@@ -390,6 +393,10 @@ mod tests {
             assert_eq!(compare(&w[0], &w[1]), compare(&w[1], &w[0]).reverse());
         }
         assert_eq!(compare(b"abc", b"abc"), Ordering::Equal);
+        // Short keys of one length are as different as their bytes: their
+        // identity is all of them, not nothing.
+        assert_eq!(compare(b"abc", b"xyz"), Ordering::Less);
+        assert_ne!(cf_and_user_key(b"abc"), cf_and_user_key(b"xyz"));
         // Equal only for equal bytes, even against a zero trailer.
         let padded = [&b"abc"[..], &[0; TRAILER_LEN]].concat();
         assert_ne!(compare(b"abc", &padded), Ordering::Equal);

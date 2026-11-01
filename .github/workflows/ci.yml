@@ -74,6 +74,28 @@ jobs:
       - run: cargo check --all-targets --target ${{ matrix.target }}
         if: matrix.target == 'x86_64-unknown-linux-musl'
 
+  # The benchmark's crash test on NTFS: a writer committing fsynced
+  # batches is killed (TerminateProcess) mid-write, twenty times, and the
+  # reopened database must hold every acknowledged batch, none of them in
+  # part. bench/gate.sh runs the same test a hundred times on Linux. A
+  # process kill keeps the OS cache: it tests recovery on NTFS, not what
+  # a power loss would take (the syncs in StdFs are for that).
+  crash-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --manifest-path bench/Cargo.toml --no-default-features --features solistore
+      - shell: bash
+        run: |
+          for i in $(seq 1 20); do
+            out=$(bench/target/release/engine-bench.exe crash --engine solistore \
+              --label "ntfs-$i" --dir "$RUNNER_TEMP/crash" --secs 3 --sx-buffer-mb 2)
+            echo "$out"
+            echo "$out" | grep -q '"lost_acked":0,' || { echo "acknowledged batches lost"; exit 1; }
+            echo "$out" | grep -q '"torn_batch":false' || { echo "a batch applied in part"; exit 1; }
+          done
+
   # loom on the commit path's two protocols (crates/solistore/src/
   # commit_queue.rs): leader election and publication, under every
   # interleaving of a few writers.

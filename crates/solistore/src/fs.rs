@@ -185,6 +185,8 @@ impl Fs for StdFs {
         path.exists()
     }
 
+    // Durable once the directory is synced, which every caller does next
+    // (on Windows too, see `sync_dir`).
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
     }
@@ -200,7 +202,8 @@ impl Fs for StdFs {
             return Ok(());
         }
         std::fs::copy(from, to)?;
-        File::open(to)?.sync_all()
+        // A write handle: Windows flushes no file through a read-only one.
+        OpenOptions::new().write(true).open(to)?.sync_all()
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {
@@ -212,8 +215,41 @@ impl Fs for StdFs {
         File::open(dir)?.sync_all()
     }
 
-    // Windows cannot open a directory as a file; NTFS journals its metadata.
-    #[cfg(not(unix))]
+    /// NTFS journals a directory's entries, but the journal reaches the
+    /// disk on its own schedule: a file created or renamed just before a
+    /// power loss could be missing after it. A directory opened with
+    /// `FILE_FLAG_BACKUP_SEMANTICS` takes `FlushFileBuffers`, which writes
+    /// its entries out, as an fsync of the directory does on Unix.
+    ///
+    /// A file system with nothing of the kind (FAT, some network shares and
+    /// filter drivers) answers that the call is not supported: nothing more
+    /// can be made durable there, as before, and it is not an error. Any
+    /// other failure is.
+    #[cfg(windows)]
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const ERROR_INVALID_FUNCTION: i32 = 1;
+        const ERROR_NOT_SUPPORTED: i32 = 50;
+        let flushed = OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+            .and_then(|d| d.sync_all());
+        match flushed {
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED)
+                ) =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
         Ok(())
     }
@@ -620,6 +656,36 @@ impl Fs for FaultFs {
 
     fn lock(&self, _path: &Path) -> io::Result<Box<dyn Send + Sync>> {
         Ok(Box::new(()))
+    }
+}
+
+#[cfg(test)]
+mod std_fs_tests {
+    use super::*;
+
+    /// On every platform CI runs: on Windows, a directory takes
+    /// FlushFileBuffers through FILE_FLAG_BACKUP_SEMANTICS, and a rename
+    /// replaces its target.
+    #[test]
+    fn a_directory_syncs_and_a_rename_replaces_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = StdFs;
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        let f = fs.create(&a).unwrap();
+        f.append(b"new").unwrap();
+        f.sync().unwrap();
+        std::fs::write(&b, b"old").unwrap();
+        fs.rename(&a, &b).unwrap();
+        fs.sync_dir(dir.path()).unwrap();
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&b).unwrap(), b"new");
+        // `reuse` renames too, then writes the file again from its start.
+        let c = dir.path().join("c");
+        let w = fs.reuse(&b, &c).unwrap();
+        w.append(b"N").unwrap();
+        w.sync().unwrap();
+        fs.sync_dir(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&c).unwrap(), b"New");
     }
 }
 
