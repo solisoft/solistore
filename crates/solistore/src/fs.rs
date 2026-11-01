@@ -70,50 +70,6 @@ pub trait Fs: Send + Sync + fmt::Debug {
 
 // ---------------------------------------------------------------- StdFs
 
-/// Rename `from` to `to`, replacing it. On Windows with
-/// `MOVEFILE_WRITE_THROUGH`, so the rename is on the disk when this returns:
-/// `std::fs::rename` does not ask for it, and NTFS would otherwise write the
-/// change out later. Elsewhere the directory's fsync makes it durable.
-#[cfg(windows)]
-fn rename_durably(from: &Path, to: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-    // NUL-terminated, and refused with a NUL inside, as std does: the call
-    // would stop at it and rename some other path.
-    let wide = |p: &Path| -> io::Result<Vec<u16>> {
-        let w: Vec<u16> = p.as_os_str().encode_wide().collect();
-        if w.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a NUL in a path",
-            ));
-        }
-        Ok(w.into_iter().chain([0]).collect())
-    };
-    let (from, to) = (wide(from)?, wide(to)?);
-    // SAFETY: both paths are NUL-terminated wide strings that outlive the
-    // call; the function reads them and nothing else.
-    let done = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if done == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(windows))]
-fn rename_durably(from: &Path, to: &Path) -> io::Result<()> {
-    std::fs::rename(from, to)
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StdFs;
 
@@ -229,12 +185,14 @@ impl Fs for StdFs {
         path.exists()
     }
 
+    // Durable once the directory is synced, which every caller does next
+    // (on Windows too, see `sync_dir`).
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        rename_durably(from, to)
+        std::fs::rename(from, to)
     }
 
     fn reuse(&self, from: &Path, to: &Path) -> io::Result<Arc<dyn WritableFile>> {
-        rename_durably(from, to)?;
+        std::fs::rename(from, to)?;
         let file = OpenOptions::new().write(true).open(to)?;
         Ok(Arc::new(StdFile(file)))
     }
@@ -244,7 +202,8 @@ impl Fs for StdFs {
             return Ok(());
         }
         std::fs::copy(from, to)?;
-        File::open(to)?.sync_all()
+        // A write handle: Windows flushes no file through a read-only one.
+        OpenOptions::new().write(true).open(to)?.sync_all()
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {
@@ -261,15 +220,33 @@ impl Fs for StdFs {
     /// power loss could be missing after it. A directory opened with
     /// `FILE_FLAG_BACKUP_SEMANTICS` takes `FlushFileBuffers`, which writes
     /// its entries out, as an fsync of the directory does on Unix.
+    ///
+    /// A file system with nothing of the kind (FAT, some network shares and
+    /// filter drivers) answers that the call is not supported: nothing more
+    /// can be made durable there, as before, and it is not an error. Any
+    /// other failure is.
     #[cfg(windows)]
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        OpenOptions::new()
+        const ERROR_INVALID_FUNCTION: i32 = 1;
+        const ERROR_NOT_SUPPORTED: i32 = 50;
+        let flushed = OpenOptions::new()
             .write(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(dir)?
-            .sync_all()
+            .open(dir)
+            .and_then(|d| d.sync_all());
+        match flushed {
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED)
+                ) =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -688,7 +665,7 @@ mod std_fs_tests {
 
     /// On every platform CI runs: on Windows, a directory takes
     /// FlushFileBuffers through FILE_FLAG_BACKUP_SEMANTICS, and a rename
-    /// with MOVEFILE_WRITE_THROUGH replaces its target.
+    /// replaces its target.
     #[test]
     fn a_directory_syncs_and_a_rename_replaces_its_target() {
         let dir = tempfile::tempdir().unwrap();

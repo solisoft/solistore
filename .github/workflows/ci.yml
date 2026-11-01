@@ -77,7 +77,9 @@ jobs:
   # The benchmark's crash test on NTFS: a writer committing fsynced
   # batches is killed (TerminateProcess) mid-write, twenty times, and the
   # reopened database must hold every acknowledged batch, none of them in
-  # part. bench/gate.sh runs the same test a hundred times on Linux.
+  # part. bench/gate.sh runs the same test a hundred times on Linux. A
+  # process kill keeps the OS cache: it tests recovery on NTFS, not what
+  # a power loss would take (the syncs in StdFs are for that).
   crash-windows:
     runs-on: windows-latest
     steps:
