@@ -11,10 +11,7 @@
 //! newest first, and the first entry at or after `(cf, key, snapshot)` is the
 //! version a reader at `snapshot` sees.
 
-use std::borrow::Borrow;
 use std::cmp::Ordering;
-
-use bytes::Bytes;
 
 /// Sequence numbers are 56 bits (the trailer keeps 8 for the kind). They
 /// start at 1, so 0 sorts after every real version of a key.
@@ -175,54 +172,6 @@ pub fn compare(a: &[u8], b: &[u8]) -> Ordering {
     cf_and_user_key(a)
         .cmp(cf_and_user_key(b))
         .then_with(|| trailer(b).cmp(&trailer(a)))
-}
-
-/// A borrowed internal key that orders with [`compare`], so a sorted map of
-/// [`MemKey`] can be searched with a plain slice.
-#[derive(Debug, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct KeyRef([u8]);
-
-impl KeyRef {
-    pub fn new(key: &[u8]) -> &KeyRef {
-        // SAFETY: KeyRef is a repr(transparent) wrapper around [u8], so the
-        // two have the same layout and the cast preserves the lifetime.
-        unsafe { &*(key as *const [u8] as *const KeyRef) }
-    }
-}
-
-impl Ord for KeyRef {
-    fn cmp(&self, other: &Self) -> Ordering {
-        compare(&self.0, &other.0)
-    }
-}
-
-impl PartialOrd for KeyRef {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// An owned internal key, as the memtable stores it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemKey(pub Bytes);
-
-impl Borrow<KeyRef> for MemKey {
-    fn borrow(&self) -> &KeyRef {
-        KeyRef::new(&self.0)
-    }
-}
-
-impl Ord for MemKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        compare(&self.0, &other.0)
-    }
-}
-
-impl PartialOrd for MemKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 #[cfg(test)]

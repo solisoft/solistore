@@ -14,7 +14,6 @@ categories = ["database-implementations"]
 arc-swap = "1"
 bytes = "1"
 crc32c = "0.6"
-crossbeam-skiplist = "0.1"
 # Block-format LZ4, pure Rust. Without the default `safe-*` features it uses
 # its faster unchecked paths; input is checksummed before it is decoded.
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }

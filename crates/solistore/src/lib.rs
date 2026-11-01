@@ -20,6 +20,7 @@ mod key;
 mod log;
 mod manifest;
 mod memtable;
+mod skiplist;
 mod sst;
 mod version;
 

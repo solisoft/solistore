@@ -220,16 +220,19 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
   file). The index's real cost is that its entries share no prefix
   (restart interval 1): at interval 16 it falls to 3.2% of the file, at
   some point-read CPU still to be measured.
-- The memtable's real footprint is above what it counts: a skiplist node
-  costs ~112 bytes, counted as 32 to flush as often as RocksDB. On write
-  phases at 5M documents, peak RSS is 1.05x RocksDB's.
+- The memtable counts what it holds. Its skiplist keeps each node's
+  links, key and value in one arena allocation (~22 bytes of overhead)
+  where the crossbeam one cost ~112 bytes per entry counted as 32. A
+  64 MiB memtable of the bench's key mix holds 369k entries (374k before:
+  flushes are as frequent) in 68 MB of RSS instead of 104 MB. On the
+  quick bench (1M documents), peak RSS is 0.88-0.97x what it was; peak
+  RSS at 5M against RocksDB (1.05x before) is to be measured again.
 - Level targets are dynamic (RocksDB's `level_compaction_dynamic_level_bytes`,
   on by default): at 5M documents the load ran 17% faster with a third less
   compaction writing (write amplification 2.57 against 3.06), scans 25% and
   updates 17% faster, and the database ended 17% smaller on disk (1,188 MB
   against 1,425 MB).
-- Not done from the plan: the arena skiplist proper
-  (entries are arena-backed, nodes are not), `loom` on the commit path,
+- Not done from the plan: `loom` on the commit path,
   Miri on the `unsafe` (one cast, one `sync_file_range` call), fuzzing of
   the decoders.
 - Windows: `StdFs::sync_dir` is a no-op there and `start_writeback` does
