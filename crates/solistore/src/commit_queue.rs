@@ -160,7 +160,6 @@ impl<T, S: Clone> Leadership<'_, T, S> {
     /// Give each member `slot(index, ticket)`, free the leader's place for
     /// the next group, and return the leader's own slot (index 0).
     pub fn finish(mut self, mut slot: impl FnMut(usize, &Ticket<T, S>) -> S) -> S {
-        self.finished = true;
         let mut mine = None;
         let mut queue = self.queue.state.lock();
         for (i, ticket) in self.group.iter().enumerate() {
@@ -172,6 +171,10 @@ impl<T, S: Clone> Leadership<'_, T, S> {
                 ticket.ready.store(true, Ordering::Release);
             }
         }
+        // Only now: should `slot` panic, the drop still frees the leader's
+        // place and tells every member (the queue lock, a local here, is
+        // released first by the unwinding).
+        self.finished = true;
         queue.leader_active = false;
         self.queue.leader_busy.store(false, Ordering::Release);
         drop(queue);
