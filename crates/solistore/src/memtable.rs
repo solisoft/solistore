@@ -10,46 +10,27 @@
 //! dropped collection or database, so there are few of them, and a point
 //! lookup can afford to scan them.
 
-use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use crossbeam_skiplist::map::Entry;
-use crossbeam_skiplist::SkipMap;
 use parking_lot::RwLock;
 
 use crate::error::Result;
 use crate::iter::InternalIterator;
-use crate::key::{self, KeyRef, Kind, MemKey};
+use crate::key::{self, Kind};
+use crate::skiplist::{Cursor, SkipList};
 
-/// What an entry counts toward the write buffer on top of its key and
-/// value bytes (which live in a writer's arena chunk, see [`arena_copy`]).
-///
-/// Its real cost is higher: a crossbeam skiplist node with two `Bytes`
-/// handles is ~112 bytes after allocator rounding. Counting that made a
-/// 64 MiB memtable hold ~30% fewer entries than RocksDB's, which counts
-/// ~30 bytes of overhead per entry, so it flushed 45% more often. Each
-/// extra level-0 file meant another L0->L1 compaction rewriting all of L1.
-/// On SoliDB's update phase (1M documents), compaction writes went from
-/// 757 to 515 bytes per update and throughput up 5%. The memtables' real
-/// footprint is then up to ~1.3x the write buffer size.
-const ENTRY_OVERHEAD: usize = 32;
-
-/// Size of the chunks writers copy keys and values into.
-const ARENA_CHUNK: usize = 1 << 20;
-
-thread_local! {
-    static ARENA: std::cell::RefCell<bytes::BytesMut> = std::cell::RefCell::new(bytes::BytesMut::new());
-}
+/// What a range tombstone counts toward the write buffer on top of its
+/// bounds. Entries count exactly what their skiplist node takes.
+const TOMBSTONE_OVERHEAD: usize = std::mem::size_of::<RangeTombstone>();
 
 /// A value handed out by a point lookup, as its own allocation when it is a
 /// small part of the buffer it slices (`backing` bytes).
 ///
 /// A `Bytes` slice keeps its whole buffer alive: a 250-byte document read
-/// from a table pinned its 4 KiB decoded block, and one read from a memtable
-/// its 1 MiB arena chunk, for as long as the caller held it — past the
-/// block's eviction from the cache and past the memtable's flush. A
+/// from a table pinned its 4 KiB decoded block for as long as the caller
+/// held it — past the block's eviction from the cache. A
 /// `multi_get` of 5,000 documents held ~3,600 blocks that way until the
 /// query ended; with 64 such queries in flight SoliDB's live heap was
 /// ~450 MB above RocksDB's, whose bindings copy every value out. Copying a
@@ -61,23 +42,6 @@ pub(crate) fn detach(value: Bytes, backing: usize) -> Bytes {
     } else {
         value
     }
-}
-
-/// Copy `len` bytes, written by `fill`, into this thread's arena chunk and
-/// return them as one shared buffer. Entries are then slices of it: one
-/// allocation per megabyte instead of two per entry. Allocations were most
-/// of a memtable's real size for SoliDB's small index entries, which made
-/// memtables flush with little data in them and level 0 compact over and
-/// over.
-pub fn arena_copy(len: usize, fill: impl FnOnce(&mut bytes::BytesMut)) -> Bytes {
-    ARENA.with(|arena| {
-        let mut arena = arena.borrow_mut();
-        if arena.capacity() - arena.len() < len {
-            *arena = bytes::BytesMut::with_capacity(len.max(ARENA_CHUNK));
-        }
-        fill(&mut arena);
-        arena.split().freeze()
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,12 +83,15 @@ pub struct Version {
 }
 
 pub struct Memtable {
-    map: SkipMap<MemKey, Bytes>,
+    /// Keys, values and nodes, all in the list's arena, which counts what
+    /// it hands out.
+    map: SkipList,
     tombstones: RwLock<Vec<RangeTombstone>>,
     /// `tombstones` is not empty. Lets every point read skip the lock: a
     /// read lock is a write to a shared cache line, on every get.
     has_tombstones: AtomicBool,
-    size: AtomicUsize,
+    /// Bytes held by range tombstones; entries are counted by `map`.
+    tombstone_bytes: AtomicUsize,
     /// The highest sequence number inserted.
     max_seq: AtomicU64,
     /// The first WAL file holding any of this memtable's writes: once it is
@@ -135,10 +102,10 @@ pub struct Memtable {
 impl Memtable {
     pub fn new(first_wal: u64) -> Self {
         Memtable {
-            map: SkipMap::new(),
+            map: SkipList::new(),
             tombstones: RwLock::new(Vec::new()),
             has_tombstones: AtomicBool::new(false),
-            size: AtomicUsize::new(0),
+            tombstone_bytes: AtomicUsize::new(0),
             max_seq: AtomicU64::new(0),
             first_wal,
         }
@@ -155,38 +122,33 @@ impl Memtable {
 
     #[cfg(test)]
     pub fn insert(&self, cf: u32, key: &[u8], seq: u64, kind: Kind, value: &[u8]) {
-        let bytes = self.insert_entry(cf, key, seq, kind, value);
-        self.account(bytes, seq);
+        self.insert_entry(cf, key, seq, kind, value);
+        self.account(seq);
     }
 
-    /// Insert without updating the shared size and sequence counters;
-    /// returns the bytes to [`Memtable::account`] for. Writers inserting a
-    /// batch account once for all of it: eight writers bumping the same two
-    /// atomics for every entry would bounce their cache line between cores.
-    #[cfg(test)]
-    pub fn insert_entry(&self, cf: u32, key: &[u8], seq: u64, kind: Kind, value: &[u8]) -> usize {
-        let encoded = MemKey(Bytes::from(key::encode(cf, key, seq, kind)));
-        self.map.insert(encoded, Bytes::copy_from_slice(value));
-        key.len() + value.len() + ENTRY_OVERHEAD
+    /// Insert without updating the highest sequence number, which
+    /// [`Memtable::account`] does once for a whole batch: eight writers
+    /// bumping the same atomic for every entry would bounce its cache line
+    /// between cores. The arena counts the entry's size in the writer's
+    /// shard.
+    pub fn insert_entry(&self, cf: u32, key: &[u8], seq: u64, kind: Kind, value: &[u8]) {
+        // A batch never repeats a sequence number, so the key is new.
+        self.map.insert(
+            &[&cf.to_be_bytes(), key, &key::trailer_bytes(seq, kind)],
+            value,
+        );
     }
 
-    /// Insert an entry whose encoded key and value are already slices of an
-    /// arena buffer; returns its size for [`Memtable::account`].
-    pub fn insert_shared(&self, encoded_key: Bytes, value: Bytes) -> usize {
-        let bytes = encoded_key.len() + value.len() + ENTRY_OVERHEAD;
-        self.map.insert(MemKey(encoded_key), value);
-        bytes
-    }
-
-    pub fn account(&self, bytes: usize, max_seq: u64) {
-        self.size.fetch_add(bytes, Ordering::Relaxed);
+    pub fn account(&self, max_seq: u64) {
         self.max_seq.fetch_max(max_seq, Ordering::Relaxed);
     }
 
     pub fn insert_range_tombstone(&self, cf: u32, start: &[u8], end: &[u8], seq: u64) {
         self.max_seq.fetch_max(seq, Ordering::Relaxed);
-        self.size
-            .fetch_add(start.len() + end.len() + ENTRY_OVERHEAD, Ordering::Relaxed);
+        self.tombstone_bytes.fetch_add(
+            start.len() + end.len() + TOMBSTONE_OVERHEAD,
+            Ordering::Relaxed,
+        );
         self.has_tombstones.store(true, Ordering::Release);
         self.tombstones.write().push(RangeTombstone {
             cf,
@@ -196,9 +158,12 @@ impl Memtable {
         });
     }
 
-    /// Approximate memory held, in bytes.
+    /// Memory held, in bytes: what the arena handed out for entries
+    /// (padding and lost tails included) and the range tombstones. Not
+    /// counted: what the arena's open blocks still hold in reserve, at most
+    /// 512 KiB.
     pub fn approximate_size(&self) -> usize {
-        self.size.load(Ordering::Relaxed)
+        self.map.memory_usage() + self.tombstone_bytes.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -208,12 +173,15 @@ impl Memtable {
     /// The newest version of `key` with a sequence number at most `snapshot`.
     pub fn get(&self, cf: u32, key: &[u8], snapshot: u64) -> Option<Version> {
         let probe = key::at_snapshot(cf, key, snapshot);
-        let entry = self.map.lower_bound(Bound::Included(KeyRef::new(&probe)))?;
-        let found = key::parse(&entry.key().0)?;
+        let at = self.map.seek_ge(&probe)?;
+        // SAFETY: `at` comes from `self.map`.
+        let found = key::parse(unsafe { self.map.key(at) })?;
+        // A copy, as RocksDB's bindings make: a slice of the arena would
+        // keep the whole memtable alive past its flush.
         (found.cf == cf && found.user_key == key).then(|| Version {
             seq: found.seq,
             kind: found.kind,
-            value: detach(entry.value().clone(), ARENA_CHUNK),
+            value: Bytes::copy_from_slice(unsafe { self.map.value(at) }),
         })
     }
 
@@ -232,73 +200,70 @@ impl Memtable {
     }
 
     /// Every entry in order, for a flush.
-    pub fn entries(&self) -> impl Iterator<Item = (Bytes, Bytes)> + '_ {
-        self.map
-            .iter()
-            .map(|e| (e.key().0.clone(), e.value().clone()))
+    pub fn entries(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+        self.map.iter()
     }
 }
 
-/// A cursor over a memtable. Each step is a fresh search from the current
-/// key, which keeps the cursor independent of the skiplist's lifetimes.
+/// A cursor over a memtable. Forward steps follow the list's bottom
+/// links; backward steps search again from the head, as the list has no
+/// back links.
 pub struct MemIter {
     mem: Arc<Memtable>,
-    current: Option<(Bytes, Bytes)>,
+    /// Always a cursor of `mem.map`, which `mem` keeps alive: every
+    /// `unsafe` read below relies on it.
+    at: Option<Cursor>,
 }
 
 impl MemIter {
     pub fn new(mem: Arc<Memtable>) -> Self {
-        MemIter { mem, current: None }
+        MemIter { mem, at: None }
     }
-}
 
-fn owned(entry: Option<Entry<'_, MemKey, Bytes>>) -> Option<(Bytes, Bytes)> {
-    entry.map(|e| (e.key().0.clone(), e.value().clone()))
+    fn current(&self) -> Cursor {
+        self.at.expect("valid")
+    }
 }
 
 impl InternalIterator for MemIter {
     fn seek_ge(&mut self, target: &[u8]) {
-        self.current = owned(
-            self.mem
-                .map
-                .lower_bound(Bound::Included(KeyRef::new(target))),
-        );
+        self.at = self.mem.map.seek_ge(target);
     }
 
     fn seek_le(&mut self, target: &[u8]) {
-        self.current = owned(
-            self.mem
-                .map
-                .upper_bound(Bound::Included(KeyRef::new(target))),
-        );
+        self.at = self.mem.map.seek_le(target);
     }
 
     fn seek_to_last(&mut self) {
-        self.current = owned(self.mem.map.back());
+        self.at = self.mem.map.last();
     }
 
     fn next(&mut self) {
-        if let Some((key, _)) = self.current.take() {
-            self.current = owned(self.mem.map.lower_bound(Bound::Excluded(KeyRef::new(&key))));
+        if let Some(at) = self.at {
+            // SAFETY: `at` is a cursor of `mem.map`.
+            self.at = unsafe { self.mem.map.next(at) };
         }
     }
 
     fn prev(&mut self) {
-        if let Some((key, _)) = self.current.take() {
-            self.current = owned(self.mem.map.upper_bound(Bound::Excluded(KeyRef::new(&key))));
+        if let Some(at) = self.at {
+            // SAFETY: as in `next`.
+            self.at = self.mem.map.seek_lt(unsafe { self.mem.map.key(at) });
         }
     }
 
     fn valid(&self) -> bool {
-        self.current.is_some()
+        self.at.is_some()
     }
 
     fn key(&self) -> &[u8] {
-        &self.current.as_ref().expect("valid").0
+        // SAFETY: as in `next`.
+        unsafe { self.mem.map.key(self.current()) }
     }
 
     fn value(&self) -> Bytes {
-        self.current.as_ref().expect("valid").1.clone()
+        // SAFETY: as in `next`.
+        Bytes::copy_from_slice(unsafe { self.mem.map.value(self.current()) })
     }
 
     fn status(&self) -> Result<()> {

@@ -1383,41 +1383,19 @@ fn tidy(change: &mut VersionChange) {
     change.sv.version = Arc::new(version);
 }
 
-/// One put or delete of a batch: sequence, column family, key, kind, value.
-type Entry<'a> = (u64, u32, &'a [u8], Kind, &'a [u8]);
-
 /// Apply decoded ops to a memtable, numbering them from `first_seq`.
 fn apply(mem: &Memtable, ops: Vec<BatchOp<'_>>, first_seq: u64, live: impl Fn(u32) -> bool) {
-    // One arena copy for the whole batch: encoded keys and values, back to back.
-    let entries: Vec<Entry<'_>> = (first_seq..)
-        .zip(&ops)
-        .filter_map(|(seq, op)| match *op {
-            BatchOp::Put { cf, key, value } if live(cf) => Some((seq, cf, key, Kind::Put, value)),
-            BatchOp::Delete { cf, key } if live(cf) => Some((seq, cf, key, Kind::Delete, &b""[..])),
-            _ => None,
-        })
-        .collect();
-    let total: usize = entries
-        .iter()
-        .map(|e| key::MIN_LEN + e.2.len() + e.4.len())
-        .sum();
-    let buf = memtable::arena_copy(total, |out| {
-        for &(seq, cf, k, kind, v) in &entries {
-            out.extend_from_slice(&cf.to_be_bytes());
-            out.extend_from_slice(k);
-            out.extend_from_slice(&key::trailer_bytes(seq, kind));
-            out.extend_from_slice(v);
+    // Each entry is written once, straight into its skiplist node.
+    for (seq, op) in (first_seq..).zip(&ops) {
+        match *op {
+            BatchOp::Put { cf, key, value } if live(cf) => {
+                mem.insert_entry(cf, key, seq, Kind::Put, value)
+            }
+            BatchOp::Delete { cf, key } if live(cf) => {
+                mem.insert_entry(cf, key, seq, Kind::Delete, b"")
+            }
+            _ => {}
         }
-    });
-    let mut bytes = 0;
-    let mut at = 0;
-    for &(_, _, k, _, v) in &entries {
-        let key_end = at + key::MIN_LEN + k.len();
-        bytes += mem.insert_shared(
-            buf.slice(at..key_end),
-            buf.slice(key_end..key_end + v.len()),
-        );
-        at = key_end + v.len();
     }
     let mut last = 0;
     for (seq, op) in (first_seq..).zip(ops) {
@@ -1428,7 +1406,7 @@ fn apply(mem: &Memtable, ops: Vec<BatchOp<'_>>, first_seq: u64, live: impl Fn(u3
         }
         last = seq;
     }
-    mem.account(bytes, last);
+    mem.account(last);
 }
 
 impl Inner {
