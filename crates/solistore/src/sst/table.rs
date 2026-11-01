@@ -316,7 +316,12 @@ pub struct TableReader {
 fn read_block(file: &dyn RandomAccessFile, handle: Handle) -> Result<Bytes> {
     let corrupt =
         |what: &str| Error::Corruption(format!("table block at {}: {what}", handle.offset));
-    let total = usize::try_from(handle.len).map_err(|_| corrupt("length"))? + BLOCK_TRAILER;
+    // Checked: a handle saying a length near the top of the range wrapped
+    // past the trailer in release builds and panicked further on.
+    let total = usize::try_from(handle.len)
+        .ok()
+        .and_then(|len| len.checked_add(BLOCK_TRAILER))
+        .ok_or_else(|| corrupt("length"))?;
     if handle.offset.saturating_add(total as u64) > file.len() {
         return Err(corrupt("past the end of the file"));
     }
