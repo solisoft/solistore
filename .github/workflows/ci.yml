@@ -87,6 +87,21 @@ jobs:
       - run: cargo miri setup
       - run: cargo miri test -p solistore --lib -- skiplist memtable
 
+  # The fuzz targets, built and run briefly from an empty corpus: a
+  # decoder change that panics on garbage fails here. Long runs are by
+  # hand (fuzz/README.md).
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: |
+          cd fuzz
+          for t in log_records write_batch version_edits block bloom table open; do
+            cargo +nightly fuzz run -O "$t" -- -max_total_time=30 -malloc_limit_mb=256
+          done
+
   # The benchmark compiles against both engines; it is never run in CI.
   bench-check:
     runs-on: ubuntu-latest
