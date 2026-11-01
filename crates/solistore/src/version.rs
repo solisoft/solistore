@@ -24,8 +24,9 @@ use crate::error::{Error, Result};
 use crate::fs::Fs;
 use crate::iter::InternalIterator;
 use crate::key::{self, Kind};
-use crate::memtable::{covering_seq, MemIter, Memtable, RangeTombstone, Version as Found};
+use crate::memtable::{MemIter, Memtable, RangeTombstone, Version as Found};
 use crate::sst::{BlockCache, TableIter, TableProps, TableReader};
+use crate::tombstones::TombstoneIndex;
 
 pub const NUM_LEVELS: usize = 7;
 
@@ -138,11 +139,26 @@ impl Drop for TableFile {
 }
 
 /// The table files and range tombstones of the database.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct Version {
     /// Level 0 newest first (its files overlap); deeper levels sorted by key.
     pub levels: Vec<Vec<Arc<TableFile>>>,
+    /// The source of truth, in the order the MANIFEST holds them.
     pub tombstones: Vec<RangeTombstone>,
+    /// `tombstones` indexed for reads, built on first use. A version is
+    /// changed only as a fresh clone before it is published, and a clone
+    /// starts without the index, so it is never stale.
+    index: OnceLock<Arc<TombstoneIndex>>,
+}
+
+impl Clone for Version {
+    fn clone(&self) -> Self {
+        Version {
+            levels: self.levels.clone(),
+            tombstones: self.tombstones.clone(),
+            index: OnceLock::new(),
+        }
+    }
 }
 
 impl Version {
@@ -150,7 +166,14 @@ impl Version {
         Version {
             levels: vec![Vec::new(); NUM_LEVELS],
             tombstones: Vec::new(),
+            index: OnceLock::new(),
         }
+    }
+
+    /// The range tombstones, indexed.
+    pub fn tombstone_index(&self) -> &Arc<TombstoneIndex> {
+        self.index
+            .get_or_init(|| Arc::new(TombstoneIndex::build(&self.tombstones)))
     }
 
     pub fn files(&self) -> impl Iterator<Item = &Arc<TableFile>> {
@@ -215,21 +238,29 @@ impl SuperVersion {
     }
 
     pub fn tombstone_seq(&self, cf: u32, user_key: &[u8], snapshot: u64) -> u64 {
-        let mut seq = covering_seq(&self.version.tombstones, cf, user_key, snapshot);
+        let mut seq = self
+            .version
+            .tombstone_index()
+            .covering_seq(cf, user_key, snapshot);
         for mem in std::iter::once(&self.mem).chain(&self.imms) {
             seq = seq.max(mem.range_tombstone_seq(cf, user_key, snapshot));
         }
         seq
     }
 
-    /// Every range tombstone of `cf` visible at `snapshot`.
-    pub fn tombstones(&self, cf: u32, snapshot: u64) -> Vec<RangeTombstone> {
-        let mut all: Vec<RangeTombstone> = self.version.tombstones.clone();
-        for mem in std::iter::once(&self.mem).chain(&self.imms) {
-            all.extend(mem.tombstones());
-        }
-        all.retain(|t| t.cf == cf && t.seq <= snapshot);
-        all
+    /// Every non-empty tombstone index of this super version (the files',
+    /// then each memtable's), for a cursor to ask per key. An index answers
+    /// for a snapshot itself, and holding it shares it instead of copying
+    /// every tombstone into each new cursor.
+    pub fn tombstone_indexes(&self) -> Vec<Arc<TombstoneIndex>> {
+        std::iter::once(self.version.tombstone_index().clone())
+            .chain(
+                std::iter::once(&self.mem)
+                    .chain(&self.imms)
+                    .map(|mem| mem.tombstone_index()),
+            )
+            .filter(|index| !index.is_empty())
+            .collect()
     }
 
     /// One cursor per source that may hold keys of `cf`.

@@ -6,9 +6,13 @@
 //! sequence numbers are above its snapshot even while that batch is being
 //! inserted.
 //!
-//! Range deletes are kept apart, in a short list: SoliDB issues one per
-//! dropped collection or database, so there are few of them, and a point
-//! lookup can afford to scan them.
+//! Range deletes are kept apart, in a list, with a [`TombstoneIndex`] over
+//! it that reads use instead of scanning it. They are not few: SoliDB
+//! issues one per dropped collection or database and twelve per truncated
+//! collection, and test runners truncate every collection at each run. A
+//! memtable holding [`Memtable::tombstone_count`] past the configured limit
+//! is sealed for flush like a full one, which bounds what a rebuild of the
+//! index costs.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -20,6 +24,7 @@ use crate::error::Result;
 use crate::iter::InternalIterator;
 use crate::key::{self, Kind};
 use crate::skiplist::{Cursor, SkipList};
+use crate::tombstones::TombstoneIndex;
 
 /// What a range tombstone counts toward the write buffer on top of its
 /// bounds. Entries count exactly what their skiplist node takes.
@@ -53,6 +58,7 @@ pub struct RangeTombstone {
 }
 
 impl RangeTombstone {
+    #[cfg(test)]
     pub fn covers(&self, cf: u32, key: &[u8]) -> bool {
         self.cf == cf && &self.start[..] <= key && key < &self.end[..]
     }
@@ -60,6 +66,10 @@ impl RangeTombstone {
 
 /// The highest sequence number, at most `snapshot`, of a tombstone covering
 /// `key` (0 if none). A version older than it is deleted.
+///
+/// The linear reference [`TombstoneIndex::covering_seq`] is tested against;
+/// reads use the index.
+#[cfg(test)]
 pub fn covering_seq<'a>(
     tombstones: impl IntoIterator<Item = &'a RangeTombstone>,
     cf: u32,
@@ -72,6 +82,12 @@ pub fn covering_seq<'a>(
         .map(|t| t.seq)
         .max()
         .unwrap_or(0)
+}
+
+/// One shared empty index, for the memtables without tombstones.
+fn empty_index() -> Arc<TombstoneIndex> {
+    static EMPTY: std::sync::OnceLock<Arc<TombstoneIndex>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(Default::default).clone()
 }
 
 /// The newest version of a key visible at a snapshot.
@@ -87,6 +103,11 @@ pub struct Memtable {
     /// it hands out.
     map: SkipList,
     tombstones: RwLock<Vec<RangeTombstone>>,
+    /// `tombstones` indexed; `None` after an insert until the next read
+    /// rebuilds it. Always written with `tombstones` locked (for writing
+    /// when clearing it, for reading when building it), so a build from the
+    /// old list cannot be stored over a newer insert.
+    index: RwLock<Option<Arc<TombstoneIndex>>>,
     /// `tombstones` is not empty. Lets every point read skip the lock: a
     /// read lock is a write to a shared cache line, on every get.
     has_tombstones: AtomicBool,
@@ -104,6 +125,7 @@ impl Memtable {
         Memtable {
             map: SkipList::new(),
             tombstones: RwLock::new(Vec::new()),
+            index: RwLock::new(None),
             has_tombstones: AtomicBool::new(false),
             tombstone_bytes: AtomicUsize::new(0),
             max_seq: AtomicU64::new(0),
@@ -150,12 +172,36 @@ impl Memtable {
             Ordering::Relaxed,
         );
         self.has_tombstones.store(true, Ordering::Release);
-        self.tombstones.write().push(RangeTombstone {
+        let mut tombstones = self.tombstones.write();
+        tombstones.push(RangeTombstone {
             cf,
             start: Bytes::copy_from_slice(start),
             end: Bytes::copy_from_slice(end),
             seq,
         });
+        *self.index.write() = None;
+    }
+
+    /// Range tombstones held.
+    pub fn tombstone_count(&self) -> usize {
+        if !self.has_tombstones.load(Ordering::Acquire) {
+            return 0;
+        }
+        self.tombstones.read().len()
+    }
+
+    /// The range tombstones, indexed; built on the first read after a change.
+    pub fn tombstone_index(&self) -> Arc<TombstoneIndex> {
+        if !self.has_tombstones.load(Ordering::Acquire) {
+            return empty_index();
+        }
+        if let Some(index) = self.index.read().as_ref() {
+            return index.clone();
+        }
+        let tombstones = self.tombstones.read();
+        let mut slot = self.index.write();
+        slot.get_or_insert_with(|| Arc::new(TombstoneIndex::build(tombstones.iter())))
+            .clone()
     }
 
     /// Memory held, in bytes: what the arena handed out for entries
@@ -196,7 +242,7 @@ impl Memtable {
         if !self.has_tombstones.load(Ordering::Acquire) {
             return 0;
         }
-        covering_seq(self.tombstones.read().iter(), cf, key, snapshot)
+        self.tombstone_index().covering_seq(cf, key, snapshot)
     }
 
     /// Every entry in order, for a flush.

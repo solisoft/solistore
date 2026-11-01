@@ -291,6 +291,7 @@ crates/solistore/src/
   batch.rs        WriteBatch and its WAL encoding
   log.rs          record framing shared by the WAL and the MANIFEST
   memtable.rs     memtable over the skiplist, range tombstones
+  tombstones.rs   range tombstone index: lookups by binary search, not a scan
   skiplist.rs     concurrent skiplist with keys, values and links in one arena
   sst/            table format: blocks, bloom filters, block cache, reader/builder
   version.rs      versions, super-versions (arc-swap), level iterators

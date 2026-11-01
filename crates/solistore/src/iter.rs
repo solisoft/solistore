@@ -16,7 +16,7 @@ use bytes::Bytes;
 
 use crate::error::{Error, Result};
 use crate::key::{self, Kind};
-use crate::memtable::{covering_seq, RangeTombstone};
+use crate::tombstones::TombstoneIndex;
 use crate::version::SuperVersion;
 
 /// A cursor over internal keys in [`key::compare`] order.
@@ -205,7 +205,8 @@ pub struct DbIterator {
     lower: Option<Vec<u8>>,
     upper: Option<Vec<u8>>,
     direction: Direction,
-    tombstones: Vec<RangeTombstone>,
+    /// The super version's tombstone indexes, shared, not copied.
+    tombstones: Vec<Arc<TombstoneIndex>>,
     done: bool,
 }
 
@@ -250,7 +251,7 @@ impl DbIterator {
                 Direction::Reverse
             }
         };
-        let tombstones = sv.tombstones(cf, snapshot);
+        let tombstones = sv.tombstone_indexes();
         Ok(DbIterator {
             merged,
             _sv: sv,
@@ -278,7 +279,14 @@ impl DbIterator {
         // `<=`, as `get` does: no covering tombstone is 0, and since
         // compaction writes sequence 0 at the bottom of the tree, an entry
         // there with nothing over it must still be visible.
-        kind == Kind::Put && covering_seq(&self.tombstones, self.cf, user_key, self.snapshot) <= seq
+        kind == Kind::Put
+            && self
+                .tombstones
+                .iter()
+                .map(|index| index.covering_seq(self.cf, user_key, self.snapshot))
+                .max()
+                .unwrap_or(0)
+                <= seq
     }
 
     fn same_key(&self, user_key: &[u8]) -> bool {
