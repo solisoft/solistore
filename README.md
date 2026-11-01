@@ -13,7 +13,7 @@ fsync. It is written to replace RocksDB under
    commits ──► group commit ──► one WAL write + one fsync per group
                     │
                     ▼
-   memtable (skiplist, entries in per-thread arenas) ──seal──► immutable memtables
+   memtable (lock-free skiplist, nodes in an arena) ──seal──► immutable memtables
                                                                   │ flush
                                                                   ▼
    L0  ▢ ▢ ▢ ▢      overlapping files, newest first
@@ -277,7 +277,8 @@ crates/solistore/src/
   db.rs           open, commit pipeline, reads, column families, checkpoints
   batch.rs        WriteBatch and its WAL encoding
   log.rs          record framing shared by the WAL and the MANIFEST
-  memtable.rs     skiplist memtable, entries in per-thread arenas
+  memtable.rs     memtable over the skiplist, range tombstones
+  skiplist.rs     concurrent skiplist with keys, values and links in one arena
   sst/            table format: blocks, bloom filters, block cache, reader/builder
   version.rs      versions, super-versions (arc-swap), level iterators
   manifest.rs     version edits and recovery
@@ -298,7 +299,7 @@ docs/             integration plan for SoliDB
 - [x] A migration tool from RocksDB data directories
   (`solidb-migrate-engine`, SoliDB 2.4).
 - [ ] A trial on real workloads, then removing RocksDB from SoliDB.
-- [ ] Dynamic level sizing, a fully arena-allocated skiplist, `loom` on the
+- [ ] Dynamic level sizing, `loom` on the
   commit path, Miri on the `unsafe`, decoder fuzzing, and crash tests on
   NTFS.
 

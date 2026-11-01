@@ -34,13 +34,13 @@ pub fn write_tables(
     let mut live = LiveCf::new(live_cf);
     let mut last_id: Vec<u8> = Vec::new();
     for (k, v) in mem.entries() {
-        let id = key::cf_and_user_key(&k);
+        let id = key::cf_and_user_key(k);
         if !last_id.is_empty() && id == last_id.as_slice() {
             continue; // an older version of the key just handled
         }
         last_id.clear();
         last_id.extend_from_slice(id);
-        let Some(parsed) = key::parse(&k) else {
+        let Some(parsed) = key::parse(k) else {
             continue;
         };
         if !live.check(parsed.cf)
@@ -48,7 +48,7 @@ pub fn write_tables(
         {
             continue;
         }
-        out.add(parsed.cf, &k, &v, &mut allocate)?;
+        out.add(parsed.cf, k, v, &mut allocate)?;
     }
     out.finish()
 }
