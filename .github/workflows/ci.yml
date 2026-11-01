@@ -26,7 +26,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.91
-      - run: cargo check --all-targets
+      - run: cargo check --all-targets --all-features
 
   # The reason this crate exists: no C or C++ toolchain anywhere in the build.
   no-c-toolchain:
@@ -98,6 +98,25 @@ jobs:
           components: miri, rust-src
       - run: cargo miri setup
       - run: cargo miri test -p solistore --lib -- skiplist memtable
+
+  # The fuzz targets, built and run briefly from an empty corpus: a
+  # decoder change that panics on garbage fails here. Long runs are by
+  # hand (fuzz/README.md).
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: |
+          cd fuzz
+          for t in log_records write_batch version_edits block bloom table open; do
+            # The prebuilt cargo-fuzz is a musl binary and would target musl.
+            cargo +nightly fuzz run -O --target x86_64-unknown-linux-gnu "$t" -- \
+              -max_total_time=30 -malloc_limit_mb=256
+          done
 
   # The benchmark compiles against both engines; it is never run in CI.
   bench-check:

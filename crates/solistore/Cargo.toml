@@ -10,6 +10,10 @@ readme = "../../README.md"
 keywords = ["lsm", "key-value", "storage-engine", "embedded", "database"]
 categories = ["database-implementations"]
 
+[features]
+# Entry points for the fuzz targets in fuzz/; not part of the API.
+fuzzing = []
+
 [dependencies]
 arc-swap = "1"
 bytes = "1"

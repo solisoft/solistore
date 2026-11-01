@@ -146,6 +146,11 @@ code exercises failure paths:
   checks that no reader ever sees part of a batch.
 - **Mutation testing.** Bugs are injected on purpose to check that the tests
   above catch them.
+- **Fuzzing.** `cargo-fuzz` targets feed garbage to every decoder: log
+  framing, write batches, MANIFEST edits, blocks, bloom filters, table
+  files, and a database opened from well-framed records saying anything
+  (`fuzz/`). Corrupt input must be an error, never a panic or a huge
+  allocation; CI runs each target briefly.
 - **loom.** The commit path's two protocols, leader election in the
   commit queue and publication of finished groups, are model-checked
   under every interleaving of a few writers: one leader at a time, every
@@ -313,7 +318,7 @@ docs/             integration plan for SoliDB
 - [x] A migration tool from RocksDB data directories
   (`solidb-migrate-engine`, SoliDB 2.4).
 - [ ] A trial on real workloads, then removing RocksDB from SoliDB.
-- [ ] Decoder fuzzing, and crash tests on NTFS.
+- [ ] Crash tests on NTFS.
 
 ## Licence
 

@@ -16,6 +16,9 @@ mod db;
 mod error;
 mod flush;
 pub mod fs;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod iter;
 mod key;
 mod log;

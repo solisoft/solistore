@@ -236,10 +236,12 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
   (the old cast went with the crossbeam skiplist; `sync_file_range` is FFI,
   out of Miri's reach). Stacked Borrows found nothing, data races and
   leaks included.
+- The decoders are fuzzed (`fuzz/`, cargo-fuzz): the first runs found two
+  panics, a key shorter than its trailer in a corrupt block and a MANIFEST
+  without the default column family, both now errors.
 - `loom` checks the commit path's leader election and publication
   (`commit_queue.rs`, extracted from `db.rs` for it), memtable switch
   included.
-- Not done from the plan: fuzzing of the decoders.
 - Windows: `StdFs::sync_dir` is a no-op there and `start_writeback` does
   nothing; the CI cross-check compiles and runs the tests on Windows, but
   no crash test has run on NTFS.

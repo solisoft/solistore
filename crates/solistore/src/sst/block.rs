@@ -432,6 +432,26 @@ mod tests {
     }
 
     #[test]
+    fn a_block_of_short_keys_can_be_searched() {
+        // Found by fuzzing: a corrupt block's keys may be shorter than a
+        // trailer, and a seek compared them by slicing it off.
+        let mut b = BlockBuilder::new(2);
+        for k in [&b""[..], b"a", b"ab", b"abcdefgh", b"b"] {
+            b.add(k, b"v");
+        }
+        let block = Block::new(Bytes::from(b.finish())).unwrap();
+        let mut it = block.iter();
+        for target in [&b""[..], b"a", b"zz", &encode(0, b"x", 1, Kind::Put)] {
+            it.seek(target);
+            it.seek_for_prev(target);
+        }
+        it.seek_to_first();
+        while it.valid() {
+            it.next();
+        }
+    }
+
+    #[test]
     fn garbage_is_an_error_not_a_panic() {
         for len in 0..64 {
             let data: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
