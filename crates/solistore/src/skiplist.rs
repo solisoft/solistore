@@ -55,6 +55,29 @@ const LARGE: usize = BLOCK / 4;
 /// memtable (tests use tiny ones) costs little.
 const FIRST_CHUNK: usize = 64 << 10;
 const MAX_CHUNK: usize = 4 << 20;
+/// Full-size chunks kept for the next list when a list drops: at most this
+/// many bytes, for the whole process.
+const POOL_BYTES: usize = 64 << 20;
+
+/// Chunks of `MAX_CHUNK` bytes given back by dropped lists.
+///
+/// A flushed memtable's chunks would otherwise go back to the allocator
+/// from the flush thread while the next memtable allocates fresh ones from
+/// the writers' threads: with jemalloc's per-thread arenas the freed pages
+/// were not reused, and stayed resident until their decay. Peak RSS during
+/// a load was ~100 MB above the crossbeam skiplist's, whose small nodes
+/// were reused at once, and every new chunk page-faulted in. A pooled chunk
+/// is already resident.
+static POOL: Mutex<Vec<Pooled>> = Mutex::new(Vec::new());
+
+struct Pooled(NonNull<u8>);
+
+// SAFETY: a pooled chunk is owned by the pool alone until popped.
+unsafe impl Send for Pooled {}
+
+fn chunk_layout(size: usize) -> Layout {
+    Layout::from_size_align(size, ALIGN).expect("chunk layout")
+}
 const ALIGN: usize = align_of::<AtomicPtr<Node>>();
 const LINK: usize = size_of::<AtomicPtr<Node>>();
 
@@ -146,10 +169,17 @@ impl Chunks {
             lost = self.free.left;
             let chunk = size.max(self.next_size);
             self.next_size = (self.next_size * 2).min(MAX_CHUNK);
-            let layout = Layout::from_size_align(chunk, ALIGN).expect("chunk layout");
-            // SAFETY: the layout has a non-zero size.
-            let p = NonNull::new(unsafe { alloc::alloc(layout) })
-                .unwrap_or_else(|| alloc::handle_alloc_error(layout));
+            let layout = chunk_layout(chunk);
+            let pooled = if chunk == MAX_CHUNK {
+                POOL.lock().pop().map(|c| c.0)
+            } else {
+                None
+            };
+            let p = pooled.unwrap_or_else(|| {
+                // SAFETY: the layout has a non-zero size.
+                NonNull::new(unsafe { alloc::alloc(layout) })
+                    .unwrap_or_else(|| alloc::handle_alloc_error(layout))
+            });
             self.owned.push((p, layout));
             self.free = Free {
                 at: p.as_ptr(),
@@ -235,9 +265,14 @@ impl Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
+        let mut pool = POOL.lock();
         for (p, layout) in self.chunks.get_mut().owned.drain(..) {
-            // SAFETY: allocated in `take` with this layout, freed once.
-            unsafe { alloc::dealloc(p.as_ptr(), layout) };
+            if layout.size() == MAX_CHUNK && pool.len() * MAX_CHUNK < POOL_BYTES {
+                pool.push(Pooled(p));
+            } else {
+                // SAFETY: allocated in `take` with this layout, freed once.
+                unsafe { alloc::dealloc(p.as_ptr(), layout) };
+            }
         }
     }
 }
@@ -771,6 +806,22 @@ mod tests {
         let seeks: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
         assert!(seeks > 1000, "{seeks} seeks");
         assert_eq!(list.iter().count(), 4 * n as usize + 1);
+    }
+
+    /// Dropped lists give their full-size chunks to the pool, up to its
+    /// cap, and the next lists reuse them with their own contents.
+    #[test]
+    fn chunks_go_back_to_a_bounded_pool_and_are_reused() {
+        for round in 0..6u32 {
+            let list = SkipList::new();
+            let value = vec![round as u8; 1000];
+            for i in 0..30_000u32 {
+                list.insert(&[&ik(i)], &value);
+            }
+            assert!(list.iter().all(|(_, v)| v == &value[..]), "round {round}");
+            drop(list);
+            assert!(POOL.lock().len() * MAX_CHUNK <= POOL_BYTES);
+        }
     }
 
     /// Two lists on one thread alternate: each allocates from its own arena.
