@@ -1,0 +1,69 @@
+[package]
+name = "solistore-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "cargo-fuzz targets for solistore's decoders"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+solistore = { path = "../crates/solistore", features = ["fuzzing"] }
+
+# Standalone: libFuzzer's C++ must stay out of the engine's own build.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "log_records"
+path = "fuzz_targets/log_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "write_batch"
+path = "fuzz_targets/write_batch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "version_edits"
+path = "fuzz_targets/version_edits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block"
+path = "fuzz_targets/block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bloom"
+path = "fuzz_targets/bloom.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "table"
+path = "fuzz_targets/table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open"
+path = "fuzz_targets/open.rs"
+test = false
+doc = false
+bench = false
+

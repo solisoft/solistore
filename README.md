@@ -146,6 +146,11 @@ code exercises failure paths:
   checks that no reader ever sees part of a batch.
 - **Mutation testing.** Bugs are injected on purpose to check that the tests
   above catch them.
+- **Fuzzing.** `cargo-fuzz` targets feed garbage to every decoder: log
+  framing, write batches, MANIFEST edits, blocks, bloom filters, table
+  files, and a database opened from well-framed records saying anything
+  (`fuzz/`). Corrupt input must be an error, never a panic or a huge
+  allocation; CI runs each target briefly.
 - **Miri.** CI runs the tests of the memtable's skiplist and arena under
   Miri, the only `unsafe` in the crate besides one `sync_file_range` call
   (an FFI call Miri cannot run, which passes a file descriptor and two
@@ -307,7 +312,7 @@ docs/             integration plan for SoliDB
 - [x] A migration tool from RocksDB data directories
   (`solidb-migrate-engine`, SoliDB 2.4).
 - [ ] A trial on real workloads, then removing RocksDB from SoliDB.
-- [ ] `loom` on the commit path, decoder fuzzing, and crash tests on NTFS.
+- [ ] `loom` on the commit path, and crash tests on NTFS.
 
 ## Licence
 

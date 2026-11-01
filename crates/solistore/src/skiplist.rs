@@ -681,9 +681,14 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let mut value = vec![i as u8; len];
-            if let Some(last) = value.last_mut() {
-                *last = 0xa5;
+            // A byte pattern that depends on the position, so a copy from
+            // the wrong offset shows; built by whole runs, which Miri does
+            // quickly.
+            let run: Vec<u8> = (0..251u32).map(|b| (b * 31 + i as u32) as u8).collect();
+            let mut value = Vec::with_capacity(len);
+            while value.len() < len {
+                let take = run.len().min(len - value.len());
+                value.extend_from_slice(&run[..take]);
             }
             list.insert(&[&ik(i as u32)], &value);
             let c = list.seek_ge(&ik(i as u32)).unwrap();
@@ -820,7 +825,10 @@ mod tests {
         }
         stop.store(true, Relaxed);
         let seeks: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
-        assert!(seeks > scaled(1000, 3) as u64, "{seeks} seeks");
+        // Under Miri the scheduler may run the writers to the end first.
+        if !cfg!(miri) {
+            assert!(seeks > 1000, "{seeks} seeks");
+        }
         assert_eq!(list.iter().count(), 4 * n as usize + 1);
     }
 
