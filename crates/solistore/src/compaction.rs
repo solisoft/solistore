@@ -2,9 +2,28 @@
 //!
 //! Level 0 holds flushed memtables, which overlap. Each deeper level is one
 //! sorted run of disjoint files, ten times larger than the one above it. A
-//! compaction merges files of one level into the next: all of level 0 once
-//! it has `l0_trigger` files, otherwise one file of the level most over its
-//! target size, chosen round-robin.
+//! compaction merges files of one level into the next: all of level 0 into
+//! the base level once it has `l0_trigger` files, otherwise one file of the
+//! level most over its target size, chosen round-robin.
+//!
+//! # Level targets
+//!
+//! With `dynamic` (the default, as RocksDB's
+//! `level_compaction_dynamic_level_bytes`), targets are set from the bottom:
+//! the last level's is the size of the largest level, and each level above
+//! gets a tenth of the one below. The base level, into which level 0
+//! compacts, is the deepest one whose target is still within
+//! `level_base_bytes`; the levels above it stay empty. A small database thus
+//! keeps all its data in the bottom level, one sorted run, and the base
+//! level rises as it grows: the space taken by obsolete versions stays
+//! bounded at about one level in ten whatever the size. With fixed targets
+//! (level 1 at `level_base_bytes`, then ten times more per level), a
+//! database of a few gigabytes held most of its data in levels 1 and 2
+//! with little below, and its bottom level was not the largest.
+//!
+//! The base level is never above the first level holding data, so data
+//! only moves down: a database written with fixed targets drains its upper
+//! levels, which are then over their (smaller) targets, into the bottom.
 //!
 //! The merge keeps only the newest version of each key (see
 //! [`crate::version`] for why no older one can still be needed), drops what
@@ -58,6 +77,8 @@ pub struct Config {
     pub l0_trigger: usize,
     pub level_base_bytes: u64,
     pub level_multiplier: u64,
+    /// Targets set from the bottom level (see the module docs).
+    pub dynamic: bool,
     pub target_file_size: u64,
     /// Ranges one compaction is split into and merged in parallel.
     pub subcompactions: usize,
@@ -77,8 +98,10 @@ pub struct Compaction {
 
 impl Compaction {
     /// One file, nothing under it: move it down instead of rewriting it.
+    /// Level 0 may skip levels, down to the base level: those between are
+    /// empty.
     pub fn is_trivial_move(&self) -> bool {
-        self.output_level == self.level + 1 && self.inputs.len() == 1 && self.overlapping.is_empty()
+        self.output_level > self.level && self.inputs.len() == 1 && self.overlapping.is_empty()
     }
 
     pub fn all_inputs(&self) -> impl Iterator<Item = (usize, &Arc<TableFile>)> {
@@ -103,12 +126,55 @@ pub fn level_bytes(files: &[Arc<TableFile>]) -> u64 {
     files.iter().map(|f| f.props.size).sum()
 }
 
-fn target_bytes(cfg: &Config, level: usize) -> u64 {
-    let mut target = cfg.level_base_bytes;
-    for _ in 1..level {
-        target = target.saturating_mul(cfg.level_multiplier);
+/// Where level 0 compacts to, and each level's target size in bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Targets {
+    pub base_level: usize,
+    pub bytes: [u64; NUM_LEVELS],
+}
+
+impl Targets {
+    pub fn of(version: &Version, cfg: &Config) -> Targets {
+        let mut bytes = [0u64; NUM_LEVELS];
+        if !cfg.dynamic {
+            let mut target = cfg.level_base_bytes;
+            for b in bytes.iter_mut().skip(1) {
+                *b = target;
+                target = target.saturating_mul(cfg.level_multiplier);
+            }
+            return Targets {
+                base_level: 1,
+                bytes,
+            };
+        }
+        let bottom = NUM_LEVELS - 1;
+        let largest = (1..NUM_LEVELS)
+            .map(|l| level_bytes(&version.levels[l]))
+            .max()
+            .unwrap_or(0);
+        bytes[bottom] = largest;
+        for l in (1..bottom).rev() {
+            bytes[l] = bytes[l + 1] / cfg.level_multiplier;
+        }
+        let mut base_level = bottom;
+        while base_level > 1 && bytes[base_level] > cfg.level_base_bytes {
+            base_level -= 1;
+        }
+        // Data only moves down: never compact level 0 below data.
+        if let Some(first) = (1..NUM_LEVELS).find(|&l| !version.levels[l].is_empty()) {
+            base_level = base_level.min(first);
+        }
+        Targets { base_level, bytes }
     }
-    target
+
+    /// How far `level` is over its target; at least 1.0 means compact it.
+    fn score(&self, version: &Version, level: usize) -> f64 {
+        let size = level_bytes(&version.levels[level]);
+        if size == 0 {
+            return 0.0;
+        }
+        size as f64 / self.bytes[level].max(1) as f64
+    }
 }
 
 /// `(cf ‖ user key)` bounds of a set of files.
@@ -178,16 +244,16 @@ pub fn pick(
     cfg: &Config,
     busy: Busy<'_>,
 ) -> Option<Compaction> {
-    pick_for_tombstones(version, busy).or_else(|| pick_by_size(version, cursors, cfg, busy))
+    pick_for_tombstones(version, cfg, busy).or_else(|| pick_by_size(version, cursors, cfg, busy))
 }
 
 /// A file that may hold data a range tombstone deletes.
-pub fn pick_for_tombstones(version: &Version, busy: Busy<'_>) -> Option<Compaction> {
+pub fn pick_for_tombstones(version: &Version, cfg: &Config, busy: Busy<'_>) -> Option<Compaction> {
     for t in &version.tombstones {
         for (level, files) in version.levels.iter().enumerate() {
             for f in files.iter().filter(|f| may_hold_covered(f, t)) {
                 let candidate = if level == 0 {
-                    level0(version)
+                    level0(version, Targets::of(version, cfg).base_level)
                 } else {
                     Some(Compaction {
                         level,
@@ -205,10 +271,11 @@ pub fn pick_for_tombstones(version: &Version, busy: Busy<'_>) -> Option<Compacti
     None
 }
 
-fn level0(version: &Version) -> Option<Compaction> {
+/// All of level 0 into `base_level`.
+fn level0(version: &Version, base_level: usize) -> Option<Compaction> {
     let inputs = version.levels[0].clone();
     let (lo, hi) = key_range(&inputs)?;
-    let overlapping = version.levels[1]
+    let overlapping = version.levels[base_level]
         .iter()
         .filter(|f| overlaps(f, &lo, &hi))
         .cloned()
@@ -217,7 +284,7 @@ fn level0(version: &Version) -> Option<Compaction> {
         level: 0,
         inputs,
         overlapping,
-        output_level: 1,
+        output_level: base_level,
     })
 }
 
@@ -258,13 +325,15 @@ fn pick_by_size(
     cfg: &Config,
     busy: Busy<'_>,
 ) -> Option<Compaction> {
+    let targets = Targets::of(version, cfg);
     let mut scored: Vec<(f64, usize)> = Vec::new();
     let l0 = version.levels[0].len() as f64 / cfg.l0_trigger.max(1) as f64;
     if l0 >= 1.0 {
         scored.push((l0, 0));
     }
+    // The bottom level has nowhere to go.
     for level in 1..NUM_LEVELS - 1 {
-        let score = level_bytes(&version.levels[level]) as f64 / target_bytes(cfg, level) as f64;
+        let score = targets.score(version, level);
         if score >= 1.0 {
             scored.push((score, level));
         }
@@ -272,16 +341,18 @@ fn pick_by_size(
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     scored.into_iter().find_map(|(_, level)| {
         if level == 0 {
-            level0(version).filter(|c| c.is_free(busy))
+            level0(version, targets.base_level).filter(|c| c.is_free(busy))
         } else {
             one_file(version, level, cursors.get(level), busy)
         }
     })
 }
 
-/// Level 0 into level 1, if level 0 holds anything in `[lo, hi]` (`cf ‖ key`).
+/// Level 0 into the base level, if level 0 holds anything in `[lo, hi]`
+/// (`cf ‖ key`).
 pub fn pick_level0_overlapping(
     version: &Version,
+    cfg: &Config,
     lo: &[u8],
     hi: &[u8],
     busy: Busy<'_>,
@@ -289,7 +360,7 @@ pub fn pick_level0_overlapping(
     version.levels[0]
         .iter()
         .any(|f| overlaps(f, lo, hi))
-        .then(|| level0(version))
+        .then(|| level0(version, Targets::of(version, cfg).base_level))
         .flatten()
         .filter(|c| c.is_free(busy))
 }
@@ -636,6 +707,7 @@ mod tests {
             l0_trigger: 4,
             level_base_bytes: 1 << 20,
             level_multiplier: 10,
+            dynamic: false,
             target_file_size: 1 << 20,
             subcompactions: 1,
             writeback: false,
@@ -653,6 +725,110 @@ mod tests {
         .unwrap();
         assert_eq!(out.len(), 1);
         (out[0].1.smallest_seq, out[0].1.largest_seq)
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    fn cfg(dynamic: bool) -> Config {
+        Config {
+            l0_trigger: 4,
+            level_base_bytes: 512 * MIB,
+            level_multiplier: 10,
+            dynamic,
+            target_file_size: 64 * MIB,
+            subcompactions: 1,
+            writeback: false,
+        }
+    }
+
+    /// A version whose levels hold files of these sizes; the files exist on
+    /// paper only (nothing here opens them). Each file gets its own key
+    /// range, so a level stays a sorted run.
+    fn version_with(sizes: &[(usize, u64)]) -> Version {
+        let fs: Arc<dyn Fs> = Arc::new(FaultFs::new());
+        let cache = Arc::new(BlockCache::new(1 << 20));
+        let mut version = Version::empty();
+        for (i, &(level, size)) in sizes.iter().enumerate() {
+            let k = format!("k{i:04}");
+            let props = TableProps {
+                size,
+                smallest: key::encode(0, k.as_bytes(), 1, Kind::Put),
+                largest: key::encode(0, k.as_bytes(), 1, Kind::Put),
+                smallest_seq: 1,
+                largest_seq: 1,
+                entries: 1,
+                tombstone_watermark: 0,
+            };
+            let f = TableFile::new(
+                fs.clone(),
+                cache.clone(),
+                Path::new("/db"),
+                i as u64 + 1,
+                props,
+            );
+            version.levels[level].push(Arc::new(f));
+        }
+        version
+    }
+
+    #[test]
+    fn fixed_targets_start_at_level_one() {
+        let t = Targets::of(&version_with(&[(6, 10 * MIB)]), &cfg(false));
+        assert_eq!(t.base_level, 1);
+        assert_eq!(t.bytes[1], 512 * MIB);
+        assert_eq!(t.bytes[3], 51_200 * MIB);
+    }
+
+    #[test]
+    fn an_empty_or_small_database_compacts_level_zero_into_the_bottom() {
+        let bottom = NUM_LEVELS - 1;
+        assert_eq!(
+            Targets::of(&Version::empty(), &cfg(true)).base_level,
+            bottom
+        );
+        let t = Targets::of(&version_with(&[(bottom, 100 * MIB)]), &cfg(true));
+        assert_eq!(t.base_level, bottom);
+        assert_eq!(t.bytes[bottom], 100 * MIB);
+    }
+
+    #[test]
+    fn the_base_level_rises_as_the_bottom_grows() {
+        let bottom = NUM_LEVELS - 1;
+        // 2 GiB at the bottom: its tenth, 205 MiB, fits the 512 MiB base.
+        let t = Targets::of(&version_with(&[(bottom, 2048 * MIB)]), &cfg(true));
+        assert_eq!(t.base_level, bottom - 1);
+        assert_eq!(t.bytes[bottom - 1], 2048 * MIB / 10);
+        // 60 GiB: 6 GiB, then 600 MiB are too big; 60 MiB is the base.
+        let t = Targets::of(&version_with(&[(bottom, 61_440 * MIB)]), &cfg(true));
+        assert_eq!(t.base_level, bottom - 3);
+        assert!(t.bytes[t.base_level] <= 512 * MIB);
+        assert!(t.bytes[t.base_level + 1] > 512 * MIB);
+    }
+
+    #[test]
+    fn level_zero_never_compacts_below_data() {
+        // Laid out with fixed targets: data in level 1 and 2 only.
+        let v = version_with(&[(1, 300 * MIB), (2, 3000 * MIB)]);
+        let t = Targets::of(&v, &cfg(true));
+        assert_eq!(t.base_level, 1);
+        // The largest level sets the bottom's target, and the upper levels
+        // are over theirs: they drain down.
+        assert_eq!(t.bytes[NUM_LEVELS - 1], 3000 * MIB);
+        assert!(t.score(&v, 1) > 1.0 && t.score(&v, 2) > 1.0);
+    }
+
+    #[test]
+    fn level_zero_goes_straight_to_the_base_level_as_a_trivial_move() {
+        let bottom = NUM_LEVELS - 1;
+        let mut v = version_with(&[(0, MIB)]);
+        let c = level0(&v, Targets::of(&v, &cfg(true)).base_level).unwrap();
+        assert_eq!(c.output_level, bottom);
+        assert!(c.is_trivial_move());
+        // With data at the bottom overlapping it, it is a merge.
+        v.levels[bottom] = version_with(&[(0, MIB)]).levels[0].clone();
+        let c = level0(&v, Targets::of(&v, &cfg(true)).base_level).unwrap();
+        assert_eq!((c.output_level, c.overlapping.len()), (bottom, 1));
+        assert!(!c.is_trivial_move());
     }
 
     #[test]

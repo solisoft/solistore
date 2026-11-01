@@ -91,9 +91,16 @@ pub struct Options {
     pub level0_slowdown_trigger: usize,
     /// Level-0 files at which writers wait for compaction.
     pub level0_stop_trigger: usize,
-    /// Target size of level 1; each deeper level is `level_multiplier` times larger.
+    /// Target size of the base level, into which level 0 compacts; each
+    /// deeper level is `level_multiplier` times larger.
     pub max_bytes_for_level_base: u64,
     pub level_multiplier: u64,
+    /// Set level targets from the bottom level, as RocksDB's option of the
+    /// same name: the base level is the deepest whose target fits in
+    /// `max_bytes_for_level_base`, and a small database keeps its data in
+    /// the bottom level. Off, level 1 is the base level at
+    /// `max_bytes_for_level_base`.
+    pub level_compaction_dynamic_level_bytes: bool,
     /// Ranges a compaction is split into and merged in parallel.
     pub max_subcompactions: usize,
     /// Compactions that may run at once, on disjoint files.
@@ -130,6 +137,7 @@ impl Default for Options {
             level0_stop_trigger: 36,
             max_bytes_for_level_base: 512 << 20,
             level_multiplier: 10,
+            level_compaction_dynamic_level_bytes: true,
             max_subcompactions: 4,
             // One at a time measured best at 5M documents: concurrent
             // compactions hold level-1 files the next level-0 compaction
@@ -161,6 +169,10 @@ impl fmt::Debug for Options {
             .field("level0_stop_trigger", &self.level0_stop_trigger)
             .field("max_bytes_for_level_base", &self.max_bytes_for_level_base)
             .field("level_multiplier", &self.level_multiplier)
+            .field(
+                "level_compaction_dynamic_level_bytes",
+                &self.level_compaction_dynamic_level_bytes,
+            )
             .field("max_subcompactions", &self.max_subcompactions)
             .field(
                 "max_background_compactions",
@@ -687,6 +699,7 @@ impl Db {
                 l0_trigger: opts.level0_compaction_trigger.max(1),
                 level_base_bytes: opts.max_bytes_for_level_base.max(1),
                 level_multiplier: opts.level_multiplier.max(2),
+                dynamic: opts.level_compaction_dynamic_level_bytes,
                 target_file_size: opts.target_file_size.max(1),
                 subcompactions: opts.max_subcompactions.max(1),
                 writeback: opts.bytes_per_sync > 0,
@@ -998,9 +1011,10 @@ impl Db {
                 .checked_add(1)
                 .map_or_else(|| vec![0xff; 5], |next| next.to_be_bytes().to_vec()),
         };
+        let cfg = inner.compaction;
         let wanted = |v: &Version, busy: compaction::Busy<'_>| {
-            compaction::pick_for_tombstones(v, busy)
-                .or_else(|| compaction::pick_level0_overlapping(v, &lo, &hi, busy))
+            compaction::pick_for_tombstones(v, &cfg, busy)
+                .or_else(|| compaction::pick_level0_overlapping(v, &cfg, &lo, &hi, busy))
         };
         // Bounded: writes arriving meanwhile could otherwise keep it going.
         for _ in 0..10_000 {
