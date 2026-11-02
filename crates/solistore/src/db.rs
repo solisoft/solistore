@@ -628,6 +628,15 @@ impl Db {
             wals.truncate(i);
         }
 
+        // What was replayed must be durable before the new WAL counts it:
+        // after a process crash those bytes may still be only in the page
+        // cache. The new WAL's header says every sequence number up to
+        // `last_seq` is in the WALs before it, so a power loss that took
+        // their tail would drop the new WAL, synced writes and all.
+        for &no in &wals {
+            fs.sync_file(&dir.join(wal_name(no)))?;
+        }
+
         // The MANIFEST's install syncs the directory, which makes the new
         // WAL's name durable too, and the deletions above.
         let wal_file = fs.create(&dir.join(wal_name(wal_no)))?;

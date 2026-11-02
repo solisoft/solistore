@@ -62,6 +62,10 @@ pub trait Fs: Send + Sync + fmt::Debug {
     /// `to` are durable when this returns; its name is not until `sync_dir`.
     fn link(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove(&self, path: &Path) -> io::Result<()>;
+    /// Make every byte of the existing file at `path` durable, through a
+    /// handle of its own (`fdatasync`): a file this process did not write,
+    /// or no longer holds open.
+    fn sync_file(&self, path: &Path) -> io::Result<()>;
     /// Make the creations, renames and removals in `dir` durable.
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
     /// An exclusive lock on `path`, held until the returned guard drops.
@@ -208,6 +212,11 @@ impl Fs for StdFs {
 
     fn remove(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
+    }
+
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        // A write handle: Windows flushes no file through a read-only one.
+        OpenOptions::new().write(true).open(path)?.sync_data()
     }
 
     #[cfg(unix)]
@@ -465,6 +474,15 @@ impl FaultFs {
         crash_locked(&mut state, torn);
     }
 
+    /// Simulate a process crash: handles opened before it fail from now
+    /// on, but nothing is lost. Unsynced bytes stay in the page cache, as
+    /// they do when only the process dies.
+    pub fn kill(&self) {
+        let mut state = self.state.lock();
+        state.countdown = None;
+        state.generation += 1;
+    }
+
     /// Crash on the `ops`-th mutating operation from now (appends, fsyncs,
     /// creations, renames, links, removals, directory syncs): that operation
     /// fails, and so does everything a process handle does after it.
@@ -637,6 +655,24 @@ impl Fs for FaultFs {
             .remove(path)
             .map(|_| ())
             .ok_or_else(|| Self::not_found(path))
+    }
+
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        let mut state = self.state.lock();
+        self.tick(&mut state)?;
+        state.syncs += 1;
+        if state.failing_syncs > 0 {
+            state.failing_syncs -= 1;
+            return Err(io::Error::other("FaultFs: injected EIO on fsync"));
+        }
+        let node = state
+            .live
+            .get(path)
+            .cloned()
+            .ok_or_else(|| Self::not_found(path))?;
+        let mut node = node.lock();
+        node.synced = node.data.len();
+        Ok(())
     }
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {

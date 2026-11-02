@@ -1058,3 +1058,56 @@ fn closing_wakes_a_syncer_with_a_long_interval() {
         "every write before a clean close is kept"
     );
 }
+
+/// A process crash leaves unsynced WAL bytes in the page cache, and the
+/// next open replays them. A synced write after that open must survive a
+/// power loss, whatever happens to those replayed bytes.
+#[test]
+fn a_synced_write_after_a_process_crash_survives_power_loss() {
+    let fs = FaultFs::new();
+    let opts = Options {
+        fs: Arc::new(fs.clone()),
+        durability: Durability::Eventual {
+            sync_interval: Duration::from_secs(3600),
+        },
+        wal_bytes_per_sync: 0,
+        ..Options::default()
+    };
+    let open = || {
+        Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts.clone()
+            },
+        )
+        .unwrap()
+    };
+    let db = open();
+    let cf = db.default_cf();
+    for i in 0..100u32 {
+        db.put(&cf, i.to_be_bytes(), [1u8; 64]).unwrap();
+    }
+    // The process dies: nothing was fsynced, nothing is lost yet.
+    fs.kill();
+    drop(db);
+
+    let db = open();
+    let cf = db.default_cf();
+    assert_eq!(db.iterator(&cf, IteratorMode::Start).unwrap().count(), 100);
+    let mut batch = WriteBatch::new();
+    batch.put(&cf, b"synced", b"yes");
+    db.write_opt(batch, &WriteOptions { sync: true }).unwrap();
+    // Power loss.
+    fs.crash(Torn::None);
+    drop(db);
+
+    let db = open();
+    let cf = db.default_cf();
+    assert_eq!(
+        db.get(&cf, b"synced").unwrap().as_deref(),
+        Some(&b"yes"[..]),
+        "an acknowledged synced write was lost"
+    );
+    assert_eq!(db.iterator(&cf, IteratorMode::Start).unwrap().count(), 101);
+}
