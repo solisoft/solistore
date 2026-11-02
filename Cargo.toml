@@ -7,7 +7,7 @@ members = ["crates/solistore"]
 exclude = ["bench", "fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # SoliDB's floor (rust-rocksdb 0.53 declared it); the engine must not raise it.
 rust-version = "1.91"
