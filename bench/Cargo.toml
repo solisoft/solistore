@@ -6,7 +6,10 @@ publish = false
 description = "SoliDB-shaped storage-engine benchmark: RocksDB with SoliDB's prod profile against solistore"
 
 [features]
-default = ["rocks", "solistore", "surrealkv"]
+default = ["rocks", "solistore", "surrealkv", "scan-api"]
+# solistore's snapshots, borrowed iteration and split points (0.2.2). Off,
+# the scan phases build against an older solistore, to measure it.
+scan-api = []
 # The baseline. Off, the benchmark builds without a C++ compiler.
 rocks = ["dep:rust-rocksdb"]
 solistore = ["dep:solistore"]

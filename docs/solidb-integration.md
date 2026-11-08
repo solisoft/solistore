@@ -152,6 +152,26 @@ Since then (2026-10-15):
 - Compaction to the bottom of the tree writes sequence 0, as RocksDB does:
   tables 1.07x RocksDB's size -> 1.02x after a 1M-document load.
 
+Since then (2026-11-08, Bonfire #777), for SoliDB's full scans and
+aggregations:
+
+- `Db::snapshot()` gives one view to any number of iterators and gets on
+  any threads, passed as `ReadOptions { snapshot: Some(s), .. }` to
+  `Db::iterator_opt` (or `s.get`, `s.iterator_opt`).
+  `Db::split_points(cf, lo, hi, n)` (or the snapshot's) cuts a keyspace
+  into `n` parts of about equal size, estimated from the table indexes
+  and the memtables. A parallel scan is: snapshot, split points, one
+  iterator per part on its own thread. A snapshot pins its memtables and
+  table files until dropped.
+- `DbIterator::next_ref()` borrows each entry until the next call, with no
+  allocation per entry walking forward; `Db::for_each(cf, opts, mode, f)`
+  is the same as a visitor. `KsIter` can hand out slices instead of
+  `(Bytes, Bytes)`.
+- `ReadOptions` gained a field: the release is 0.3.0.
+- Warm, one thread, 1M documents of ~430 B: 147 ms a pass -> 71 ms
+  through `next_ref` (84 ms through the owned iterator); 8 threads over
+  one snapshot 23 -> 15 ms (`bench/results/2026-11-08-scan`).
+
 - `storage/kv/solistore.rs`: `Kv` over `solistore::Db`, behind a cargo
   feature `engine-solistore` (git dependency on
   github.com/solisoft/solistore, crates.io once published).
