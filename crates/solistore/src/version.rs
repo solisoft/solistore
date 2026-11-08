@@ -238,11 +238,56 @@ impl SuperVersion {
         all
     }
 
+    /// User keys that cut `[lo, hi)` of `cf` into about `n` parts of equal
+    /// table bytes: see [`crate::Db::split_points`].
+    pub fn split_points(&self, cf: u32, lo: &[u8], hi: &[u8], n: usize) -> Result<Vec<Vec<u8>>> {
+        if n <= 1 || lo >= hi {
+            return Ok(Vec::new());
+        }
+        let prefix = cf.to_be_bytes();
+        let (lo, hi) = ([&prefix[..], lo].concat(), [&prefix[..], hi].concat());
+        // Every file's samples, then in key order across files and levels:
+        // the bytes below a key add up whatever file holds them.
+        let mut samples: Vec<(&[u8], u64)> = Vec::new();
+        for file in self.version.files() {
+            let smallest = key::cf_and_user_key(&file.props.smallest);
+            let largest = key::cf_and_user_key(&file.props.largest);
+            if largest <= lo.as_slice() || smallest >= hi.as_slice() {
+                continue;
+            }
+            file.reader()?.size_samples(&lo, &hi, &mut samples)?;
+        }
+        samples.sort_unstable_by(|a, b| key::cmp_bytes(a.0, b.0));
+        let total: u128 = samples.iter().map(|&(_, bytes)| bytes as u128).sum();
+        let (n, mut cuts) = (n as u128, Vec::new());
+        let (mut below, mut next) = (0u128, 1u128);
+        for (id, bytes) in samples {
+            below += bytes as u128;
+            // Past the next cut's share: cut here, once however many shares
+            // this sample crossed.
+            if next < n && below * n >= total * next {
+                // Strictly inside `(lo, hi)`, so a whole column family
+                // followed by a user key.
+                let user_key = &id[key::CF_LEN..];
+                if cuts
+                    .last()
+                    .is_none_or(|last: &Vec<u8>| last.as_slice() < user_key)
+                {
+                    cuts.push(user_key.to_vec());
+                }
+                while next < n && below * n >= total * next {
+                    next += 1;
+                }
+            }
+        }
+        Ok(cuts)
+    }
+
     /// One cursor per source that may hold keys of `cf`.
-    pub fn iterators(&self, cf: u32) -> Result<Vec<Box<dyn InternalIterator>>> {
-        let mut out: Vec<Box<dyn InternalIterator>> = Vec::new();
+    pub fn iterators(&self, cf: u32) -> Result<Vec<Source>> {
+        let mut out: Vec<Source> = Vec::new();
         for mem in std::iter::once(&self.mem).chain(&self.imms) {
-            out.push(Box::new(MemIter::new(mem.clone())));
+            out.push(Source::Mem(MemIter::new(mem.clone())));
         }
         let holds_cf = |f: &TableFile| {
             let (lo, hi) = (key::parse(&f.props.smallest), key::parse(&f.props.largest));
@@ -253,7 +298,7 @@ impl SuperVersion {
         };
         for file in &self.version.levels[0] {
             if holds_cf(file) {
-                out.push(Box::new(TableIter::new(file.reader()?.clone())));
+                out.push(Source::Table(TableIter::new(file.reader()?.clone())));
             }
         }
         // A deeper level is one sorted run: one cursor that opens only the
@@ -262,7 +307,7 @@ impl SuperVersion {
             let files: Vec<Arc<TableFile>> =
                 level.iter().filter(|f| holds_cf(f)).cloned().collect();
             if !files.is_empty() {
-                out.push(Box::new(LevelIter::new(files)));
+                out.push(Source::Level(LevelIter::new(files)));
             }
         }
         Ok(out)
@@ -315,6 +360,7 @@ impl LevelIter {
         }
     }
 
+    #[inline]
     fn current_valid(&self) -> bool {
         self.current.as_ref().is_some_and(|c| c.valid())
     }
@@ -407,6 +453,17 @@ impl InternalIterator for LevelIter {
         self.forward_to_valid();
     }
 
+    #[inline]
+    fn advance(&mut self) -> bool {
+        if let Some(c) = self.current.as_mut() {
+            if c.advance() {
+                return true;
+            }
+        }
+        self.forward_to_valid();
+        self.valid()
+    }
+
     fn prev(&mut self) {
         if let Some(c) = self.current.as_mut() {
             c.prev();
@@ -414,10 +471,12 @@ impl InternalIterator for LevelIter {
         self.backward_to_valid();
     }
 
+    #[inline]
     fn valid(&self) -> bool {
         self.error.is_none() && self.current_valid()
     }
 
+    #[inline]
     fn key(&self) -> &[u8] {
         self.current.as_ref().expect("valid").key()
     }
@@ -426,11 +485,85 @@ impl InternalIterator for LevelIter {
         self.current.as_ref().expect("valid").value()
     }
 
+    #[inline]
+    fn value_slice(&self) -> &[u8] {
+        self.current.as_ref().expect("valid").value_slice()
+    }
+
     fn status(&self) -> Result<()> {
         match &self.error {
             Some(e) => Err(e.clone()),
             None => self.current.as_ref().map_or(Ok(()), |c| c.status()),
         }
+    }
+}
+
+/// A cursor of any kind the merge reads, dispatched without a virtual call
+/// so that each step can be inlined into the merge.
+pub enum Source {
+    Mem(MemIter),
+    Table(TableIter),
+    Level(LevelIter),
+}
+
+macro_rules! each_source {
+    ($self:expr, $it:ident => $body:expr) => {
+        match $self {
+            Source::Mem($it) => $body,
+            Source::Table($it) => $body,
+            Source::Level($it) => $body,
+        }
+    };
+}
+
+impl InternalIterator for Source {
+    fn seek_ge(&mut self, target: &[u8]) {
+        each_source!(self, it => it.seek_ge(target))
+    }
+
+    fn seek_le(&mut self, target: &[u8]) {
+        each_source!(self, it => it.seek_le(target))
+    }
+
+    fn seek_to_last(&mut self) {
+        each_source!(self, it => it.seek_to_last())
+    }
+
+    #[inline]
+    fn next(&mut self) {
+        each_source!(self, it => it.next())
+    }
+
+    #[inline]
+    fn advance(&mut self) -> bool {
+        each_source!(self, it => it.advance())
+    }
+
+    fn prev(&mut self) {
+        each_source!(self, it => it.prev())
+    }
+
+    #[inline]
+    fn valid(&self) -> bool {
+        each_source!(self, it => it.valid())
+    }
+
+    #[inline]
+    fn key(&self) -> &[u8] {
+        each_source!(self, it => it.key())
+    }
+
+    fn value(&self) -> Bytes {
+        each_source!(self, it => it.value())
+    }
+
+    #[inline]
+    fn value_slice(&self) -> &[u8] {
+        each_source!(self, it => it.value_slice())
+    }
+
+    fn status(&self) -> Result<()> {
+        each_source!(self, it => it.status())
     }
 }
 

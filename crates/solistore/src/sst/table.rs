@@ -409,6 +409,12 @@ impl TableReader {
         self.data_block_at(Handle::decode(handle_bytes)?, fill)
     }
 
+    /// A data block if the cache holds it; nothing is read.
+    fn cached_block(&self, handle: Handle) -> Option<Block> {
+        let (cache, number) = self.cache.as_ref()?;
+        cache.get(*number, handle.offset)
+    }
+
     fn data_block_at(&self, handle: Handle, fill: bool) -> Result<Block> {
         if let Some((cache, number)) = &self.cache {
             if let Some(block) = cache.get(*number, handle.offset) {
@@ -433,7 +439,39 @@ impl TableReader {
         if !index.valid() {
             return Ok(self.data_end);
         }
-        Ok(Handle::decode(&index.value())?.offset)
+        Ok(Handle::decode(index.value_slice())?.offset)
+    }
+
+    /// Samples of where the data of `[lo, hi)` (`cf ‖ user key`) lies, for
+    /// cutting it into parts of equal size: one per index restart point
+    /// (every [`INDEX_RESTART_INTERVAL`] blocks) inside the range, its
+    /// separator's `cf ‖ user key` with the bytes of data blocks since the
+    /// sample before it. Read from the index alone, in place.
+    pub fn size_samples<'a>(
+        &'a self,
+        lo: &[u8],
+        hi: &[u8],
+        out: &mut Vec<(&'a [u8], u64)>,
+    ) -> Result<()> {
+        let mut last_offset = 0;
+        for entry in self.index.restart_entries() {
+            let (separator, handle) = entry?;
+            let handle = Handle::decode(handle)?;
+            // A corrupt handle must not overflow: it only skews a sample.
+            let end = handle
+                .offset
+                .saturating_add(handle.len)
+                .saturating_add(BLOCK_TRAILER as u64);
+            let id = key::cf_and_user_key(separator);
+            if id > lo && id < hi {
+                out.push((id, end.saturating_sub(last_offset)));
+            }
+            last_offset = end;
+            if id >= hi {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// The newest version of `user_key` at most `snapshot`, if this table has one.
@@ -499,7 +537,7 @@ impl TableReader {
             index.status()?;
             return Ok(None);
         }
-        let mut it = self.data_block(&index.value(), true)?.iter();
+        let mut it = self.data_block(index.value_slice(), true)?.iter();
         it.seek_to_first();
         it.status()?;
         if !it.valid() {
@@ -571,6 +609,12 @@ pub struct TableIter {
     table: Arc<TableReader>,
     index: BlockIter,
     data: Option<BlockIter>,
+    /// The key buffer of the last block's cursor, for the next one.
+    spare_key: Vec<u8>,
+    /// Walking forward, the block after the current one, with where its
+    /// entry is in the index: found in the cache, and its memory
+    /// prefetched, on entering the current one (see [`Block::prefetch`]).
+    ahead: Option<(usize, Block)>,
     error: Option<Error>,
     fill_cache: bool,
 }
@@ -582,6 +626,8 @@ impl TableIter {
             table,
             index,
             data: None,
+            spare_key: Vec::new(),
+            ahead: None,
             error: None,
             fill_cache: true,
         }
@@ -595,16 +641,23 @@ impl TableIter {
 
     /// Open the data block the index points at.
     fn load(&mut self) -> bool {
-        self.data = None;
+        if let Some(data) = self.data.take() {
+            self.spare_key = data.into_key();
+        }
         if !self.index.valid() {
             if let Err(e) = self.index.status() {
                 self.error = Some(e);
             }
             return false;
         }
-        match self.table.data_block(&self.index.value(), self.fill_cache) {
+        let block = match self.ahead.take() {
+            Some((entry, block)) if entry == self.index.offset() => Ok(block),
+            _ => Handle::decode(self.index.value_slice())
+                .and_then(|handle| self.table.data_block_at(handle, self.fill_cache)),
+        };
+        match block {
             Ok(block) => {
-                self.data = Some(block.iter());
+                self.data = Some(block.into_iter_with(std::mem::take(&mut self.spare_key)));
                 true
             }
             Err(e) => {
@@ -614,8 +667,30 @@ impl TableIter {
         }
     }
 
+    #[inline]
     fn data_valid(&self) -> bool {
         self.data.as_ref().is_some_and(|d| d.valid())
+    }
+
+    /// Walking forward into a block: find the next one in the cache and
+    /// start bringing it into the CPU's caches while this one is read. A
+    /// compaction, which reads blocks the cache mostly does not hold, does
+    /// not look.
+    fn look_ahead(&mut self) {
+        self.ahead = None;
+        if !self.fill_cache {
+            return;
+        }
+        let Some(next) = self.index.peek_next_value() else {
+            return;
+        };
+        if let Some(block) = Handle::decode(next)
+            .ok()
+            .and_then(|handle| self.table.cached_block(handle))
+        {
+            block.prefetch();
+            self.ahead = Some((self.index.next_offset(), block));
+        }
     }
 
     /// Past the end of a block: on to the first entry of the next one.
@@ -634,6 +709,7 @@ impl TableIter {
                 return;
             }
             self.data.as_mut().expect("loaded").seek_to_first();
+            self.look_ahead();
         }
     }
 
@@ -663,6 +739,9 @@ impl InternalIterator for TableIter {
         self.index.seek(target);
         if self.load() {
             self.data.as_mut().expect("loaded").seek(target);
+            if self.data_valid() {
+                self.look_ahead();
+            }
             self.skip_forward();
         }
     }
@@ -702,6 +781,18 @@ impl InternalIterator for TableIter {
         self.skip_forward();
     }
 
+    #[inline]
+    fn advance(&mut self) -> bool {
+        if let Some(d) = self.data.as_mut() {
+            d.next();
+            if d.valid() {
+                return true;
+            }
+        }
+        self.skip_forward();
+        self.valid()
+    }
+
     fn prev(&mut self) {
         if let Some(d) = self.data.as_mut() {
             d.prev();
@@ -709,16 +800,23 @@ impl InternalIterator for TableIter {
         self.skip_backward();
     }
 
+    #[inline]
     fn valid(&self) -> bool {
         self.error.is_none() && self.data_valid()
     }
 
+    #[inline]
     fn key(&self) -> &[u8] {
         self.data.as_ref().expect("valid").key()
     }
 
     fn value(&self) -> Bytes {
         self.data.as_ref().expect("valid").value()
+    }
+
+    #[inline]
+    fn value_slice(&self) -> &[u8] {
+        self.data.as_ref().expect("valid").value_slice()
     }
 
     fn status(&self) -> Result<()> {

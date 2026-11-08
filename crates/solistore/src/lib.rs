@@ -3,7 +3,10 @@
 //! It exists to replace RocksDB under SoliDB, so its surface is what SoliDB
 //! uses of RocksDB and no more: column families created and dropped at run
 //! time, atomic batches across them, range deletes, bounded iterators in both
-//! directions, checkpoints and a handful of size metrics.
+//! directions, checkpoints and a handful of size metrics. For whole-range
+//! reads it adds snapshots shared by many iterators, borrowed iteration
+//! ([`DbIterator::next_ref`]) and split points to cut a range into parallel
+//! parts ([`Db::split_points`]).
 //!
 //! Every commit is fsynced before it is acknowledged unless the database is
 //! opened in eventual mode; concurrent commits share one fsync.
@@ -25,6 +28,7 @@ mod log;
 mod manifest;
 mod memtable;
 mod skiplist;
+mod snapshot;
 mod sst;
 mod sync;
 mod version;
@@ -37,3 +41,4 @@ pub use db::{
 };
 pub use error::{Error, Result};
 pub use iter::{DbIterator, Direction, IteratorMode, ReadOptions};
+pub use snapshot::Snapshot;

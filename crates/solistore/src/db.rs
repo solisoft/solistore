@@ -50,6 +50,7 @@ use crate::key::{self, Kind, MAX_SEQ};
 use crate::log::{self, encode_record_parts, read_records};
 use crate::manifest::{self, file_no_u32, Edit, ManifestState, ManifestWriter, DEFAULT_CF};
 use crate::memtable::{self, Memtable};
+use crate::snapshot::Snapshot;
 use crate::sst::BlockCache;
 use crate::version::{by_smallest, table_name, SuperVersion, TableFile, Version, NUM_LEVELS};
 
@@ -329,7 +330,7 @@ impl ColumnFamily {
         self.inner.id
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         if self.inner.dropped.load(Ordering::Acquire) {
             Err(Error::ColumnFamilyDropped(self.inner.name.clone()))
         } else {
@@ -1304,6 +1305,38 @@ impl Db {
         let sv = inner.sv.load_full();
         let snapshot = inner.publisher.visible();
         DbIterator::new(sv, cf.id(), snapshot, opts, mode)
+    }
+
+    /// A consistent view of the whole database as of now, for any number
+    /// of iterators and point reads on any threads: see [`Snapshot`].
+    /// Released when dropped, with its clones.
+    pub fn snapshot(&self) -> Snapshot {
+        let inner = self.inner();
+        // The super version first, then the sequence: see `version`.
+        let sv = inner.sv.load_full();
+        let seq = inner.publisher.visible();
+        Snapshot::new(sv, seq)
+    }
+
+    /// Keys that cut `[lo, hi)` of `cf` into about `n` parts of equal size,
+    /// to scan them in parallel: at most `n - 1` user keys, increasing and
+    /// strictly between `lo` and `hi`, the parts being `[lo, k1)`,
+    /// `[k1, k2)` … `[k_last, hi)`.
+    ///
+    /// Sizes are bytes of table data, taken from the files' indexes (a
+    /// sample every four blocks, ~16 KiB) without reading a data block.
+    /// What is still in the memtables is not counted, so a range held
+    /// mostly there gets fewer cuts, or none. [`Snapshot::split_points`]
+    /// cuts the tables a snapshot reads.
+    pub fn split_points(
+        &self,
+        cf: &ColumnFamily,
+        lo: &[u8],
+        hi: &[u8],
+        n: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        cf.check()?;
+        self.inner().sv.load().split_points(cf.id(), lo, hi, n)
     }
 }
 
