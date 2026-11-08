@@ -101,6 +101,13 @@ trait Engine: Send + Sync {
     ) -> (u64, u64) {
         unimplemented!("parallel_scan")
     }
+    /// What the write path is doing now, for a per-second series: level-0
+    /// files, then cumulative counters (writes slowed, ms stopped, commit
+    /// groups, batches, WAL fsyncs, compactions), as far as the engine has
+    /// them.
+    fn write_state(&self) -> [u64; 7] {
+        [0; 7]
+    }
     /// Engine counters as a JSON object, printed with every phase.
     fn stats(&self) -> String {
         String::new()
@@ -471,6 +478,9 @@ mod soli {
             if let Some(n) = t.compactions {
                 opts.max_background_compactions = n;
             }
+            if let Some(n) = t.l0_slowdown {
+                opts.level0_slowdown_trigger = n;
+            }
             if let Some(n) = t.recycle_wals {
                 opts.recycle_wal_files = n;
             }
@@ -671,6 +681,19 @@ mod soli {
                     .map(|h| h.join().unwrap())
                     .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
             })
+        }
+
+        fn write_state(&self) -> [u64; 7] {
+            let s = self.db.stats();
+            [
+                self.db.files_per_level()[0] as u64,
+                s.l0_slowdowns,
+                s.l0_stop_micros / 1000,
+                s.commit_groups,
+                s.committed_batches,
+                s.wal_fsyncs,
+                s.compactions,
+            ]
         }
 
         fn stats(&self) -> String {
@@ -877,6 +900,8 @@ struct SoliTuning {
     compactions: Option<usize>,
     /// Dead WAL files kept for reuse.
     recycle_wals: Option<usize>,
+    /// Level-0 files at which writes slow down.
+    l0_slowdown: Option<usize>,
     /// Block cache size (default 512 MiB, SoliDB's).
     cache_mb: Option<usize>,
 }
@@ -954,6 +979,8 @@ struct Params {
     scan_random: bool,
     /// Run only this scan phase (for profiling one path).
     only: Option<String>,
+    /// Sustained writes: fsync every commit.
+    sync: bool,
     rocks: RocksTuning,
     soli: SoliTuning,
 }
@@ -981,6 +1008,7 @@ impl Params {
             scan_threads: 8,
             scan_random: true,
             only: None,
+            sync: false,
             rocks: RocksTuning::default(),
             soli: SoliTuning::default(),
         };
@@ -1009,6 +1037,7 @@ impl Params {
                 "--sx-buffer-mb" => p.soli.buffer_mb = Some(value.parse().unwrap()),
                 "--sx-compactions" => p.soli.compactions = Some(value.parse().unwrap()),
                 "--sx-recycle-wals" => p.soli.recycle_wals = Some(value.parse().unwrap()),
+                "--sx-l0-slowdown" => p.soli.l0_slowdown = Some(value.parse().unwrap()),
                 "--cache-mb" => {
                     p.rocks.cache_mb = Some(value.parse().unwrap());
                     p.soli.cache_mb = Some(value.parse().unwrap());
@@ -1017,6 +1046,7 @@ impl Params {
                 "--scan-threads" => p.scan_threads = value.parse().unwrap(),
                 "--order" => p.scan_random = value == "random",
                 "--only" => p.only = Some(value),
+                "--sync" => p.sync = value == "1",
                 flag => panic!("unknown flag {flag}"),
             }
             i += 2;
@@ -1818,6 +1848,112 @@ fn scan(p: Params) {
     read_phase(&format!("multi_get_10_{}t", p.threads), p.threads, 10);
 }
 
+// ---------------------------------------------------------------- sustained writes
+
+/// SoliDB's inserts, sustained: `--threads` writers each commit one document
+/// with its three index entries per batch (fsynced with `--sync 1`) for
+/// `--mixed-secs` seconds, on a database that grows as it goes. One line
+/// at the end, with per-second series: operations, p99 (µs), level-0
+/// files, and per second writes slowed, ms stopped, batches per commit
+/// group, WAL fsyncs and compactions finished. Where the throughput sags
+/// as the data grows, the series says whether level 0 did.
+fn sustain(p: Params) {
+    std::fs::create_dir_all(&p.dir).unwrap();
+    let engine: Arc<dyn Engine> = Arc::from(open_engine(&p));
+    *STATS_SOURCE.lock().unwrap() = Some(engine.clone());
+    for coll in 1..=p.collections {
+        engine.create_collection(coll);
+    }
+    let secs = p.mixed_secs as usize;
+    let next = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let start = Instant::now();
+    let before = counters();
+    let mut states = Vec::new();
+    let (lat, logical) = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..p.threads)
+            .map(|t| {
+                let (engine, p, next, stop) = (&engine, &p, &next, &stop);
+                scope.spawn(move || {
+                    let mut rng = StdRng::seed_from_u64(70_000 + t);
+                    let (mut lat, mut bytes) = (Vec::new(), 0u64);
+                    while !stop.load(Ordering::Relaxed) {
+                        let n = next.fetch_add(1, Ordering::Relaxed);
+                        let ops = insert_ops(p, n, &mut rng);
+                        bytes += ops.iter().map(Op::logical_bytes).sum::<u64>();
+                        let t0 = Instant::now();
+                        engine.write(ops, p.sync);
+                        let second = start.elapsed().as_secs() as usize;
+                        lat.push((
+                            second,
+                            t0.elapsed().as_micros().min(u32::MAX as u128) as u32,
+                        ));
+                    }
+                    (lat, bytes)
+                })
+            })
+            .collect();
+        for s in 1..=secs {
+            std::thread::sleep(
+                (start + Duration::from_secs(s as u64)).saturating_duration_since(Instant::now()),
+            );
+            states.push(engine.write_state());
+        }
+        stop.store(true, Ordering::Relaxed);
+        let mut all = Vec::new();
+        let mut logical = 0;
+        for h in handles {
+            let (lat, bytes) = h.join().unwrap();
+            all.extend(lat);
+            logical += bytes;
+        }
+        (all, logical)
+    });
+    let mut per_second: Vec<Vec<u32>> = vec![Vec::new(); secs];
+    for &(second, us) in lat.iter().filter(|(s, _)| *s < secs) {
+        per_second[second].push(us);
+    }
+    let ops: Vec<usize> = per_second.iter().map(Vec::len).collect();
+    let p99: Vec<u32> = per_second
+        .iter_mut()
+        .map(|l| {
+            l.sort_unstable();
+            percentile(l, 0.99)
+        })
+        .collect();
+    let delta = |i: usize| -> Vec<u64> {
+        let mut prev = 0;
+        states
+            .iter()
+            .map(|s| {
+                let d = s[i] - prev.min(s[i]);
+                prev = s[i];
+                d
+            })
+            .collect()
+    };
+    let (groups, batches) = (delta(3), delta(4));
+    let per_group: Vec<String> = groups
+        .iter()
+        .zip(&batches)
+        .map(|(g, b)| format!("{:.1}", *b as f64 / (*g).max(1) as f64))
+        .collect();
+    let mut phase = Phase::new(&p, if p.sync { "sustain_sync" } else { "sustain" });
+    phase.ops = ops.iter().sum::<usize>() as u64;
+    phase.lat_us = lat.into_iter().map(|(_, us)| us).collect();
+    phase.logical_bytes = logical;
+    phase.extra = format!(
+        r#","series_ops":{ops:?},"series_p99_us":{p99:?},"series_l0":{:?},"series_slowed":{:?},"series_stop_ms":{:?},"series_batches_per_group":[{}],"series_fsyncs":{:?},"series_compactions":{:?}"#,
+        states.iter().map(|s| s[0]).collect::<Vec<_>>(),
+        delta(1),
+        delta(2),
+        per_group.join(","),
+        delta(5),
+        delta(6),
+    );
+    phase.print(before);
+}
+
 // ---------------------------------------------------------------- crash
 
 /// Child: commit fsync'd batches forever, printing each acknowledged seq.
@@ -2017,6 +2153,7 @@ fn main() {
         "crash-child" => crash_child(params),
         "visibility" => visibility(params),
         "scan" => scan(params),
+        "sustain" => sustain(params),
         other => panic!("unknown mode {other:?}: run | crash | visibility | scan"),
     }
 }
