@@ -25,8 +25,9 @@ use crate::skiplist::{Cursor, SkipList};
 /// bounds. Entries count exactly what their skiplist node takes.
 const TOMBSTONE_OVERHEAD: usize = std::mem::size_of::<RangeTombstone>();
 
-/// A value handed out by a point lookup, as its own allocation when it is a
-/// small part of the buffer it slices (`backing` bytes).
+/// A value handed out by a point lookup, read in place in a buffer of
+/// `backing` bytes: copied out as its own allocation when it is a small
+/// part of that buffer, else `handle()`, a slice of it.
 ///
 /// A `Bytes` slice keeps its whole buffer alive: a 250-byte document read
 /// from a table pinned its 4 KiB decoded block for as long as the caller
@@ -36,16 +37,6 @@ const TOMBSTONE_OVERHEAD: usize = std::mem::size_of::<RangeTombstone>();
 /// ~450 MB above RocksDB's, whose bindings copy every value out. Copying a
 /// value that small costs nothing next to the decompression that produced
 /// it. A value that is most of its buffer is handed out as it is.
-pub(crate) fn detach(value: Bytes, backing: usize) -> Bytes {
-    if copies(value.len(), backing) {
-        Bytes::copy_from_slice(&value)
-    } else {
-        value
-    }
-}
-
-/// [`detach`] for a value read in place: copy `value` out, or take
-/// `handle()` on its buffer of `backing` bytes, by the same rule.
 pub(crate) fn detach_from(value: &[u8], backing: usize, handle: impl FnOnce() -> Bytes) -> Bytes {
     if copies(value.len(), backing) {
         Bytes::copy_from_slice(value)
@@ -194,16 +185,37 @@ impl Memtable {
 
     /// [`Memtable::get`] for a key a read built once for every source.
     pub fn get_at(&self, lookup: &key::LookupKey<'_>) -> Option<Version> {
-        let at = self.map.seek_ge(lookup.internal())?;
-        // SAFETY: `at` comes from `self.map`.
-        let found = key::parse(unsafe { self.map.key(at) })?;
         // A copy, as RocksDB's bindings make: a slice of the arena would
         // keep the whole memtable alive past its flush.
-        (found.cf == lookup.cf && found.user_key == lookup.user_key).then(|| Version {
-            seq: found.seq,
-            kind: found.kind,
-            value: Bytes::copy_from_slice(unsafe { self.map.value(at) }),
+        self.get_ref(lookup).map(|(seq, kind, value)| Version {
+            seq,
+            kind,
+            value: Bytes::copy_from_slice(value),
         })
+    }
+
+    /// The newest version of `lookup`'s key at its snapshot: sequence
+    /// number, kind and value, read in place in the arena.
+    #[inline]
+    pub fn get_ref(&self, lookup: &key::LookupKey<'_>) -> Option<(u64, Kind, &[u8])> {
+        let at = self.map.seek_ge(lookup.internal())?;
+        // SAFETY: `at` comes from `self.map`, and the bytes live as long
+        // as it does.
+        let found = key::parse(unsafe { self.map.key(at) })?;
+        (found.cf == lookup.cf && key::eq_bytes(found.user_key, lookup.user_key))
+            .then(|| (found.seq, found.kind, unsafe { self.map.value(at) }))
+    }
+
+    /// No entry at all (range tombstones aside): a point read can skip it.
+    #[inline]
+    pub fn has_no_entries(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Whether any range tombstone was written to it.
+    #[inline]
+    pub fn has_tombstones(&self) -> bool {
+        self.has_tombstones.load(Ordering::Acquire)
     }
 
     pub fn tombstones(&self) -> Vec<RangeTombstone> {

@@ -22,6 +22,7 @@ pub mod fs;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
+mod hint;
 mod iter;
 mod key;
 mod log;

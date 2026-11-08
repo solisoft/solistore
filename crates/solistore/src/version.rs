@@ -25,6 +25,8 @@ use crate::fs::Fs;
 use crate::iter::InternalIterator;
 use crate::key::{self, Kind};
 use crate::memtable::{covering_seq, MemIter, Memtable, RangeTombstone, Version as Found};
+use crate::sst::block::{shared_prefix, word_after, Block};
+use crate::sst::table::{with_seek_key, BlockAt};
 use crate::sst::{bloom, BlockCache, TableIter, TableProps, TableReader};
 
 pub const NUM_LEVELS: usize = 7;
@@ -119,10 +121,27 @@ impl TableFile {
         self.obsolete.store(true, AtomicOrdering::Release);
     }
 
+    /// The table's reader if it is open already: nothing is read.
+    #[inline]
+    pub fn opened(&self) -> Option<&Arc<TableReader>> {
+        self.reader.get()
+    }
+
     /// Whether `cf ‖ user_key` falls between the table's first and last keys.
+    ///
+    /// Slice comparisons, not `key::cmp_bytes`: bounds and probes share
+    /// 20-odd bytes, which the library's vectorised memcmp compares in a
+    /// quarter of the instructions.
+    #[inline]
     pub fn may_hold(&self, cf_and_user_key: &[u8]) -> bool {
         key::cf_and_user_key(&self.props.smallest) <= cf_and_user_key
-            && cf_and_user_key <= key::cf_and_user_key(&self.props.largest)
+            && cf_and_user_key <= self.largest_id()
+    }
+
+    /// `cf ‖ user key` of the table's last key.
+    #[inline]
+    pub fn largest_id(&self) -> &[u8] {
+        key::cf_and_user_key(&self.props.largest)
     }
 }
 
@@ -181,17 +200,28 @@ impl SuperVersion {
         let Some(found) = self.newest(cf, user_key, snapshot)? else {
             return Ok(None);
         };
-        if found.kind == Kind::Delete || self.tombstone_seq(cf, user_key, snapshot) > found.seq {
+        if found.kind == Kind::Delete
+            || self.has_tombstones() && self.tombstone_seq(cf, user_key, snapshot) > found.seq
+        {
             return Ok(None);
         }
         Ok(Some(found.value))
     }
 
+    /// Whether any range tombstone is in sight: the version's, or one in a
+    /// memtable.
+    #[inline]
+    fn has_tombstones(&self) -> bool {
+        !self.version.tombstones.is_empty()
+            || std::iter::once(&self.mem)
+                .chain(&self.imms)
+                .any(|m| m.has_tombstones())
+    }
+
     /// The newest version at or below `snapshot`: sources are searched newest
     /// first, so the first hit wins.
     fn newest(&self, cf: u32, user_key: &[u8], snapshot: u64) -> Result<Option<Found>> {
-        // One key for every source, and one bloom hash for every table,
-        // taken at the first table probed.
+        // One key for every source, and one bloom hash for every table.
         let lookup = key::LookupKey::new(cf, user_key, snapshot);
         for mem in std::iter::once(&self.mem).chain(&self.imms) {
             if let Some(found) = mem.get_at(&lookup) {
@@ -199,25 +229,229 @@ impl SuperVersion {
             }
         }
         let probe = lookup.id();
-        let mut hash = None;
-        let mut hash = || *hash.get_or_insert_with(|| bloom::hash(probe));
-        for file in &self.version.levels[0] {
+        let levels = &self.version.levels;
+        // The one file of each deeper level that may hold the key, found
+        // before any table is probed: their filter lines, likely cache
+        // misses each, are then fetched together with level 0's.
+        let mut deeper: [Option<&Arc<TableFile>>; NUM_LEVELS] = [None; NUM_LEVELS];
+        let mut any = false;
+        for (slot, level) in deeper.iter_mut().zip(levels).skip(1) {
+            *slot = file_for(level, probe);
+            any |= slot.is_some();
+        }
+        if !any && !levels[0].iter().any(|f| f.may_hold(probe)) {
+            return Ok(None);
+        }
+        let hash = bloom::hash(probe);
+        for file in deeper.iter().flatten() {
+            if let Some(reader) = file.opened() {
+                reader.prefetch_filter(hash);
+            }
+        }
+        for file in &levels[0] {
             if file.may_hold(probe) {
-                if let Some(found) = file.reader()?.get_at(&lookup, hash())? {
+                if let Some(found) = file.reader()?.get_at(&lookup, hash)? {
                     return Ok(Some(found));
                 }
             }
         }
-        for level in &self.version.levels[1..] {
-            // Sorted and disjoint: at most one file can hold the key.
-            let at = level.partition_point(|f| key::cf_and_user_key(&f.props.largest) < probe);
-            if let Some(file) = level.get(at).filter(|f| f.may_hold(probe)) {
-                if let Some(found) = file.reader()?.get_at(&lookup, hash())? {
-                    return Ok(Some(found));
-                }
+        for file in deeper.iter().flatten() {
+            if let Some(found) = file.reader()?.get_at(&lookup, hash)? {
+                return Ok(Some(found));
             }
         }
         Ok(None)
+    }
+
+    /// The values of `keys` of `cf` at `snapshot`, handed to `emit` in the
+    /// order of `keys` with their position, borrowed from the memtables and
+    /// data blocks they were found in: [`crate::Db::multi_get_with`].
+    ///
+    /// One pass over the sources for all the keys, in key order: each
+    /// memtable once, then each sorted run of tables (a level-0 file, or a
+    /// deeper level) for the keys still missing, in stages that let their
+    /// cache misses overlap (see [`SuperVersion::read_run`]). Keys that
+    /// fall in one data block read it once.
+    pub fn multi_get<K: AsRef<[u8]>>(
+        &self,
+        cf: u32,
+        keys: &[K],
+        snapshot: u64,
+        mut emit: impl FnMut(usize, Option<ValueRef<'_>>),
+    ) -> Result<()> {
+        let mut probes: Vec<Probe<'_, '_>> = keys
+            .iter()
+            .map(|k| Probe {
+                lookup: key::LookupKey::new(cf, k.as_ref(), snapshot),
+                hash: 0,
+                found: None,
+            })
+            .collect();
+        let order = key_order(&probes);
+        let mut missing = probes.len();
+        for mem in std::iter::once(&self.mem).chain(&self.imms) {
+            if missing == 0 || mem.has_no_entries() {
+                continue;
+            }
+            for &i in &order {
+                let p = &mut probes[i as usize];
+                if p.found.is_none() {
+                    if let Some((seq, kind, value)) = mem.get_ref(&p.lookup) {
+                        p.found = Some(Hit::Mem { seq, kind, value });
+                        missing -= 1;
+                    }
+                }
+            }
+        }
+        let mut blocks: Vec<Block> = Vec::new();
+        if missing > 0 {
+            for p in probes.iter_mut().filter(|p| p.found.is_none()) {
+                p.hash = bloom::hash(p.lookup.id());
+            }
+            with_seek_key(|key| -> Result<()> {
+                let mut todo = Vec::new();
+                // Level 0's files overlap, newest first: each is a run.
+                let runs = self.version.levels[0]
+                    .iter()
+                    .map(std::slice::from_ref)
+                    .chain(self.version.levels[1..].iter().map(Vec::as_slice));
+                for run in runs {
+                    if missing == 0 {
+                        break;
+                    }
+                    if !run.is_empty() {
+                        missing -=
+                            Self::read_run(run, &order, &mut probes, &mut blocks, &mut todo, key)?;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        let tombstones = self.has_tombstones();
+        for (i, p) in probes.iter().enumerate() {
+            let (seq, value) = match p.found {
+                Some(Hit::Mem {
+                    seq,
+                    kind: Kind::Put,
+                    value,
+                }) => (seq, ValueRef::Mem(value)),
+                Some(Hit::Table {
+                    seq,
+                    kind: Kind::Put,
+                    block,
+                    value,
+                }) => (seq, ValueRef::Block(&blocks[block], value.0, value.1)),
+                _ => {
+                    emit(i, None);
+                    continue;
+                }
+            };
+            let deleted = tombstones && self.tombstone_seq(cf, p.lookup.user_key, snapshot) > seq;
+            emit(i, (!deleted).then_some(value));
+        }
+        Ok(())
+    }
+
+    /// Look the keys still missing up in one sorted run of tables, in key
+    /// order, a stage at a time over all of them: each key's file and its
+    /// filter line fetched, then the filters read; each key's data block
+    /// found from the fences and taken from the cache (which starts
+    /// fetching its entries), a block shared by consecutive keys once; then
+    /// each block searched. A single get waits for one cache miss after
+    /// another; here those of different keys are in flight together.
+    /// Returns how many keys it found.
+    fn read_run<'r>(
+        run: &'r [Arc<TableFile>],
+        order: &[u32],
+        probes: &mut [Probe<'_, '_>],
+        blocks: &mut Vec<Block>,
+        todo: &mut Vec<Todo<'r>>,
+        key: &mut Vec<u8>,
+    ) -> Result<usize> {
+        todo.clear();
+        let (mut at, mut reader) = (0, None);
+        for &i in order {
+            let p = &probes[i as usize];
+            if p.found.is_some() {
+                continue;
+            }
+            let id = p.lookup.id();
+            while at < run.len() && run[at].largest_id() < id {
+                at += 1;
+                reader = None;
+            }
+            if at == run.len() {
+                break;
+            }
+            if key::cf_and_user_key(&run[at].props.smallest) <= id {
+                let r = match reader {
+                    Some(r) => r,
+                    None => &**run[at].reader()?,
+                };
+                reader = Some(r);
+                r.prefetch_filter(p.hash);
+                todo.push(Todo {
+                    probe: i,
+                    reader: r,
+                    block: u32::MAX,
+                    at: None,
+                });
+            }
+        }
+        todo.retain(|t| t.reader.may_contain(probes[t.probe as usize].hash));
+        // Each key's block, read once for consecutive keys in it.
+        let mut last: Option<(*const TableReader, u64, u32)> = None;
+        for t in todo.iter_mut() {
+            let Some(place) = t
+                .reader
+                .block_for(probes[t.probe as usize].lookup.internal(), key)?
+            else {
+                continue;
+            };
+            t.at = Some(place);
+            let table: *const TableReader = t.reader;
+            t.block = match last {
+                Some((last_table, offset, slot))
+                    if std::ptr::eq(last_table, table) && offset == place.handle.offset =>
+                {
+                    slot
+                }
+                _ => {
+                    blocks.push(t.reader.data_block_at(place.handle, true)?);
+                    let slot = (blocks.len() - 1) as u32;
+                    last = Some((table, place.handle.offset, slot));
+                    slot
+                }
+            };
+        }
+        let mut found = 0;
+        for t in todo.iter() {
+            let Some(place) = t.at else {
+                continue;
+            };
+            let p = &mut probes[t.probe as usize];
+            let mut block = t.block as usize;
+            let mut located = t.reader.version_in(&blocks[block], &p.lookup, key)?;
+            if located.is_none() {
+                // Past every entry of its block: the next one's first
+                // entry decides.
+                if let Some(next) = t.reader.next_block(p.lookup.internal(), place.number)? {
+                    blocks.push(t.reader.data_block_at(next.handle, true)?);
+                    block = blocks.len() - 1;
+                    located = t.reader.version_in(&blocks[block], &p.lookup, key)?;
+                }
+            }
+            if let Some(Some(hit)) = located {
+                p.found = Some(Hit::Table {
+                    seq: hit.seq,
+                    kind: hit.kind,
+                    block,
+                    value: hit.value,
+                });
+                found += 1;
+            }
+        }
+        Ok(found)
     }
 
     pub fn tombstone_seq(&self, cf: u32, user_key: &[u8], snapshot: u64) -> u64 {
@@ -315,6 +549,115 @@ impl SuperVersion {
         }
         Ok(out)
     }
+}
+
+/// The file of a sorted level whose key range holds `id` (`cf ‖ user
+/// key`), if any.
+#[inline]
+fn file_for<'a>(level: &'a [Arc<TableFile>], id: &[u8]) -> Option<&'a Arc<TableFile>> {
+    let at = level.partition_point(|f| f.largest_id() < id);
+    // At or before its last key: only the first is left to check.
+    level
+        .get(at)
+        .filter(|f| key::cf_and_user_key(&f.props.smallest) <= id)
+}
+
+/// A value a batched read found, borrowed from where it lies.
+pub enum ValueRef<'a> {
+    /// In a memtable's arena.
+    Mem(&'a [u8]),
+    /// In a data block, at this range.
+    Block(&'a Block, usize, usize),
+}
+
+impl ValueRef<'_> {
+    #[inline]
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            ValueRef::Mem(value) => value,
+            ValueRef::Block(block, start, end) => &block.bytes()[*start..*end],
+        }
+    }
+
+    /// The value as a `get` hands it out: copied out of a memtable, and out
+    /// of a block unless it is most of it (see `memtable::detach`).
+    pub fn to_bytes(&self) -> Bytes {
+        match self {
+            ValueRef::Mem(value) => Bytes::copy_from_slice(value),
+            ValueRef::Block(block, start, end) => {
+                crate::memtable::detach_from(&block.bytes()[*start..*end], block.size(), || {
+                    block.slice(*start..*end)
+                })
+            }
+        }
+    }
+}
+
+/// A key a batched read looks for, and what it found.
+struct Probe<'k, 'v> {
+    lookup: key::LookupKey<'k>,
+    /// Its bloom hash, once a table is to be probed.
+    hash: u64,
+    found: Option<Hit<'v>>,
+}
+
+/// The newest version of a key at the snapshot, where a batched read found it.
+#[derive(Clone, Copy)]
+enum Hit<'v> {
+    Mem {
+        seq: u64,
+        kind: Kind,
+        value: &'v [u8],
+    },
+    /// In the read's block `block`, at `value`.
+    Table {
+        seq: u64,
+        kind: Kind,
+        block: usize,
+        value: (usize, usize),
+    },
+}
+
+/// A key a batched read is to look up in one table of a run.
+struct Todo<'r> {
+    probe: u32,
+    reader: &'r TableReader,
+    /// Its data block among the read's blocks, once taken.
+    block: u32,
+    at: Option<BlockAt>,
+}
+
+/// The positions of `probes` in key order. Sorted by the eight bytes of
+/// their identities after the prefix all of them share, whole identities
+/// only among equal words: a batch's keys share 20-odd bytes (column
+/// family, keyspace, `doc:`), and comparing those at every step of the sort
+/// cost more than the rest of the batch. Keys already in order are not
+/// sorted.
+fn key_order(probes: &[Probe<'_, '_>]) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..probes.len() as u32).collect();
+    let Some(first) = probes.first() else {
+        return order;
+    };
+    let first = first.lookup.id();
+    let p = probes
+        .iter()
+        .map(|q| shared_prefix(first, q.lookup.id()))
+        .min()
+        .unwrap_or(0);
+    let words: Vec<u64> = probes
+        .iter()
+        .map(|q| word_after(q.lookup.id(), p))
+        .collect();
+    let id = |i: u32| probes[i as usize].lookup.id();
+    let before = |a: u32, b: u32| {
+        words[a as usize]
+            .cmp(&words[b as usize])
+            .then_with(|| id(a).cmp(id(b)))
+    };
+    if !order.is_sorted_by(|&a, &b| before(a, b).is_le()) {
+        order.sort_unstable_by(|&a, &b| before(a, b));
+    }
+    order
 }
 
 /// A cursor over a sorted run of disjoint tables (a level below 0).

@@ -31,7 +31,7 @@ pub struct BlockBuilder {
 /// Length of the common prefix of `a` and `b`, compared eight bytes at a
 /// time.
 #[inline]
-fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
+pub(crate) fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
     let mut i = 0;
     while i + 8 <= n {
@@ -46,6 +46,37 @@ fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
         i += 1;
     }
     i
+}
+
+/// Where each of a block's entries (`data`, up to the restart array)
+/// starts, read from their headers alone, when there are at most
+/// [`MAX_LISTED`] and the block is under 64 KiB; else none. A malformed
+/// entry also lists none: searches report it.
+fn list_entries(data: &[u8]) -> ([u16; MAX_LISTED], u8) {
+    let mut starts = [0u16; MAX_LISTED];
+    if data.len() > usize::from(u16::MAX) {
+        return (starts, 0);
+    }
+    let (mut at, mut n) = (0, 0);
+    while at < data.len() {
+        if n == MAX_LISTED {
+            return (starts, 0);
+        }
+        let Some((_, unshared, value_len, header)) = entry_header(&data[at..]) else {
+            return (starts, 0);
+        };
+        starts[n] = at as u16;
+        n += 1;
+        at = match at
+            .checked_add(header)
+            .and_then(|a| a.checked_add(unshared))
+            .and_then(|a| a.checked_add(value_len))
+        {
+            Some(next) if next <= data.len() => next,
+            _ => return (starts, 0),
+        };
+    }
+    (starts, n as u8)
 }
 
 /// Decode an entry header (`shared`, `unshared`, `value_len`), returning it
@@ -128,6 +159,9 @@ impl BlockBuilder {
     }
 }
 
+/// Blocks of at most this many entries keep where each one starts.
+const MAX_LISTED: usize = 16;
+
 /// A decoded block, shared by every iterator over it.
 #[derive(Clone)]
 pub struct Block {
@@ -135,6 +169,15 @@ pub struct Block {
     /// Where the restart array starts (= where entries end).
     restarts: usize,
     num_restarts: usize,
+    /// Where each entry starts, for a block of at most [`MAX_LISTED`]
+    /// entries within 64 KiB (`listed` of them; 0 for any other): found
+    /// from the entries' headers when the block is decoded, so that a read
+    /// can fetch every header it will step over at once (see
+    /// [`Block::prefetch_entries`]). Kept in the block's handle, which the
+    /// block cache holds in the entry a hit has already read: no miss of
+    /// its own.
+    starts: [u16; MAX_LISTED],
+    listed: u8,
 }
 
 fn corrupt() -> Error {
@@ -152,11 +195,34 @@ impl Block {
         if num_restarts == 0 {
             return Err(corrupt());
         }
+        let (starts, listed) = list_entries(&data[..restarts]);
         Ok(Block {
             data,
             restarts,
             num_restarts,
+            starts,
+            listed,
         })
+    }
+
+    /// Start fetching the cache lines of every entry's header and the key
+    /// bytes after it, from the entries' places alone (nothing for a block
+    /// that does not keep them).
+    ///
+    /// A seek steps over the entries one after another, and each header
+    /// says where the next one is: with entries of a few hundred bytes,
+    /// each is a cache miss that only begins once the one before is read.
+    /// Asked for together, they arrive together. A SoliDB document block
+    /// holds about nine.
+    #[inline]
+    pub fn prefetch_entries(&self) {
+        let base = self.data.as_ptr();
+        for &at in &self.starts[..self.listed as usize] {
+            let at = base.wrapping_add(at as usize);
+            crate::hint::prefetch_line(at);
+            // Header and key bytes may run into the next line.
+            crate::hint::prefetch_line(at.wrapping_add(32));
+        }
     }
 
     pub fn size(&self) -> usize {
@@ -240,38 +306,17 @@ impl Block {
         &self.data
     }
 
-    /// Start bringing the whole block into the CPU's caches, for a walk
-    /// about to read it.
+    /// Start bringing the whole block into the CPU's caches, for a read
+    /// about to walk it.
     ///
     /// Each cached block is its own allocation, and a walk reads one entry
     /// every few hundred bytes, too few for the hardware prefetcher to
     /// follow within 4 KiB: without this, a warm full scan spent most of
-    /// its time waiting for the memory of each next entry.
+    /// its time waiting for the memory of each next entry, and a point
+    /// read waited for each entry it stepped over in turn.
     #[inline]
     pub fn prefetch(&self) {
-        #[cfg(all(target_arch = "x86_64", not(miri)))]
-        {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let (start, len) = (self.data.as_ptr(), self.data.len());
-            // SAFETY: a prefetch is a hint. It never faults and has no
-            // effect a program can observe besides timing; every address is
-            // inside a live slice anyway.
-            #[allow(unused_unsafe)]
-            let line =
-                |at: usize| unsafe { _mm_prefetch::<_MM_HINT_T0>(start.wrapping_add(at).cast()) };
-            let mut at = 0;
-            while at + 256 <= len {
-                line(at);
-                line(at + 64);
-                line(at + 128);
-                line(at + 192);
-                at += 256;
-            }
-            while at < len {
-                line(at);
-                at += 64;
-            }
-        }
+        crate::hint::prefetch(&self.data);
     }
 
     /// A handle on part of the block, which keeps the whole block alive.
@@ -318,95 +363,353 @@ impl Block {
             }
         }
         let data = &self.data[..self.restarts];
-        let mut at = self.restart_point(left);
-        key.clear();
-        while at < self.restarts {
-            let (value, next) = parse_entry(data, at, key).ok_or_else(corrupt)?;
-            if key::compare(key, target) != Ordering::Less {
-                return Ok(Some(Entry { offset: at, value }));
-            }
-            at = next;
+        let start = self.restart_point(left);
+        match seek_in_place(data, start, target, key)? {
+            Some(found) => Ok(found),
+            None => seek_rebuilding(data, start, target, key),
         }
-        Ok(None)
     }
 }
 
-/// The restart keys of an index block reduced to integers: the eight bytes
-/// of each key's `cf ‖ user key` after the prefix all of them share. A
-/// seek binary-searches these, in a small array of its own, and compares
-/// whole keys only among restart points that tie.
+/// The first entry from `at` on that is at or after `target`, without
+/// rebuilding the keys stepped over: `Ok(Some(..))` once decided, its key
+/// then left in `key`; `Ok(None)` for keys this cannot order on their bytes
+/// alone (an identity that is a prefix of the other's, among others), for
+/// [`seek_rebuilding`] to decide.
+///
+/// A key repeats `shared` bytes of the one before. Say the last key agreed
+/// with the target on `same` bytes and was below it at the next one, inside
+/// both identities. A key repeating more than `same` bytes has that same
+/// smaller byte there: it is below the target too, whatever follows. A key
+/// repeating at most `same` bytes is the target's first `shared` bytes
+/// followed by its own: only those are compared. A walk over a block
+/// rebuilt every key (a copy) and compared it from its first byte; SoliDB's
+/// keys share 30-odd bytes, and differ in the last few digits.
+#[inline]
+fn seek_in_place(
+    data: &[u8],
+    mut at: usize,
+    target: &[u8],
+    key: &mut Vec<u8>,
+) -> Result<Option<Option<Entry>>> {
+    let Some(target_id) = target.len().checked_sub(key::TRAILER_LEN) else {
+        return Ok(None);
+    };
+    // Bytes the last key shares with the target; whether it is below the
+    // target at the next one, inside the target's identity; its length.
+    let (mut same, mut skip, mut last_len) = (0, false, 0);
+    while at < data.len() {
+        let (shared, unshared, value_len, header) =
+            entry_header(&data[at..]).ok_or_else(corrupt)?;
+        // Saturated: an overflow lands past the end, which is refused.
+        let key_start = at.saturating_add(header);
+        let value_start = key_start.saturating_add(unshared);
+        let value_end = value_start.saturating_add(value_len);
+        if value_end > data.len() || shared > last_len {
+            return Err(corrupt());
+        }
+        last_len = shared + unshared;
+        if shared > same {
+            if !skip {
+                return Ok(None);
+            }
+            at = value_end;
+            continue;
+        }
+        // This key is `target[..shared] ‖ own`.
+        let own = &data[key_start..value_start];
+        let p = shared + shared_prefix(own, &target[shared..]);
+        let Some(key_id) = last_len.checked_sub(key::TRAILER_LEN) else {
+            return Ok(None);
+        };
+        let order = if p < key_id && p < target_id {
+            // The identities differ at `p`.
+            own[p - shared].cmp(&target[p])
+        } else if key_id != target_id {
+            // One identity is a prefix of the other: the shorter is first.
+            key_id.cmp(&target_id)
+        } else {
+            // The same identity: newest first. The trailer is this key's
+            // own last bytes, unless it repeats some of the last key's.
+            let trailer = match own.get(key_id.wrapping_sub(shared)..) {
+                Some(tail) if shared <= key_id => {
+                    u64::from_le_bytes(tail.try_into().expect("a whole trailer"))
+                }
+                _ => {
+                    let mut trailer = [0u8; key::TRAILER_LEN];
+                    for (i, b) in trailer.iter_mut().enumerate() {
+                        let at = key_id + i;
+                        *b = if at < shared {
+                            target[at]
+                        } else {
+                            own[at - shared]
+                        };
+                    }
+                    u64::from_le_bytes(trailer)
+                }
+            };
+            key::trailer(target).cmp(&trailer)
+        };
+        if order != Ordering::Less {
+            key.clear();
+            key.extend_from_slice(&target[..shared]);
+            key.extend_from_slice(own);
+            return Ok(Some(Some(Entry {
+                offset: at,
+                value: (value_start, value_end),
+            })));
+        }
+        // Below the target. Later keys that repeat more than `p` bytes of
+        // this one are below it too only if it differs at `p` by a smaller
+        // byte inside both identities.
+        skip = p < key_id && p < target_id;
+        same = p;
+        at = value_end;
+    }
+    Ok(Some(None))
+}
+
+/// [`seek_in_place`] the plain way: every key rebuilt in `key` and compared
+/// whole.
+fn seek_rebuilding(
+    data: &[u8],
+    mut at: usize,
+    target: &[u8],
+    key: &mut Vec<u8>,
+) -> Result<Option<Entry>> {
+    key.clear();
+    while at < data.len() {
+        let (value, next) = parse_entry(data, at, key).ok_or_else(corrupt)?;
+        if key::compare(key, target) != Ordering::Less {
+            return Ok(Some(Entry { offset: at, value }));
+        }
+        at = next;
+    }
+    Ok(None)
+}
+
+/// A table's index reduced, per data block, to integers: the eight bytes
+/// of its separator's `cf ‖ user key` after the prefix every separator
+/// shares, and where the block starts in the file. A point read
+/// binary-searches the words for its data block and takes the block's
+/// place from `offsets`, without reading the index block; a seek narrows
+/// the index's restart points the same way. Only separators that tie
+/// with the target on their word need whole keys.
 ///
 /// SoliDB's keys share 20-odd bytes (column family, keyspace, `doc:`), and
-/// a 64 MiB table's index has ~4,000 restart points over ~600 KB: each step
-/// of the search decoded a key there, likely a cache miss, and compared it
-/// word by word from the start.
+/// a 64 MiB table's index holds ~16,000 entries over ~600 KB: a get used to
+/// binary-search its restart keys, decode a handful of entries and two
+/// varints there (~900 instructions and two or three cache misses), where
+/// the words and offsets take 12 bytes a block (~200 KB for such a table,
+/// charged to the block cache's budget like the index).
 pub struct Fences {
     prefix: Vec<u8>,
     words: Vec<u64>,
+    /// Where each data block starts, then where the last one ends: block
+    /// `i` and its trailer are `offsets[i]..offsets[i + 1]`.
+    offsets: Vec<u32>,
+    /// Index entries per restart point.
+    interval: usize,
 }
 
 /// The eight bytes of `id` from `at`, zero-padded, as a big-endian word:
 /// words order as the ids they come from, ties aside.
-fn word_after(id: &[u8], at: usize) -> u64 {
+#[inline]
+pub(crate) fn word_after(id: &[u8], at: usize) -> u64 {
     let tail = id.get(at..).unwrap_or_default();
+    if let Some(word) = tail.first_chunk::<8>() {
+        return u64::from_be_bytes(*word);
+    }
     let mut word = [0u8; 8];
-    let n = tail.len().min(8);
-    word[..n].copy_from_slice(&tail[..n]);
+    word[..tail.len()].copy_from_slice(tail);
     u64::from_be_bytes(word)
 }
 
+/// Where a target falls among a table's separators.
+#[derive(Clone, Copy)]
+enum Place {
+    /// At or before the first.
+    First,
+    /// After the last.
+    Past,
+    /// After the separators `..below` and before those from `not_above`;
+    /// the ones between tie with it on their word.
+    Words { below: usize, not_above: usize },
+}
+
 impl Fences {
-    /// The fences of `block`; `None` when it has too few restart points
-    /// to gain anything, or when they are not in order (a corrupt block is
-    /// then searched as before).
-    pub fn new(block: &Block) -> Option<Fences> {
-        let n = block.num_restarts;
-        if n < 8 {
+    /// The fences of a table's `index`, whose data blocks end at
+    /// `data_end`; `handle` reads an entry's value as the place of its
+    /// block and the end of its trailer. `None` for an index that is not
+    /// as the table builder writes it: entries out of order, blocks not
+    /// back to back, restart points not evenly spaced, or data past 4 GiB.
+    /// Such a table is searched through its index alone.
+    pub fn new(
+        index: &Block,
+        data_end: u64,
+        handle: impl Fn(&[u8]) -> Option<(u64, u64)>,
+    ) -> Option<Fences> {
+        if data_end > u64::from(u32::MAX) {
             return None;
         }
-        let first = key::cf_and_user_key(block.restart_key(0)?);
-        let last = key::cf_and_user_key(block.restart_key(n - 1)?);
+        let first = key::cf_and_user_key(index.restart_key(0)?).to_vec();
+        let mut it = index.iter();
+        it.seek_to_last();
+        if !it.valid() {
+            return None;
+        }
+        let last = key::cf_and_user_key(it.key());
         let shared = first.iter().zip(last).take_while(|(a, b)| a == b).count();
         let prefix = first[..shared].to_vec();
-        let mut words = Vec::with_capacity(n);
-        for i in 0..n {
-            let id = key::cf_and_user_key(block.restart_key(i)?);
-            if !id.starts_with(&prefix) || words.last().is_some_and(|&w| w > word_after(id, shared))
+
+        let (mut words, mut offsets) = (Vec::new(), Vec::new());
+        // The entry each restart point starts at.
+        let mut starts = Vec::with_capacity(index.num_restarts);
+        it.seek_to_first();
+        while it.valid() {
+            if starts.len() < index.num_restarts && it.offset() == index.restart_point(starts.len())
             {
+                starts.push(words.len());
+            }
+            let id = key::cf_and_user_key(it.key());
+            let word = word_after(id, shared);
+            if !id.starts_with(&prefix) || words.last().is_some_and(|&w| w > word) {
                 return None;
             }
-            words.push(word_after(id, shared));
+            // Each block starts where the one before ended.
+            let (offset, end) = handle(it.value_slice())?;
+            match offsets.last() {
+                None => offsets.push(u32::try_from(offset).ok()?),
+                Some(&o) if u64::from(o) == offset => {}
+                Some(_) => return None,
+            }
+            if end <= offset {
+                return None;
+            }
+            offsets.push(u32::try_from(end).ok()?);
+            words.push(word);
+            it.next();
         }
-        Some(Fences { prefix, words })
+        it.status().ok()?;
+        let interval = match starts.get(1) {
+            Some(&i) => i,
+            None => words.len(),
+        };
+        let even = starts.len() == index.num_restarts
+            && interval > 0
+            && starts.iter().enumerate().all(|(j, &e)| e == j * interval);
+        if words.is_empty() || !even || offsets.last() != Some(&(data_end as u32)) {
+            return None;
+        }
+        Some(Fences {
+            prefix,
+            words,
+            offsets,
+            interval,
+        })
     }
 
     /// Bytes held.
     pub fn size(&self) -> usize {
-        self.prefix.len() + 8 * self.words.len()
+        self.prefix.len() + 8 * self.words.len() + 4 * self.offsets.len()
     }
 
-    /// Where among the restart points the last one whose key is before
-    /// `target` lies (the first, if none is): a range for
-    /// [`Block::seek_entry_in`].
-    pub fn range(&self, target: &[u8]) -> (usize, usize) {
-        let last = self.words.len() - 1;
+    /// Data blocks.
+    pub fn blocks(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Where data block `i` lies: its offset and length, trailer excluded
+    /// (`trailer` bytes).
+    pub fn handle(&self, i: usize, trailer: u64) -> (u64, u64) {
+        let (start, end) = (self.offsets[i], self.offsets[i + 1]);
+        (u64::from(start), u64::from(end - start) - trailer)
+    }
+
+    #[inline]
+    fn place(&self, target: &[u8]) -> Place {
         let id = key::cf_and_user_key(target);
         let p = self.prefix.len();
         let m = p.min(id.len());
-        match key::cmp_bytes(&id[..m], &self.prefix[..m]) {
-            // Below every restart key, or above them all.
-            Ordering::Less => return (0, 0),
-            Ordering::Greater => return (last, last),
-            Ordering::Equal if id.len() < p => return (0, 0),
+        // A slice comparison: on a prefix of 20-odd bytes, the library's
+        // vectorised memcmp takes a quarter of the instructions of
+        // `key::cmp_bytes`.
+        match id[..m].cmp(&self.prefix[..m]) {
+            Ordering::Less => return Place::First,
+            Ordering::Greater => return Place::Past,
+            Ordering::Equal if id.len() < p => return Place::First,
             Ordering::Equal => {}
         }
         // A smaller word is a smaller key, a larger word a larger one:
         // only equal words need whole keys.
         let t = word_after(id, p);
         let below = self.words.partition_point(|&w| w < t);
-        // Ties are few: step over them rather than search again.
-        let not_above = below + self.words[below..].iter().take_while(|&&w| w == t).count();
-        (below.saturating_sub(1), not_above.saturating_sub(1))
+        // Most targets tie with no separator. Those that do may tie with
+        // thousands: in a table holding many collections, the word after
+        // the table's shared prefix can be a keyspace byte and `doc:`,
+        // the same for every block of one collection. A walk over the
+        // ties made a get on such a table 2-3x slower than 0.3.0.
+        let not_above = if self.words.get(below) == Some(&t) {
+            below + self.words[below..].partition_point(|&w| w == t)
+        } else {
+            below
+        };
+        Place::Words { below, not_above }
+    }
+
+    /// The data block holding the first entry at or after `target`:
+    /// `Some(None)` when every entry of the table is before it, and `None`
+    /// when separators tie with it on their word, for [`Fences::range`]
+    /// and the index to decide. Reads go through [`Fences::locate`].
+    #[cfg(test)]
+    pub fn block(&self, target: &[u8]) -> Option<Option<usize>> {
+        self.block_at(self.place(target))
+    }
+
+    /// [`Fences::block`], or where it cannot tell, [`Fences::range`]:
+    /// both from one search.
+    #[inline]
+    pub fn locate(&self, target: &[u8]) -> std::result::Result<Option<usize>, (usize, usize)> {
+        let place = self.place(target);
+        self.block_at(place).ok_or_else(|| self.range_at(place))
+    }
+
+    #[inline]
+    fn block_at(&self, place: Place) -> Option<Option<usize>> {
+        match place {
+            Place::First => Some(Some(0)),
+            Place::Past => Some(None),
+            Place::Words { below, not_above } if below == not_above => {
+                Some((below < self.words.len()).then_some(below))
+            }
+            Place::Words { .. } => None,
+        }
+    }
+
+    /// Where among the index's restart points the last one whose key is
+    /// before `target` lies (the first, if none is): a range for
+    /// [`Block::seek_entry_in`].
+    pub fn range(&self, target: &[u8]) -> (usize, usize) {
+        self.range_at(self.place(target))
+    }
+
+    #[inline]
+    fn range_at(&self, place: Place) -> (usize, usize) {
+        let restart = |entry: usize| entry / self.interval;
+        match place {
+            Place::First => (0, 0),
+            Place::Past => {
+                let last = restart(self.words.len() - 1);
+                (last, last)
+            }
+            // A restart point's key is its first entry's: the one holding
+            // the last entry below the target has a smaller key, and any
+            // whose first entry is above the ties a larger one.
+            Place::Words { below, not_above } => (
+                below.checked_sub(1).map_or(0, restart),
+                not_above.checked_sub(1).map_or(0, restart),
+            ),
+        }
     }
 }
 
@@ -497,11 +800,6 @@ impl BlockIter {
             .checked_add(header)?
             .checked_add(unshared)?;
         data.get(start..start.checked_add(value_len)?)
-    }
-
-    /// Size of the decoded block the values slice.
-    pub fn block_size(&self) -> usize {
-        self.block.size()
     }
 
     pub fn status(&self) -> Result<()> {
@@ -730,16 +1028,20 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
         /// A seek narrowed by the fences lands where the full search does,
-        /// for keys sharing a prefix (or not), versions of one key across
-        /// restart points, and targets inside, before and after the block.
+        /// on the first key at or after the target (by a plain walk of the
+        /// sorted keys), for keys sharing a prefix (or not), versions of
+        /// one key across restart points, targets inside, before and after
+        /// the block, and any restart interval. Where the fences name the
+        /// block on their own, it is that entry's, at its place.
         #[test]
-        fn fences_narrow_a_seek_to_the_same_entry(
+        fn fences_find_the_entry_the_full_search_finds(
             prefix in prop::collection::vec(byte(), 0..20),
-            ids in prop::collection::vec((prop::collection::vec(byte(), 0..12), 1..4u64), 16..200),
+            ids in prop::collection::vec((prop::collection::vec(byte(), 0..12), 1..4u64), 1..200),
             targets in prop::collection::vec(
                 (0..3u32, any::<bool>(), prop::collection::vec(byte(), 0..14), 0..6u64),
                 1..40,
             ),
+            interval in 1..6usize,
         ) {
             let mut keys: Vec<Vec<u8>> = ids
                 .iter()
@@ -750,27 +1052,174 @@ mod tests {
                 .collect();
             keys.sort_by(|a, b| key::compare(a, b));
             keys.dedup();
-            let mut b = BlockBuilder::new(2);
-            for k in &keys {
-                b.add(k, b"v");
+            // An index: entry `i` names block `i`, at `10 i..10 i + 10`.
+            let mut b = BlockBuilder::new(interval);
+            for (i, k) in keys.iter().enumerate() {
+                b.add(k, &(i as u32).to_le_bytes());
             }
             let block = Block::new(Bytes::from(b.finish())).unwrap();
-            let Some(fences) = Fences::new(&block) else {
-                prop_assert!(keys.len() < 16);
-                return Ok(());
-            };
+            let number = |value: &[u8]| u32::from_le_bytes(value.try_into().unwrap()) as usize;
+            let fences = Fences::new(&block, keys.len() as u64 * 10, |v| {
+                let i = u64::from(u32::from_le_bytes(v.try_into().ok()?));
+                Some((i * 10, i * 10 + 10))
+            })
+            .expect("the fences of a well-formed index");
+            prop_assert_eq!(fences.blocks(), keys.len());
             let (mut a, mut z) = (Vec::new(), Vec::new());
             for (cf, prefixed, suffix, seq) in targets {
                 let user_key = if prefixed { [&prefix[..], &suffix[..]].concat() } else { suffix };
                 let target = encode(cf, &user_key, seq, Kind::Put);
+                let first = keys.iter().position(|k| key::compare(k, &target) != Ordering::Less);
                 let want = block.seek_entry(&target, &mut a).unwrap();
+                prop_assert_eq!(want.map(|e| number(&block.bytes()[e.value.0..e.value.1])), first);
                 let got = block.seek_entry_in(&target, &mut z, fences.range(&target)).unwrap();
                 prop_assert_eq!(got, want, "{:?}", target);
-                if want.is_some() {
-                    prop_assert_eq!(&z, &a);
+                if let Some(i) = first {
+                    prop_assert_eq!(&z, &keys[i]);
+                    prop_assert_eq!(&a, &keys[i]);
+                }
+                if let Some(found) = fences.block(&target) {
+                    prop_assert_eq!(found, first, "{:?}", target);
+                    if let Some(i) = found {
+                        prop_assert_eq!(fences.handle(i, 0), (i as u64 * 10, 10));
+                    }
+                }
+                match fences.locate(&target) {
+                    Ok(found) => prop_assert_eq!(Some(found), fences.block(&target)),
+                    Err(range) => {
+                        prop_assert_eq!(fences.block(&target), None);
+                        prop_assert_eq!(range, fences.range(&target));
+                    }
                 }
             }
         }
+    }
+
+    /// Two collections in one table, as SoliDB's shared keyspace has them:
+    /// the table's keys share only the column family and part of the
+    /// keyspace prefix, so every key of one collection has the same word
+    /// (its last prefix byte, then `doc:000`). The fences must still lead
+    /// a seek to the right entry, through the index.
+    #[test]
+    fn fences_among_thousands_of_ties() {
+        let key_of = |coll: u8, n: u32| {
+            let mut user = vec![0, 0, 0, 1, 0, 0, 0, coll];
+            user.extend_from_slice(format!("doc:{n:020}").as_bytes());
+            encode(1, &user, 7, Kind::Put)
+        };
+        let keys: Vec<Vec<u8>> = [3u8, 4]
+            .iter()
+            .flat_map(|&coll| (0..2000).map(move |n| key_of(coll, n * 2)))
+            .collect();
+        let mut b = BlockBuilder::new(4);
+        for (i, k) in keys.iter().enumerate() {
+            b.add(k, &(i as u32).to_le_bytes());
+        }
+        let block = Block::new(Bytes::from(b.finish())).unwrap();
+        let fences = Fences::new(&block, keys.len() as u64 * 10, |v| {
+            let i = u64::from(u32::from_le_bytes(v.try_into().ok()?));
+            Some((i * 10, i * 10 + 10))
+        })
+        .expect("fences");
+        let (mut a, mut z) = (Vec::new(), Vec::new());
+        for coll in [3u8, 4] {
+            for n in [0, 1, 2, 777, 1998, 3998, 3999, 4001] {
+                let target = key_of(coll, n);
+                let want = block.seek_entry(&target, &mut a).unwrap();
+                let range = fences.locate(&target).expect_err("the word ties");
+                // The range spans the collection's ties: the index decides.
+                assert!(range.1 - range.0 > 100, "{range:?}");
+                let got = block.seek_entry_in(&target, &mut z, range).unwrap();
+                assert_eq!(got, want, "coll {coll}, n {n}");
+                assert_eq!(z, a);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// The in-place seek finds what a plain walk of the sorted keys
+        /// finds, on keys made to defeat it: identities that are prefixes of
+        /// one another, zero and 0xff bytes, versions whose trailers share
+        /// bytes (so that keys repeat part of a trailer), both kinds, and
+        /// any restart interval; targets at, between and around them.
+        #[test]
+        fn a_seek_in_place_lands_where_a_walk_does(
+            ids in prop::collection::vec(
+                (prop::collection::vec(byte(), 0..10), prop::collection::vec(0..4u64, 1..4)),
+                1..60,
+            ),
+            interval in 1..20usize,
+            targets in prop::collection::vec(
+                (0..3u32, prop::collection::vec(byte(), 0..11), 0..5u64, any::<bool>()),
+                1..40,
+            ),
+        ) {
+            // Sequence numbers 0x0100..: neighbours share trailer bytes.
+            let seq = |s: u64| 0x0100 + s;
+            let mut keys: Vec<Vec<u8>> = ids
+                .iter()
+                .flat_map(|(id, seqs)| {
+                    seqs.iter().map(move |&s| {
+                        let kind = if s % 2 == 0 { Kind::Put } else { Kind::Delete };
+                        encode(1, id, seq(s), kind)
+                    })
+                })
+                .collect();
+            keys.sort_by(|a, b| key::compare(a, b));
+            keys.dedup();
+            let mut b = BlockBuilder::new(interval);
+            for (i, k) in keys.iter().enumerate() {
+                b.add(k, &(i as u32).to_le_bytes());
+            }
+            let block = Block::new(Bytes::from(b.finish())).unwrap();
+            let mut all: Vec<Vec<u8>> = targets
+                .iter()
+                .map(|(cf, id, s, put)| {
+                    encode(*cf, id, seq(*s), if *put { Kind::Put } else { Kind::Delete })
+                })
+                .collect();
+            all.extend(keys.iter().cloned());
+            let mut key = b"left over".to_vec();
+            for target in &all {
+                let first = keys.iter().position(|k| key::compare(k, target) != Ordering::Less);
+                let found = block.seek_entry(target, &mut key).unwrap();
+                let at = found.map(|e| u32::from_le_bytes(block.bytes()[e.value.0..e.value.1].try_into().unwrap()) as usize);
+                prop_assert_eq!(at, first, "{:?}", target);
+                if let Some(i) = first {
+                    prop_assert_eq!(&key, &keys[i]);
+                }
+            }
+        }
+    }
+
+    /// Fences are only built for an index as the table builder writes it.
+    #[test]
+    fn fences_refuse_blocks_that_are_not_back_to_back() {
+        let ks = keys(40);
+        let mut b = BlockBuilder::new(4);
+        for (i, k) in ks.iter().enumerate() {
+            b.add(k, &(i as u32).to_le_bytes());
+        }
+        let block = Block::new(Bytes::from(b.finish())).unwrap();
+        let at = |gap: u64| {
+            move |v: &[u8]| {
+                let i = u64::from(u32::from_le_bytes(v.try_into().ok()?));
+                let start = i * 10 + if i >= 20 { gap } else { 0 };
+                Some((start, start + 10))
+            }
+        };
+        assert!(Fences::new(&block, 400, at(0)).is_some());
+        assert!(
+            Fences::new(&block, 401, at(0)).is_none(),
+            "data ends elsewhere"
+        );
+        assert!(
+            Fences::new(&block, 401, at(1)).is_none(),
+            "a gap between blocks"
+        );
+        assert!(Fences::new(&block, 1 << 33, |_| Some((0, 1 << 33))).is_none());
     }
 
     #[test]
