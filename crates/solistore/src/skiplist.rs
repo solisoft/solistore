@@ -657,10 +657,14 @@ mod tests {
         }
         let all: Vec<&[u8]> = list.iter().map(|(k, _)| k).collect();
         assert_eq!(list.level_keys(0).collect::<Vec<_>>(), all);
+        // Level 1 is a strict sample of every key: all n nodes reaching it
+        // has probability (1/BRANCHING)^n. Higher up, a level may keep every
+        // node of the one below (a few tall nodes), so only inclusion holds.
+        assert!(list.level_keys(1).count() < all.len());
         let mut below = all;
         for level in 1..list.levels() {
             let keys: Vec<&[u8]> = list.level_keys(level).collect();
-            assert!(keys.len() < below.len() || keys.is_empty());
+            assert!(keys.len() <= below.len());
             assert!(keys.iter().all(|k| below.contains(k)));
             assert!(keys.windows(2).all(|w| key::compare(w[0], w[1]).is_lt()));
             below = keys;
