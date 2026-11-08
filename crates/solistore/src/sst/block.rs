@@ -200,25 +200,38 @@ impl Block {
         }
     }
 
-    /// The entries stored whole at the restart points, in order: every
-    /// `interval`-th entry of the block, read in place. A malformed one is
-    /// an error.
-    pub fn restart_entries(&self) -> impl Iterator<Item = Result<(&[u8], &[u8])>> + '_ {
+    /// The keys stored whole at the restart points, in order, each with
+    /// how many entries its restart interval holds (counted by skipping
+    /// over their headers, no key rebuilt). A malformed entry is an error.
+    pub fn restart_keys(&self) -> impl Iterator<Item = Result<(&[u8], usize)>> + '_ {
         let data = &self.data[..self.restarts];
         (0..self.num_restarts).map(move |i| {
             let at = self.restart_point(i);
-            let (shared, unshared, value_len, header) =
+            let (shared, unshared, _, header) =
                 entry_header(data.get(at..).ok_or_else(corrupt)?).ok_or_else(corrupt)?;
             if shared != 0 {
                 return Err(corrupt());
             }
             let key_start = at.checked_add(header).ok_or_else(corrupt)?;
-            let value_start = key_start.checked_add(unshared).ok_or_else(corrupt)?;
-            let value_end = value_start.checked_add(value_len).ok_or_else(corrupt)?;
-            Ok((
-                data.get(key_start..value_start).ok_or_else(corrupt)?,
-                data.get(value_start..value_end).ok_or_else(corrupt)?,
-            ))
+            let key = data
+                .get(key_start..key_start.checked_add(unshared).ok_or_else(corrupt)?)
+                .ok_or_else(corrupt)?;
+            let end = if i + 1 < self.num_restarts {
+                self.restart_point(i + 1)
+            } else {
+                self.restarts
+            };
+            let (mut entries, mut next) = (0, at);
+            while next < end {
+                let (_, unshared, value_len, header) =
+                    entry_header(data.get(next..).ok_or_else(corrupt)?).ok_or_else(corrupt)?;
+                next = [header, unshared, value_len]
+                    .iter()
+                    .try_fold(next, |at, len| at.checked_add(*len))
+                    .ok_or_else(corrupt)?;
+                entries += 1;
+            }
+            Ok((key, entries))
         })
     }
 

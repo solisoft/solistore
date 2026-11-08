@@ -445,31 +445,29 @@ impl TableReader {
     /// Samples of where the data of `[lo, hi)` (`cf ‖ user key`) lies, for
     /// cutting it into parts of equal size: one per index restart point
     /// (every [`INDEX_RESTART_INTERVAL`] blocks) inside the range, its
-    /// separator's `cf ‖ user key` with the bytes of data blocks since the
-    /// sample before it. Read from the index alone, in place.
+    /// separator's `cf ‖ user key` with the decoded bytes of the data blocks
+    /// since the sample before it, at [`BLOCK_SIZE`] a block (each is cut
+    /// once that full: decoded bytes compare with a memtable's, where bytes
+    /// on disk would depend on compression). Read from the index alone.
     pub fn size_samples<'a>(
         &'a self,
         lo: &[u8],
         hi: &[u8],
         out: &mut Vec<(&'a [u8], u64)>,
     ) -> Result<()> {
-        let mut last_offset = 0;
-        for entry in self.index.restart_entries() {
-            let (separator, handle) = entry?;
-            let handle = Handle::decode(handle)?;
-            // A corrupt handle must not overflow: it only skews a sample.
-            let end = handle
-                .offset
-                .saturating_add(handle.len)
-                .saturating_add(BLOCK_TRAILER as u64);
+        // The separator at a restart point ends the first block of its
+        // interval: since the sample before, the blocks of that interval.
+        let mut blocks = 1;
+        for entry in self.index.restart_keys() {
+            let (separator, entries) = entry?;
             let id = key::cf_and_user_key(separator);
-            if id > lo && id < hi {
-                out.push((id, end.saturating_sub(last_offset)));
+            if key::cmp_bytes(id, lo).is_gt() && key::cmp_bytes(id, hi).is_lt() {
+                out.push((id, (blocks * BLOCK_SIZE) as u64));
             }
-            last_offset = end;
-            if id >= hi {
+            if key::cmp_bytes(id, hi).is_ge() {
                 break;
             }
+            blocks = entries;
         }
         Ok(())
     }

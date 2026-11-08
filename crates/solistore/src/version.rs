@@ -239,16 +239,19 @@ impl SuperVersion {
     }
 
     /// User keys that cut `[lo, hi)` of `cf` into about `n` parts of equal
-    /// table bytes: see [`crate::Db::split_points`].
+    /// size: see [`crate::Db::split_points`].
     pub fn split_points(&self, cf: u32, lo: &[u8], hi: &[u8], n: usize) -> Result<Vec<Vec<u8>>> {
         if n <= 1 || lo >= hi {
             return Ok(Vec::new());
         }
         let prefix = cf.to_be_bytes();
         let (lo, hi) = ([&prefix[..], lo].concat(), [&prefix[..], hi].concat());
-        // Every file's samples, then in key order across files and levels:
-        // the bytes below a key add up whatever file holds them.
+        // Every source's samples, then in key order across them: the bytes
+        // below a key add up whatever memtable or file holds them.
         let mut samples: Vec<(&[u8], u64)> = Vec::new();
+        for mem in std::iter::once(&self.mem).chain(&self.imms) {
+            mem.size_samples(&lo, &hi, &mut samples);
+        }
         for file in self.version.files() {
             let smallest = key::cf_and_user_key(&file.props.smallest);
             let largest = key::cf_and_user_key(&file.props.largest);

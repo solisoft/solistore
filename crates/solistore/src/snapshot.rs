@@ -39,13 +39,19 @@ use crate::version::SuperVersion;
 pub struct Snapshot {
     sv: Arc<SuperVersion>,
     seq: u64,
+    /// The database it was taken of (see `Db::iterator_opt`).
+    db: u64,
 }
 
 impl Snapshot {
     /// `sv` must have been loaded before `seq` was read (see
     /// [`crate::version`]).
-    pub(crate) fn new(sv: Arc<SuperVersion>, seq: u64) -> Self {
-        Snapshot { sv, seq }
+    pub(crate) fn new(sv: Arc<SuperVersion>, seq: u64, db: u64) -> Self {
+        Snapshot { sv, seq, db }
+    }
+
+    pub(crate) fn parts(&self) -> (&Arc<SuperVersion>, u64, u64) {
+        (&self.sv, self.seq, self.db)
     }
 
     /// The sequence number every read of this snapshot is at: the last
@@ -77,7 +83,8 @@ impl Snapshot {
         self.iterator_opt(cf, ReadOptions::default(), mode)
     }
 
-    /// A bounded iterator over `cf` as of the snapshot.
+    /// A bounded iterator over `cf` as of the snapshot (a snapshot in
+    /// `opts` is not looked at: this one is read).
     pub fn iterator_opt(
         &self,
         cf: &ColumnFamily,
@@ -89,7 +96,8 @@ impl Snapshot {
     }
 
     /// Keys that cut `[lo, hi)` of `cf` into about `n` parts of equal size
-    /// in this snapshot's table files; see [`crate::Db::split_points`].
+    /// in this snapshot's memtables and tables; see
+    /// [`crate::Db::split_points`].
     pub fn split_points(
         &self,
         cf: &ColumnFamily,

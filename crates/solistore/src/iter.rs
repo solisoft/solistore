@@ -17,6 +17,7 @@ use bytes::Bytes;
 use crate::error::{Error, Result};
 use crate::key::{self, Kind};
 use crate::memtable::{covering_seq, RangeTombstone};
+use crate::snapshot::Snapshot;
 use crate::version::{Source, SuperVersion};
 
 /// A cursor over internal keys in [`key::compare`] order.
@@ -302,11 +303,18 @@ pub enum IteratorMode<'a> {
 }
 
 /// Bounds in the style of RocksDB's `iterate_lower_bound` /
-/// `iterate_upper_bound`: lower inclusive, upper exclusive.
+/// `iterate_upper_bound` (lower inclusive, upper exclusive), and the
+/// snapshot to read, as RocksDB's `ReadOptions::set_snapshot`.
+///
+/// Build it with `..Default::default()`: fields may be added.
 #[derive(Debug, Clone, Default)]
 pub struct ReadOptions {
     pub lower_bound: Option<Vec<u8>>,
     pub upper_bound: Option<Vec<u8>>,
+    /// Read as of this snapshot of the same database (see
+    /// [`crate::Db::snapshot`]) rather than as of now: iterators made on
+    /// several threads with one snapshot see exactly the same data.
+    pub snapshot: Option<Snapshot>,
 }
 
 /// An iterator over one column family, at one snapshot.
@@ -357,7 +365,11 @@ impl DbIterator {
         opts: ReadOptions,
         mode: IteratorMode<'_>,
     ) -> Result<Self> {
-        let (lower, upper) = (opts.lower_bound, opts.upper_bound);
+        let ReadOptions {
+            lower_bound: lower,
+            upper_bound: upper,
+            ..
+        } = opts;
         let id_of = |user_key: &[u8]| [&cf.to_be_bytes()[..], user_key].concat();
         let direction = match mode {
             IteratorMode::Start | IteratorMode::From(_, Direction::Forward) => Direction::Forward,

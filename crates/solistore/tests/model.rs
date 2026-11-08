@@ -306,6 +306,7 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
                 let opts = ReadOptions {
                     lower_bound: lower.clone(),
                     upper_bound: upper.clone(),
+                    ..Default::default()
                 };
                 let want = model.scan(cf, &lower, &upper, &mode);
                 for how in 0..3 {
@@ -347,11 +348,19 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
                 let opts = ReadOptions {
                     lower_bound: lower.clone(),
                     upper_bound: upper.clone(),
+                    ..Default::default()
                 };
-                let it = k
-                    .snapshot
-                    .iterator_opt(&handle, opts, iterator_mode(&mode))
-                    .unwrap();
+                // Both ways in: from the snapshot, and through the options.
+                let it = if which % 2 == 0 {
+                    k.snapshot.iterator_opt(&handle, opts, iterator_mode(&mode))
+                } else {
+                    let opts = ReadOptions {
+                        snapshot: Some(k.snapshot.clone()),
+                        ..opts
+                    };
+                    db.iterator_opt(&handle, opts, iterator_mode(&mode))
+                }
+                .unwrap();
                 prop_assert_eq!(
                     drain(it, which % 3),
                     k.model.scan(cf, &lower, &upper, &mode),
@@ -384,6 +393,7 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
                     let opts = ReadOptions {
                         lower_bound: Some(w[0].clone()),
                         upper_bound: Some(w[1].clone()),
+                        ..Default::default()
                     };
                     let it = snapshot
                         .iterator_opt(&handle, opts, IteratorMode::Start)

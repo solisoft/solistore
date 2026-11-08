@@ -30,6 +30,7 @@ fn bounded(lower: &[u8], upper: &[u8]) -> ReadOptions {
     ReadOptions {
         lower_bound: Some(lower.to_vec()),
         upper_bound: Some(upper.to_vec()),
+        ..Default::default()
     }
 }
 
@@ -247,12 +248,26 @@ fn snapshot_iterators_on_parallel_threads_see_the_same_whole_batches() {
         let per_range: Vec<BTreeMap<Vec<u8>, Vec<u8>>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..RANGES)
                 .map(|r| {
-                    let (snapshot, cf) = (&snapshot, &cf);
+                    let (snapshot, cf, db) = (&snapshot, &cf, &db);
                     scope.spawn(move || {
                         // Created at different times, as the database moves.
                         std::thread::sleep(Duration::from_millis(r as u64));
                         let (lo, hi) = (format!("r{r}/"), format!("r{r}0"));
-                        as_map(scan_ref(snapshot, cf, lo.as_bytes(), hi.as_bytes()))
+                        if r % 2 == 0 {
+                            return as_map(scan_ref(snapshot, cf, lo.as_bytes(), hi.as_bytes()));
+                        }
+                        // The other way in: the snapshot in the read options.
+                        let opts = ReadOptions {
+                            snapshot: Some(snapshot.clone()),
+                            ..bounded(lo.as_bytes(), hi.as_bytes())
+                        };
+                        let mut rows = BTreeMap::new();
+                        db.for_each(cf, opts, IteratorMode::Start, |k, v| {
+                            rows.insert(k.to_vec(), v.to_vec());
+                            true
+                        })
+                        .unwrap();
+                        rows
                     })
                 })
                 .collect();
@@ -327,34 +342,53 @@ fn split_points_cut_a_range_into_parts_of_about_equal_size() {
         }
         db.write(batch).unwrap();
     }
-    assert!(
-        db.split_points(&cf, b"doc:", b"doc;", 8)
-            .unwrap()
-            .is_empty(),
-        "the memtable is not sampled"
-    );
+    let parts = |db: &Db, cuts: Vec<Vec<u8>>| -> Vec<Vec<u8>> {
+        assert_eq!(cuts.len(), 7, "{cuts:?}");
+        assert!(cuts.windows(2).all(|w| w[0] < w[1]));
+        assert!(cuts
+            .iter()
+            .all(|c| c.as_slice() > &b"doc:"[..] && c.as_slice() < &b"doc;"[..]));
+        let mut bounds = vec![b"doc:".to_vec()];
+        bounds.extend(cuts);
+        bounds.push(b"doc;".to_vec());
+        for w in bounds.windows(2) {
+            let n = db
+                .iterator_opt(&cf, bounded(&w[0], &w[1]), IteratorMode::Start)
+                .unwrap()
+                .count();
+            assert!(
+                (10_000..=15_000).contains(&n),
+                "a part of {n} keys: {bounds:?}"
+            );
+        }
+        bounds
+    };
+    // All in the memtable: sampled from its skiplist.
+    parts(&db, db.split_points(&cf, b"doc:", b"doc;", 8).unwrap());
+    // Half in a table, half in the memtable: both count.
+    db.flush().unwrap();
+    db.compact_range(&cf, None, None).unwrap();
+    for chunk in 0..100u32 {
+        let mut batch = WriteBatch::new();
+        for i in chunk * 1000..(chunk + 1) * 1000 {
+            batch.put(&cf, format!("doc:{:08}", 100_000 + i), [i as u8; 100]);
+        }
+        db.write(batch).unwrap();
+    }
+    let both = db.split_points(&cf, b"doc:", b"doc;", 2).unwrap();
+    assert_eq!(both.len(), 1);
+    let at: u32 = std::str::from_utf8(&both[0][4..]).unwrap()[..8]
+        .parse()
+        .unwrap();
+    assert!((80_000..=120_000).contains(&at), "a middle at {at}");
+    let mut batch = WriteBatch::new();
+    batch.delete_range(&cf, b"doc:00100000", b"doc;");
+    db.write(batch).unwrap();
     db.flush().unwrap();
     db.compact_range(&cf, None, None).unwrap();
 
     let cuts = db.split_points(&cf, b"doc:", b"doc;", 8).unwrap();
-    assert_eq!(cuts.len(), 7, "{cuts:?}");
-    assert!(cuts.windows(2).all(|w| w[0] < w[1]));
-    assert!(cuts
-        .iter()
-        .all(|c| c.as_slice() > &b"doc:"[..] && c.as_slice() < &b"doc;"[..]));
-    let mut bounds = vec![b"doc:".to_vec()];
-    bounds.extend(cuts);
-    bounds.push(b"doc;".to_vec());
-    for w in bounds.windows(2) {
-        let n = db
-            .iterator_opt(&cf, bounded(&w[0], &w[1]), IteratorMode::Start)
-            .unwrap()
-            .count();
-        assert!(
-            (10_000..=15_000).contains(&n),
-            "a part of {n} keys: {bounds:?}"
-        );
-    }
+    let bounds = parts(&db, cuts);
     // The same cuts from a snapshot of the same tables.
     assert_eq!(
         db.snapshot()
@@ -381,6 +415,39 @@ fn split_points_cut_a_range_into_parts_of_about_equal_size() {
         .split_points(&other, b"doc:", b"doc;", 8)
         .unwrap()
         .is_empty());
+}
+
+/// `for_each` stops when told to; a snapshot of another database is refused
+/// rather than read.
+#[test]
+fn for_each_stops_and_a_foreign_snapshot_is_refused() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (db, other) = (
+        Db::open(a.path(), Options::default()).unwrap(),
+        Db::open(b.path(), Options::default()).unwrap(),
+    );
+    let cf = db.default_cf();
+    let mut batch = WriteBatch::new();
+    for i in 0..10u8 {
+        batch.put(&cf, [i], [i]);
+    }
+    db.write(batch).unwrap();
+    let mut seen = Vec::new();
+    db.for_each(&cf, ReadOptions::default(), IteratorMode::End, |k, v| {
+        assert_eq!(k, v);
+        seen.push(k[0]);
+        seen.len() < 3
+    })
+    .unwrap();
+    assert_eq!(seen, [9, 8, 7]);
+    let opts = ReadOptions {
+        snapshot: Some(other.snapshot()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        db.iterator_opt(&cf, opts, IteratorMode::Start),
+        Err(solistore::Error::InvalidArgument(_))
+    ));
 }
 
 /// A snapshot of a dropped column family refuses reads, as the database does.
