@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::block::{Block, BlockBuilder, BlockIter, RESTART_INTERVAL};
+use super::block::{Block, BlockBuilder, BlockIter, Fences, RESTART_INTERVAL};
 use super::bloom;
 use super::cache::BlockCache;
 use crate::coding::{get_varint, put_varint};
@@ -304,6 +304,8 @@ fn add_index_entry(index: &mut BlockBuilder, separator: &[u8], handle: Handle) {
 pub struct TableReader {
     file: Arc<dyn RandomAccessFile>,
     index: Block,
+    /// The index's restart keys as integers, for seeks (see [`Fences`]).
+    fences: Option<Fences>,
     /// Where the data blocks end (the filter follows them).
     data_end: u64,
     filter: Bytes,
@@ -384,11 +386,13 @@ impl TableReader {
         let filter_at = filter.offset;
         let index = Block::new(read_block(file.as_ref(), index)?)?;
         let filter = read_block(file.as_ref(), filter)?;
-        let pinned = index.size() + filter.len();
+        let fences = Fences::new(&index);
+        let pinned = index.size() + filter.len() + fences.as_ref().map_or(0, Fences::size);
         Ok(TableReader {
             cache: None,
             file,
             index,
+            fences,
             data_end: filter_at,
             filter,
             pinned,
@@ -407,6 +411,14 @@ impl TableReader {
     /// and would only push out what readers need.
     fn data_block(&self, handle_bytes: &[u8], fill: bool) -> Result<Block> {
         self.data_block_at(Handle::decode(handle_bytes)?, fill)
+    }
+
+    /// The restart points of the index the entry for `target` lies in.
+    fn index_range(&self, target: &[u8]) -> (usize, usize) {
+        match &self.fences {
+            Some(fences) => fences.range(target),
+            None => self.index.full_range(),
+        }
     }
 
     /// A data block if the cache holds it; nothing is read.
@@ -490,7 +502,8 @@ impl TableReader {
             return Ok(None);
         }
         let target = lookup.internal();
-        let handle = with_seek_key(|key| match self.index.seek_entry(target, key)? {
+        let range = self.index_range(target);
+        let handle = with_seek_key(|key| match self.index.seek_entry_in(target, key, range)? {
             Some(entry) => {
                 let (start, end) = entry.value;
                 Handle::decode(&self.index.bytes()[start..end]).map(Some)
@@ -556,10 +569,12 @@ fn version_of(
 ) -> Result<Option<Version>> {
     let found = key::parse(key).ok_or_else(|| Error::Corruption("bad key in table".into()))?;
     Ok(
-        (found.cf == lookup.cf && found.user_key == lookup.user_key).then(|| Version {
-            seq: found.seq,
-            kind: found.kind,
-            value: value(),
+        (found.cf == lookup.cf && key::eq_bytes(found.user_key, lookup.user_key)).then(|| {
+            Version {
+                seq: found.seq,
+                kind: found.kind,
+                value: value(),
+            }
         }),
     )
 }
@@ -734,7 +749,7 @@ impl TableIter {
 impl InternalIterator for TableIter {
     fn seek_ge(&mut self, target: &[u8]) {
         self.error = None;
-        self.index.seek(target);
+        self.index.seek_in(target, self.table.index_range(target));
         if self.load() {
             self.data.as_mut().expect("loaded").seek(target);
             if self.data_valid() {
