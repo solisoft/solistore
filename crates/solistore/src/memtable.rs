@@ -221,6 +221,30 @@ impl Memtable {
     }
 
     /// Every entry in order, for a flush.
+    /// Samples of where this memtable's data in `[lo, hi)` (`cf ‖ user
+    /// key`) lies, as [`crate::sst::TableReader::size_samples`]: the keys of
+    /// the highest level of the skiplist with a few thousand nodes (the
+    /// gaps between them are random: fewer made parts 20% off), each
+    /// standing for an equal share of the memtable's bytes.
+    pub fn size_samples<'a>(&'a self, lo: &[u8], hi: &[u8], out: &mut Vec<(&'a [u8], u64)>) {
+        let mut level = self.map.levels().saturating_sub(1);
+        let mut count = self.map.level_keys(level).count();
+        while count < 4096 && level > 0 {
+            level -= 1;
+            count = self.map.level_keys(level).count();
+        }
+        if count == 0 {
+            return;
+        }
+        let share = (self.approximate_size() as u64 / count as u64).max(1);
+        for k in self.map.level_keys(level) {
+            let id = key::cf_and_user_key(k);
+            if key::cmp_bytes(id, lo).is_gt() && key::cmp_bytes(id, hi).is_lt() {
+                out.push((id, share));
+            }
+        }
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
         self.map.iter()
     }

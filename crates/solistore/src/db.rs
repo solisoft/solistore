@@ -364,6 +364,9 @@ struct Handle {
 }
 
 struct Inner {
+    /// Unique per open database in the process: a snapshot names the one
+    /// it was taken of.
+    id: u64,
     dir: PathBuf,
     fs: Arc<dyn Fs>,
     durability: Durability,
@@ -686,7 +689,9 @@ impl Db {
             written: AtomicU64::new(0),
             synced: AtomicU64::new(0),
         });
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let inner = Arc::new(Inner {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             dir,
             fs,
             durability: opts.durability,
@@ -1294,6 +1299,9 @@ impl Db {
         self.iterator_opt(cf, ReadOptions::default(), mode)
     }
 
+    /// An iterator over `cf`, bounded by `opts`, as of `opts.snapshot` or
+    /// else as of now. Fails with `InvalidArgument` for a snapshot of
+    /// another database.
     pub fn iterator_opt(
         &self,
         cf: &ColumnFamily,
@@ -1302,9 +1310,40 @@ impl Db {
     ) -> Result<DbIterator> {
         cf.check()?;
         let inner = self.inner();
-        let sv = inner.sv.load_full();
-        let snapshot = inner.publisher.visible();
-        DbIterator::new(sv, cf.id(), snapshot, opts, mode)
+        let (sv, seq) = match &opts.snapshot {
+            Some(snapshot) => {
+                let (sv, seq, db) = snapshot.parts();
+                if db != inner.id {
+                    return Err(Error::InvalidArgument(
+                        "a snapshot of another database".into(),
+                    ));
+                }
+                (sv.clone(), seq)
+            }
+            // The super version first, then the sequence: see `version`.
+            None => (inner.sv.load_full(), inner.publisher.visible()),
+        };
+        DbIterator::new(sv, cf.id(), seq, opts, mode)
+    }
+
+    /// Every entry of `cf` that `opts` and `mode` select, in order, handed
+    /// to `f` borrowed (see [`DbIterator::next_ref`]) until it returns
+    /// `false`.
+    pub fn for_each(
+        &self,
+        cf: &ColumnFamily,
+        opts: ReadOptions,
+        mode: IteratorMode<'_>,
+        mut f: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<()> {
+        let mut it = self.iterator_opt(cf, opts, mode)?;
+        while let Some(entry) = it.next_ref() {
+            let (key, value) = entry?;
+            if !f(key, value) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// A consistent view of the whole database as of now, for any number
@@ -1315,7 +1354,7 @@ impl Db {
         // The super version first, then the sequence: see `version`.
         let sv = inner.sv.load_full();
         let seq = inner.publisher.visible();
-        Snapshot::new(sv, seq)
+        Snapshot::new(sv, seq, inner.id)
     }
 
     /// Keys that cut `[lo, hi)` of `cf` into about `n` parts of equal size,
@@ -1323,11 +1362,11 @@ impl Db {
     /// strictly between `lo` and `hi`, the parts being `[lo, k1)`,
     /// `[k1, k2)` … `[k_last, hi)`.
     ///
-    /// Sizes are bytes of table data, taken from the files' indexes (a
-    /// sample every four blocks, ~16 KiB) without reading a data block.
-    /// What is still in the memtables is not counted, so a range held
-    /// mostly there gets fewer cuts, or none. [`Snapshot::split_points`]
-    /// cuts the tables a snapshot reads.
+    /// Sizes are decoded bytes, estimated without reading a data block:
+    /// tables from their indexes (a sample every four blocks, ~16 KiB),
+    /// memtables from one level of their skiplist (a few thousand samples
+    /// each). [`Snapshot::split_points`] cuts what a snapshot reads.
+    /// Fewer cuts, or none, when the range holds too few samples.
     pub fn split_points(
         &self,
         cf: &ColumnFamily,

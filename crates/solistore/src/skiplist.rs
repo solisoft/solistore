@@ -527,6 +527,27 @@ impl SkipList {
         unsafe { value_of(at.0.as_ptr()) }
     }
 
+    /// How many levels the tallest node reaches.
+    pub fn levels(&self) -> usize {
+        self.height.load(Relaxed)
+    }
+
+    /// The keys of the nodes linked at `level`, in order: about one entry
+    /// in `BRANCHING^level`, read without walking the others. A sample of
+    /// the list for size estimates; a level above every node is empty.
+    pub fn level_keys(&self, level: usize) -> impl Iterator<Item = &[u8]> + '_ {
+        let level = level.min(MAX_HEIGHT - 1);
+        // SAFETY: the head has a link at every level, and a node is linked
+        // at `level` (Release) only once its own link there is set: every
+        // node reached is a published node at least that tall, alive with
+        // `self`.
+        let first = unsafe { link(self.head.as_ptr(), level).load(Acquire) };
+        std::iter::successors(NonNull::new(first), move |n| {
+            NonNull::new(unsafe { link(n.as_ptr(), level).load(Acquire) })
+        })
+        .map(|n| unsafe { key_of(n.as_ptr()) })
+    }
+
     /// Every entry in order.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
         // SAFETY: every cursor here comes from this list.
@@ -622,6 +643,30 @@ mod tests {
             .collect();
         assert_eq!(got, want);
         assert_eq!(key(&list, list.last().unwrap()), ik(n - 1));
+    }
+
+    /// Each level is an ordered subset of the one below, level 0 is every
+    /// key, and a level above every node is empty.
+    #[test]
+    fn levels_are_ordered_samples_of_the_list() {
+        let list = SkipList::new();
+        assert_eq!(list.level_keys(0).count(), 0);
+        let n = scaled(4000, 400);
+        for i in 0..n {
+            assert!(list.insert(&[&ik((i * 7919) % n)], b""));
+        }
+        let all: Vec<&[u8]> = list.iter().map(|(k, _)| k).collect();
+        assert_eq!(list.level_keys(0).collect::<Vec<_>>(), all);
+        let mut below = all;
+        for level in 1..list.levels() {
+            let keys: Vec<&[u8]> = list.level_keys(level).collect();
+            assert!(keys.len() < below.len() || keys.is_empty());
+            assert!(keys.iter().all(|k| below.contains(k)));
+            assert!(keys.windows(2).all(|w| key::compare(w[0], w[1]).is_lt()));
+            below = keys;
+        }
+        assert_eq!(list.level_keys(list.levels()).count(), 0);
+        assert_eq!(list.level_keys(MAX_HEIGHT + 3).count(), 0);
     }
 
     #[test]
