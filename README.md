@@ -64,11 +64,13 @@ solistore answers each of these with a design choice:
   `From(key, direction)` modes; `From(k, Reverse)` is seek-for-prev.
 - Whole-range reads:
   - `Db::snapshot()`: one consistent view for any number of iterators
-    and gets, on any threads, released when dropped.
-  - `DbIterator::next_ref`: borrowed entries, with no allocation and no
-    reference count per entry walking forward.
-  - `split_points(cf, lo, hi, n)`: cuts of about equal size, read from
-    the table indexes, to scan a range on `n` threads.
+    and gets on any threads (`ReadOptions { snapshot, .. }`), released
+    when dropped.
+  - `DbIterator::next_ref` and `Db::for_each`: borrowed entries, with no
+    allocation and no reference count per entry walking forward.
+  - `split_points(cf, lo, hi, n)`: cuts of about equal size, estimated
+    from the table indexes and the memtables, to scan a range on `n`
+    threads.
 - Range deletes:
   - Kept at the version level rather than in tables.
   - A file wholly covered by a delete is dropped without being read.
@@ -271,6 +273,18 @@ The gates that block integration all passed:
 - Reopen under 0.005 s.
 - 202 MB reclaimed after a drop, ending 10% smaller than RocksDB.
 - Peak RSS 0.98× RocksDB's, disk 0.95×.
+
+### Full scans
+
+`engine-bench scan` reads 1M documents of ~430 B in one collection, warm,
+as SoliDB's full scans and aggregations do (medians, ms a pass,
+`bench/results/2026-11-08-scan`):
+
+| | solistore 0.2.1 | solistore now | RocksDB |
+|---|---:|---:|---:|
+| one thread, owned iterator | 147 | 84 | 136 |
+| one thread, borrowed (`next_ref`; RocksDB's raw iterator) | 147 | 71 | 186 |
+| 8 threads, one snapshot, `split_points` | 23 | 15 | 34 |
 
 ### Against SurrealKV
 

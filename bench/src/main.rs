@@ -21,6 +21,7 @@
 //!   engine-bench run        --engine rocks --dir <path> [--label L] [options]
 //!   engine-bench crash      --engine rocks --dir <path> [--secs 3]
 //!   engine-bench visibility --engine rocks --dir <path> [--secs 15]
+//!   engine-bench scan       --engine rocks --dir <path> [--docs 1000000] [--cache-mb 512]
 //!
 //! Every phase prints one JSON line with throughput, latency percentiles,
 //! RSS, CPU, bytes written to disk by the process and the data directory size.
@@ -73,6 +74,33 @@ trait Engine: Send + Sync {
     ) -> Vec<Vec<u8>>;
     /// Make everything durable.
     fn flush(&self);
+    /// Every entry of `[start, end)` of `coll`, forward, through the
+    /// engine's ordinary iterator (owned items). Returns the entries and
+    /// their key and value bytes; the visitor does nothing else.
+    fn full_scan(&self, _coll: u32, _start: &[u8], _end: &[u8]) -> (u64, u64) {
+        unimplemented!("full_scan")
+    }
+    /// The same through the engine's copy-free path: slices valid until the
+    /// next step.
+    fn full_scan_ref(&self, coll: u32, start: &[u8], end: &[u8]) -> (u64, u64) {
+        self.full_scan(coll, start, end)
+    }
+    /// Values of `keys` in `coll`, in one call where the engine has one;
+    /// returns how many were found.
+    fn multi_get(&self, coll: u32, keys: &[Vec<u8>]) -> usize {
+        keys.iter().filter(|k| self.get(coll, k).is_some()).count()
+    }
+    /// The same range as one consistent read, split at `cuts` (user keys of
+    /// `coll`, increasing) and scanned on one thread per part.
+    fn parallel_scan(
+        &self,
+        _coll: u32,
+        _start: &[u8],
+        _end: &[u8],
+        _cuts: &[Vec<u8>],
+    ) -> (u64, u64) {
+        unimplemented!("parallel_scan")
+    }
     /// Engine counters as a JSON object, printed with every phase.
     fn stats(&self) -> String {
         String::new()
@@ -194,7 +222,7 @@ mod rocks {
             let mb = 1024 * 1024;
             // With a write-buffer manager the memtables are charged to the
             // cache, so it grows by their budget: same total as prod.
-            let capacity = (512 + t.wbm_mb.unwrap_or(0)) * mb;
+            let capacity = (t.cache_mb.unwrap_or(512) + t.wbm_mb.unwrap_or(0)) * mb;
             let cache = if t.hyper_clock {
                 Cache::new_hyper_clock_cache(capacity, 0)
             } else {
@@ -302,7 +330,100 @@ mod rocks {
                 self.db.flush_cf(&cf).unwrap();
             }
         }
+
+        fn multi_get(&self, coll: u32, keys: &[Vec<u8>]) -> usize {
+            let shared = self.db.cf_handle(SHARED).unwrap();
+            let keys: Vec<Vec<u8>> = keys.iter().map(|k| prefixed(coll, k)).collect();
+            self.db
+                .batched_multi_get_cf(&shared, &keys, false)
+                .into_iter()
+                .filter(|v| v.as_ref().unwrap().is_some())
+                .count()
+        }
+
+        fn full_scan(&self, coll: u32, start: &[u8], end: &[u8]) -> (u64, u64) {
+            let shared = self.db.cf_handle(SHARED).unwrap();
+            let ro = bounded(coll, start, end);
+            let (mut n, mut bytes) = (0, 0);
+            for item in self.db.iterator_cf_opt(&shared, ro, IteratorMode::Start) {
+                let (k, v) = item.unwrap();
+                n += 1;
+                bytes += (k.len() + v.len()) as u64;
+            }
+            (n, bytes)
+        }
+
+        fn full_scan_ref(&self, coll: u32, start: &[u8], end: &[u8]) -> (u64, u64) {
+            let shared = self.db.cf_handle(SHARED).unwrap();
+            let mut it = self
+                .db
+                .raw_iterator_cf_opt(&shared, bounded(coll, start, end));
+            it.seek_to_first();
+            count_raw(&mut it)
+        }
+
+        fn parallel_scan(
+            &self,
+            coll: u32,
+            start: &[u8],
+            end: &[u8],
+            cuts: &[Vec<u8>],
+        ) -> (u64, u64) {
+            let shared = self.db.cf_handle(SHARED).unwrap();
+            let snapshot = self.db.snapshot();
+            let ranges = ranges(start, end, cuts);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = ranges
+                    .iter()
+                    .map(|(lo, hi)| {
+                        let (shared, snapshot) = (&shared, &snapshot);
+                        scope.spawn(move || {
+                            let mut it =
+                                snapshot.raw_iterator_cf_opt(shared, bounded(coll, lo, hi));
+                            it.seek_to_first();
+                            count_raw(&mut it)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+            })
+        }
     }
+
+    fn bounded(coll: u32, start: &[u8], end: &[u8]) -> ReadOptions {
+        let mut ro = ReadOptions::default();
+        ro.set_iterate_lower_bound(prefixed(coll, start));
+        ro.set_iterate_upper_bound(prefixed(coll, end));
+        ro
+    }
+
+    fn count_raw<D: rust_rocksdb::DBAccess>(
+        it: &mut rust_rocksdb::DBRawIteratorWithThreadMode<'_, D>,
+    ) -> (u64, u64) {
+        let (mut n, mut bytes) = (0, 0);
+        while let Some((k, v)) = it.item() {
+            n += 1;
+            bytes += (k.len() + v.len()) as u64;
+            it.next();
+        }
+        it.status().unwrap();
+        (n, bytes)
+    }
+}
+
+/// `[start, end)` cut at `cuts` into consecutive ranges.
+#[allow(dead_code)]
+fn ranges(start: &[u8], end: &[u8], cuts: &[Vec<u8>]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut bounds = vec![start.to_vec()];
+    bounds.extend(cuts.iter().cloned());
+    bounds.push(end.to_vec());
+    bounds
+        .windows(2)
+        .map(|w| (w[0].clone(), w[1].clone()))
+        .collect()
 }
 
 // ---------------------------------------------------------------- solistore
@@ -316,6 +437,18 @@ mod soli {
 
     const META: &str = "_meta";
     const SHARED: &str = "__keyspaces__";
+
+    /// Entries and bytes of a borrowed walk.
+    #[cfg(feature = "scan-api")]
+    fn count_ref(mut it: solistore::DbIterator) -> (u64, u64) {
+        let (mut n, mut bytes) = (0, 0);
+        while let Some(item) = it.next_ref() {
+            let (k, v) = item.unwrap();
+            n += 1;
+            bytes += (k.len() + v.len()) as u64;
+        }
+        (n, bytes)
+    }
 
     /// The same layout as the RocksDB engine: collections share one column
     /// family under an 8-byte prefix, and `_meta` holds the registry.
@@ -340,6 +473,9 @@ mod soli {
             }
             if let Some(n) = t.recycle_wals {
                 opts.recycle_wal_files = n;
+            }
+            if let Some(mb) = t.cache_mb {
+                opts.block_cache_size = (mb as u64) << 20;
             }
             let db = Db::open(dir, opts).expect("open solistore");
             let cf = |name: &str| {
@@ -413,6 +549,7 @@ mod soli {
             let opts = ReadOptions {
                 lower_bound: Some(prefixed(coll, start)),
                 upper_bound: Some(prefixed(coll, end)),
+                ..Default::default()
             };
             let mode = if rev {
                 IteratorMode::End
@@ -429,6 +566,111 @@ mod soli {
 
         fn flush(&self) {
             self.db.flush().unwrap();
+        }
+
+        fn full_scan(&self, coll: u32, start: &[u8], end: &[u8]) -> (u64, u64) {
+            let opts = ReadOptions {
+                lower_bound: Some(prefixed(coll, start)),
+                upper_bound: Some(prefixed(coll, end)),
+                ..Default::default()
+            };
+            let (mut n, mut bytes) = (0, 0);
+            for item in self
+                .db
+                .iterator_opt(&self.shared, opts, IteratorMode::Start)
+                .unwrap()
+            {
+                let (k, v) = item.unwrap();
+                n += 1;
+                bytes += (k.len() + v.len()) as u64;
+            }
+            (n, bytes)
+        }
+
+        fn multi_get(&self, coll: u32, keys: &[Vec<u8>]) -> usize {
+            let keys: Vec<Vec<u8>> = keys.iter().map(|k| prefixed(coll, k)).collect();
+            let found = self.db.multi_get(&self.shared, &keys).unwrap();
+            found.iter().filter(|v| v.is_some()).count()
+        }
+
+        #[cfg(feature = "scan-api")]
+        fn full_scan_ref(&self, coll: u32, start: &[u8], end: &[u8]) -> (u64, u64) {
+            let opts = ReadOptions {
+                lower_bound: Some(prefixed(coll, start)),
+                upper_bound: Some(prefixed(coll, end)),
+                ..Default::default()
+            };
+            count_ref(
+                self.db
+                    .iterator_opt(&self.shared, opts, IteratorMode::Start)
+                    .unwrap(),
+            )
+        }
+
+        /// Without the scan API: one iterator per part, each at its own
+        /// sequence number, cut where the caller says.
+        #[cfg(not(feature = "scan-api"))]
+        fn parallel_scan(
+            &self,
+            coll: u32,
+            start: &[u8],
+            end: &[u8],
+            cuts: &[Vec<u8>],
+        ) -> (u64, u64) {
+            let ranges = ranges(start, end, cuts);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = ranges
+                    .iter()
+                    .map(|(lo, hi)| scope.spawn(move || self.full_scan(coll, lo, hi)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+            })
+        }
+
+        #[cfg(feature = "scan-api")]
+        fn parallel_scan(
+            &self,
+            coll: u32,
+            start: &[u8],
+            end: &[u8],
+            cuts: &[Vec<u8>],
+        ) -> (u64, u64) {
+            // One snapshot for every part, cut where the tables say the
+            // bytes are (the caller's cuts only give the number of parts).
+            let snapshot = self.db.snapshot();
+            let (lo, hi) = (prefixed(coll, start), prefixed(coll, end));
+            let cuts = snapshot
+                .split_points(&self.shared, &lo, &hi, cuts.len() + 1)
+                .unwrap();
+            let ranges = ranges(&lo, &hi, &cuts);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = ranges
+                    .into_iter()
+                    .map(|(lo, hi)| {
+                        let snapshot = snapshot.clone();
+                        scope.spawn(move || {
+                            // As SoliDB reads it: the snapshot in the options.
+                            let opts = ReadOptions {
+                                lower_bound: Some(lo),
+                                upper_bound: Some(hi),
+                                snapshot: Some(snapshot),
+                            };
+                            count_ref(
+                                self.db
+                                    .iterator_opt(&self.shared, opts, IteratorMode::Start)
+                                    .unwrap(),
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+            })
         }
 
         fn stats(&self) -> String {
@@ -635,6 +877,8 @@ struct SoliTuning {
     compactions: Option<usize>,
     /// Dead WAL files kept for reuse.
     recycle_wals: Option<usize>,
+    /// Block cache size (default 512 MiB, SoliDB's).
+    cache_mb: Option<usize>,
 }
 
 /// RocksDB settings under test on top of the prod profile.
@@ -645,6 +889,8 @@ struct RocksTuning {
     /// Memtable budget charged to the block cache (WriteBufferManager).
     wbm_mb: Option<usize>,
     hyper_clock: bool,
+    /// Block cache size (default 512 MiB, SoliDB's).
+    cache_mb: Option<usize>,
 }
 
 fn open_engine(p: &Params) -> Box<dyn Engine> {
@@ -701,6 +947,13 @@ struct Params {
     mixed_secs: u64,
     settle_secs: u64,
     crash_secs: u64,
+    /// Full passes per scan phase, and threads of the parallel scan.
+    passes: u64,
+    scan_threads: usize,
+    /// Load the scan collection in random key order (else ascending).
+    scan_random: bool,
+    /// Run only this scan phase (for profiling one path).
+    only: Option<String>,
     rocks: RocksTuning,
     soli: SoliTuning,
 }
@@ -724,6 +977,10 @@ impl Params {
             mixed_secs: 30,
             settle_secs: 30,
             crash_secs: 3,
+            passes: 5,
+            scan_threads: 8,
+            scan_random: true,
+            only: None,
             rocks: RocksTuning::default(),
             soli: SoliTuning::default(),
         };
@@ -752,6 +1009,14 @@ impl Params {
                 "--sx-buffer-mb" => p.soli.buffer_mb = Some(value.parse().unwrap()),
                 "--sx-compactions" => p.soli.compactions = Some(value.parse().unwrap()),
                 "--sx-recycle-wals" => p.soli.recycle_wals = Some(value.parse().unwrap()),
+                "--cache-mb" => {
+                    p.rocks.cache_mb = Some(value.parse().unwrap());
+                    p.soli.cache_mb = Some(value.parse().unwrap());
+                }
+                "--passes" => p.passes = value.parse().unwrap(),
+                "--scan-threads" => p.scan_threads = value.parse().unwrap(),
+                "--order" => p.scan_random = value == "random",
+                "--only" => p.only = Some(value),
                 flag => panic!("unknown flag {flag}"),
             }
             i += 2;
@@ -793,6 +1058,9 @@ impl Params {
         }
         if let Some(n) = self.soli.recycle_wals {
             args.extend(["--sx-recycle-wals".to_string(), n.to_string()]);
+        }
+        if let Some(mb) = self.soli.cache_mb {
+            args.extend(["--cache-mb".to_string(), mb.to_string()]);
         }
         args
     }
@@ -1384,6 +1652,172 @@ fn run(p: Params) {
     }
 }
 
+// ---------------------------------------------------------------- full scans
+
+/// The collection the scan mode fills, and the range it reads: its documents.
+const SCAN_COLL: u32 = 1;
+const SCAN_FROM: &[u8] = b"doc:";
+const SCAN_TO: &[u8] = b"doc;";
+
+/// A document of about 430 bytes: the bench's usual shape, a longer bio.
+fn scan_document(n: u64, rng: &mut StdRng) -> Vec<u8> {
+    let bio: Vec<&str> = (0..45)
+        .map(|_| WORDS[rng.gen_range(0..WORDS.len())])
+        .collect();
+    format!(
+        r#"{{"_key":"{n:020}","name":"user {n}","email":"user{n}@example.com","age":{},"city":"{}","bio":"{}","score":{}}}"#,
+        rng.gen_range(18..90),
+        CITIES[rng.gen_range(0..CITIES.len())],
+        bio.join(" "),
+        rng.gen_range(0..1_000_000)
+    )
+    .into_bytes()
+}
+
+/// Whole-collection reads, as SoliDB's full scans and aggregations do them:
+/// `docs` documents of ~430 B in one collection (keys `doc:<n>`, under the
+/// 8-byte prefix), loaded in random key order unless `--order seq`, then
+/// flushed and left to settle. Then, warm, `passes` forward passes per
+/// phase that only count entries and bytes:
+///
+/// - `full_scan`: the engine's ordinary iterator, one thread;
+/// - `full_scan_ref`: its copy-free path (RocksDB's raw iterator);
+/// - `parallel_scan_N`: one consistent read split into N ranges, one
+///   thread each.
+///
+/// Each phase's latencies are per pass; `ops_per_sec` is entries a second.
+/// The data directory is kept, marked as loaded, and reused by the next run
+/// with the same `--docs`: every binary then reads the same tables.
+fn scan(p: Params) {
+    std::fs::create_dir_all(&p.dir).unwrap();
+    let marker = p.dir.join(format!("scan-loaded-{}", p.docs));
+    let loaded = marker.exists();
+    let engine: Arc<dyn Engine> = Arc::from(open_engine(&p));
+    *STATS_SOURCE.lock().unwrap() = Some(engine.clone());
+    if !loaded {
+        engine.create_collection(SCAN_COLL);
+        let mut order: Vec<u64> = (0..p.docs).collect();
+        if p.scan_random {
+            use rand::seq::SliceRandom;
+            order.shuffle(&mut StdRng::seed_from_u64(99));
+        }
+        // Batches of 100 documents, as an import would write them.
+        let batches: Vec<&[u64]> = order.chunks(100).collect();
+        parallel_phase(&p, "scan_load", p.docs, |t, tally| {
+            let mut rng = StdRng::seed_from_u64(50_000 + t);
+            for batch in batches.iter().skip(t as usize).step_by(p.threads as usize) {
+                let ops: Vec<Op> = batch
+                    .iter()
+                    .map(|&n| Op {
+                        coll: SCAN_COLL,
+                        key: doc_key(n),
+                        value: Some(scan_document(n, &mut rng)),
+                    })
+                    .collect();
+                tally.logical_bytes += ops.iter().map(Op::logical_bytes).sum::<u64>();
+                timed(&mut tally.lat, || engine.write(ops, false));
+            }
+        });
+        settle(engine.as_ref(), &p, "scan_settle");
+        std::fs::write(&marker, b"").unwrap();
+    }
+
+    // Cuts for the parallel scan where the engine does not choose its own:
+    // the documents are numbered 0..docs, so equal counts are equal sizes.
+    let threads = p.scan_threads.max(1) as u64;
+    let cuts: Vec<Vec<u8>> = (1..threads)
+        .map(|i| doc_key(p.docs * i / threads))
+        .collect();
+
+    let check = |(n, bytes): (u64, u64)| {
+        assert_eq!(n, p.docs, "a pass saw {n} documents");
+        bytes
+    };
+    // Warm the cache (and the OS's) with one pass of each path.
+    let before = counters();
+    let mut warm = Phase::new(&p, "scan_warm");
+    timed(&mut warm.lat_us, || {
+        check(engine.full_scan(SCAN_COLL, SCAN_FROM, SCAN_TO))
+    });
+    timed(&mut warm.lat_us, || {
+        check(engine.full_scan_ref(SCAN_COLL, SCAN_FROM, SCAN_TO))
+    });
+    warm.ops = 2 * p.docs;
+    warm.print(before);
+
+    let name = format!("parallel_scan_{threads}");
+    type Pass<'a> = &'a dyn Fn() -> (u64, u64);
+    let phases: [(&str, Pass); 3] = [
+        ("full_scan", &|| {
+            engine.full_scan(SCAN_COLL, SCAN_FROM, SCAN_TO)
+        }),
+        ("full_scan_ref", &|| {
+            engine.full_scan_ref(SCAN_COLL, SCAN_FROM, SCAN_TO)
+        }),
+        (name.as_str(), &|| {
+            engine.parallel_scan(SCAN_COLL, SCAN_FROM, SCAN_TO, &cuts)
+        }),
+    ];
+    for (name, pass) in phases {
+        if p.only.as_deref().is_some_and(|only| only != name) {
+            continue;
+        }
+        let before = counters();
+        let mut phase = Phase::new(&p, name);
+        let mut bytes = 0;
+        for _ in 0..p.passes {
+            bytes = timed(&mut phase.lat_us, || check(pass()));
+        }
+        let ms: Vec<String> = phase
+            .lat_us
+            .iter()
+            .map(|us| format!("{:.1}", *us as f64 / 1000.0))
+            .collect();
+        phase.ops = p.passes * p.docs;
+        phase.extra = format!(
+            r#","entries":{},"bytes_per_pass":{bytes},"pass_ms":[{}]"#,
+            p.docs,
+            ms.join(",")
+        );
+        phase.print(before);
+    }
+
+    // Point reads of the same documents, warm: one key per call on one
+    // thread and on `threads`, then `multi_get` of 10 keys (an index
+    // lookup's documents) on `threads`.
+    let gets = p.gets;
+    let read_phase = |name: &str, threads: u64, batch: usize| {
+        if p.only.as_deref().is_some_and(|only| only != name) {
+            return;
+        }
+        let before = counters();
+        let tally = parallel(threads, |t, tally| {
+            let mut rng = StdRng::seed_from_u64(60_000 + t);
+            for _ in 0..gets / threads / batch as u64 {
+                let keys: Vec<Vec<u8>> = (0..batch)
+                    .map(|_| doc_key(rng.gen_range(0..p.docs)))
+                    .collect();
+                let found = timed(&mut tally.lat, || {
+                    if batch == 1 {
+                        engine.get(SCAN_COLL, &keys[0]).is_some() as usize
+                    } else {
+                        engine.multi_get(SCAN_COLL, &keys)
+                    }
+                });
+                assert_eq!(found, batch);
+            }
+        });
+        let mut phase = Phase::new(&p, name);
+        // Documents read a second.
+        phase.ops = gets;
+        phase.lat_us = tally.lat;
+        phase.print(before);
+    };
+    read_phase("get_1t", 1, 1);
+    read_phase(&format!("get_{}t", p.threads), p.threads, 1);
+    read_phase(&format!("multi_get_10_{}t", p.threads), p.threads, 10);
+}
+
 // ---------------------------------------------------------------- crash
 
 /// Child: commit fsync'd batches forever, printing each acknowledged seq.
@@ -1582,6 +2016,7 @@ fn main() {
         "crash" => crash(params),
         "crash-child" => crash_child(params),
         "visibility" => visibility(params),
-        other => panic!("unknown mode {other:?}: run | crash"),
+        "scan" => scan(params),
+        other => panic!("unknown mode {other:?}: run | crash | visibility | scan"),
     }
 }
