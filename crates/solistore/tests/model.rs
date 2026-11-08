@@ -33,6 +33,9 @@ enum Write {
 enum Op {
     Batch(Vec<Write>),
     Get(usize, Vec<u8>),
+    /// Several keys at once, repeats and absent keys included: owned, and
+    /// borrowed through `multi_get_with`.
+    MultiGet(usize, Vec<Vec<u8>>),
     Scan {
         cf: usize,
         lower: Option<Vec<u8>>,
@@ -92,6 +95,7 @@ fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         8 => prop::collection::vec(write(), 1..5).prop_map(Op::Batch),
         4 => (0..CFS.len(), key()).prop_map(|(c, k)| Op::Get(c, k)),
+        3 => (0..CFS.len(), prop::collection::vec(key(), 0..10)).prop_map(|(c, ks)| Op::MultiGet(c, ks)),
         3 => (0..CFS.len(), prop::option::of(key()), prop::option::of(key()), mode())
             .prop_map(|(cf, lower, upper, mode)| Op::Scan { cf, lower, upper, mode }),
         1 => (1..CFS.len()).prop_map(Op::CreateCf),
@@ -194,6 +198,20 @@ fn open(fs: &FaultFs, write_buffer_size: usize) -> Db {
     Db::open(Path::new("/db"), opts).expect("open")
 }
 
+/// What a `multi_get_with` lends, copied out: it must call back once per
+/// key, in the order of the keys.
+fn lent(
+    read: impl FnOnce(&mut dyn FnMut(usize, Option<&[u8]>)) -> solistore::Result<()>,
+) -> Vec<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    read(&mut |i, value| {
+        assert_eq!(i, out.len(), "called out of order");
+        out.push(value.map(<[u8]>::to_vec));
+    })
+    .unwrap();
+    out
+}
+
 fn iterator_mode(mode: &Mode) -> IteratorMode<'_> {
     match mode {
         Mode::Start => IteratorMode::Start,
@@ -294,6 +312,23 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
                 let got = db.get(&handle, &k).unwrap().map(|b| b.to_vec());
                 prop_assert_eq!(got, model.data.get(&(cf, k)).cloned());
             }
+            Op::MultiGet(cf, keys) => {
+                let Some(handle) = db.cf_handle(CFS[cf]) else {
+                    continue;
+                };
+                let want: Vec<Option<Vec<u8>>> = keys
+                    .iter()
+                    .map(|k| model.data.get(&(cf, k.clone())).cloned())
+                    .collect();
+                let got: Vec<_> = db
+                    .multi_get(&handle, &keys)
+                    .unwrap()
+                    .into_iter()
+                    .map(|v| v.map(|b| b.to_vec()))
+                    .collect();
+                prop_assert_eq!(&got, &want, "multi_get {:?}", keys);
+                prop_assert_eq!(lent(|f| db.multi_get_with(&handle, &keys, f)), want);
+            }
             Op::Scan {
                 cf,
                 lower,
@@ -368,7 +403,25 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
                     mode
                 );
                 let got = k.snapshot.get(&handle, &key).unwrap().map(|b| b.to_vec());
-                prop_assert_eq!(got, k.model.data.get(&(cf, key)).cloned(), "snapshot get");
+                prop_assert_eq!(
+                    got,
+                    k.model.data.get(&(cf, key.clone())).cloned(),
+                    "snapshot get"
+                );
+                let keys = [key.clone(), b"a".to_vec(), key, b"cb".to_vec(), Vec::new()];
+                let want: Vec<Option<Vec<u8>>> = keys
+                    .iter()
+                    .map(|key| k.model.data.get(&(cf, key.clone())).cloned())
+                    .collect();
+                let got: Vec<_> = k
+                    .snapshot
+                    .multi_get(&handle, &keys)
+                    .unwrap()
+                    .into_iter()
+                    .map(|v| v.map(|b| b.to_vec()))
+                    .collect();
+                prop_assert_eq!(&got, &want, "snapshot multi_get");
+                prop_assert_eq!(lent(|f| k.snapshot.multi_get_with(&handle, &keys, f)), want);
             }
             Op::Split(cf, n) => {
                 let Some(handle) = db.cf_handle(CFS[cf]) else {

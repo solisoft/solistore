@@ -1288,19 +1288,52 @@ impl Db {
         sv.get(cf.id(), key.as_ref(), snapshot)
     }
 
-    /// Several gets at one snapshot.
+    /// Several gets at one snapshot, in the order of `keys`.
+    ///
+    /// Read as one batch rather than key by key: the keys are looked up in
+    /// key order, each memtable and each table once for all of them, in
+    /// stages that let the cache misses of different keys overlap, and keys
+    /// in one data block read it once. Values are handed out as [`Db::get`]
+    /// does; [`Db::multi_get_with`] lends them instead.
     pub fn multi_get<K: AsRef<[u8]>>(
         &self,
         cf: &ColumnFamily,
         keys: &[K],
     ) -> Result<Vec<Option<Bytes>>> {
+        let mut out = vec![None; keys.len()];
+        self.multi_get_ref(cf, keys, |i, value| out[i] = value.map(|v| v.to_bytes()))?;
+        Ok(out)
+    }
+
+    /// [`Db::multi_get`] without a copy of the values: `f` is called once
+    /// for each key, in the order of `keys`, with its position in `keys`
+    /// and its value, borrowed from the memtable or the cached block that
+    /// holds it, for the length of the call. On an error, `f` is not
+    /// called at all.
+    ///
+    /// For a reader that decodes or forwards each value at once: a value
+    /// handed out owned is an allocation and a copy, as large as the value.
+    pub fn multi_get_with<K: AsRef<[u8]>>(
+        &self,
+        cf: &ColumnFamily,
+        keys: &[K],
+        mut f: impl FnMut(usize, Option<&[u8]>),
+    ) -> Result<()> {
+        self.multi_get_ref(cf, keys, |i, value| f(i, value.as_ref().map(|v| v.bytes())))
+    }
+
+    fn multi_get_ref<K: AsRef<[u8]>>(
+        &self,
+        cf: &ColumnFamily,
+        keys: &[K],
+        emit: impl FnMut(usize, Option<crate::version::ValueRef<'_>>),
+    ) -> Result<()> {
         cf.check()?;
         let inner = self.inner();
+        // The super version first, then the snapshot: see `version`.
         let sv = inner.sv.load();
         let snapshot = inner.publisher.visible();
-        keys.iter()
-            .map(|k| sv.get(cf.id(), k.as_ref(), snapshot))
-            .collect()
+        sv.multi_get(cf.id(), keys, snapshot, emit)
     }
 
     pub fn iterator(&self, cf: &ColumnFamily, mode: IteratorMode<'_>) -> Result<DbIterator> {

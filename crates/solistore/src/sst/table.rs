@@ -63,6 +63,13 @@ impl Handle {
         put_varint(buf, self.len);
     }
 
+    /// Where the block's trailer ends: where the next block starts.
+    fn end(&self) -> Option<u64> {
+        self.offset
+            .checked_add(self.len)?
+            .checked_add(BLOCK_TRAILER as u64)
+    }
+
     fn decode(mut input: &[u8]) -> Result<Handle> {
         let corrupt = || Error::Corruption("malformed block handle".into());
         Ok(Handle {
@@ -304,7 +311,7 @@ fn add_index_entry(index: &mut BlockBuilder, separator: &[u8], handle: Handle) {
 pub struct TableReader {
     file: Arc<dyn RandomAccessFile>,
     index: Block,
-    /// The index's restart keys as integers, for seeks (see [`Fences`]).
+    /// The index as integers, for point reads and seeks (see [`Fences`]).
     fences: Option<Fences>,
     /// Where the data blocks end (the filter follows them).
     data_end: u64,
@@ -386,7 +393,10 @@ impl TableReader {
         let filter_at = filter.offset;
         let index = Block::new(read_block(file.as_ref(), index)?)?;
         let filter = read_block(file.as_ref(), filter)?;
-        let fences = Fences::new(&index);
+        let fences = Fences::new(&index, filter_at, |value| {
+            let handle = Handle::decode(value).ok()?;
+            Some((handle.offset, handle.end()?))
+        });
         let pinned = index.size() + filter.len() + fences.as_ref().map_or(0, Fences::size);
         Ok(TableReader {
             cache: None,
@@ -406,9 +416,7 @@ impl TableReader {
         self
     }
 
-    /// A data block, from the cache when it is there. `fill` says whether
-    /// to keep a block read from disk: compactions read everything once
-    /// and would only push out what readers need.
+    #[cfg(test)]
     fn data_block(&self, handle_bytes: &[u8], fill: bool) -> Result<Block> {
         self.data_block_at(Handle::decode(handle_bytes)?, fill)
     }
@@ -427,7 +435,10 @@ impl TableReader {
         cache.get(*number, handle.offset)
     }
 
-    fn data_block_at(&self, handle: Handle, fill: bool) -> Result<Block> {
+    /// A data block, from the cache when it is there. `fill` says whether
+    /// to keep a block read from disk: compactions read everything once
+    /// and would only push out what readers need.
+    pub(crate) fn data_block_at(&self, handle: Handle, fill: bool) -> Result<Block> {
         if let Some((cache, number)) = &self.cache {
             if let Some(block) = cache.get(*number, handle.offset) {
                 return Ok(block);
@@ -492,53 +503,138 @@ impl TableReader {
     }
 
     /// [`TableReader::get`] for a key a read built once for every table it
-    /// probes, `hash` being its bloom hash. The index and the block are
-    /// searched in place: the one handle taken is the data block's, from the
-    /// cache. Each handle is a write to a reference count shared by every
-    /// thread reading the table, and a read used to take six, on the reader,
-    /// the index and the block.
+    /// probes, `hash` being its bloom hash. The block is searched in place:
+    /// the one handle taken is the data block's, from the cache. Each
+    /// handle is a write to a reference count shared by every thread
+    /// reading the table, and a read used to take six, on the reader, the
+    /// index and the block.
     pub fn get_at(&self, lookup: &key::LookupKey<'_>, hash: u64) -> Result<Option<Version>> {
         if !bloom::may_contain(&self.filter, hash) {
             return Ok(None);
         }
-        let target = lookup.internal();
-        let range = self.index_range(target);
-        let handle = with_seek_key(|key| match self.index.seek_entry_in(target, key, range)? {
-            Some(entry) => {
-                let (start, end) = entry.value;
-                Handle::decode(&self.index.bytes()[start..end]).map(Some)
-            }
-            None => Ok(None),
-        })?;
-        let Some(handle) = handle else {
-            return Ok(None);
-        };
-        let block = self.data_block_at(handle, true)?;
-        let found = with_seek_key(|key| -> Result<Option<Option<Version>>> {
-            let Some(entry) = block.seek_entry(target, key)? else {
+        with_seek_key(|key| {
+            let Some(at) = self.block_for(lookup.internal(), key)? else {
                 return Ok(None);
             };
-            let (start, end) = entry.value;
-            version_of(key, lookup, || {
-                crate::memtable::detach_from(&block.bytes()[start..end], block.size(), || {
-                    block.slice(start..end)
-                })
-            })
-            .map(Some)
-        })?;
-        match found {
-            Some(version) => Ok(version),
-            None => self.get_after_block(lookup),
+            let block = self.data_block_at(at.handle, true)?;
+            match self.version_in(&block, lookup, key)? {
+                Some(found) => Ok(found.map(|found| found.version(&block))),
+                None => self.get_after_block(lookup, at.number, key),
+            }
+        })
+    }
+
+    /// Start fetching the filter line a [`TableReader::may_contain`] of
+    /// `hash` reads.
+    #[inline]
+    pub fn prefetch_filter(&self, hash: u64) {
+        bloom::prefetch(&self.filter, hash);
+    }
+
+    /// Whether the table's filter lets a key of bloom hash `hash` through.
+    #[inline]
+    pub fn may_contain(&self, hash: u64) -> bool {
+        bloom::may_contain(&self.filter, hash)
+    }
+
+    /// Where the data block that may hold the first entry at or after
+    /// `target` is, from the fences when they tell, else from the index;
+    /// `None` when every entry is before `target`. `key` is scratch.
+    #[inline]
+    pub(crate) fn block_for(&self, target: &[u8], key: &mut Vec<u8>) -> Result<Option<BlockAt>> {
+        let range = match &self.fences {
+            Some(fences) => match fences.locate(target) {
+                Ok(number) => {
+                    return Ok(number.map(|i| {
+                        let (offset, len) = fences.handle(i, BLOCK_TRAILER as u64);
+                        BlockAt {
+                            handle: Handle { offset, len },
+                            number: Some(i),
+                        }
+                    }));
+                }
+                Err(range) => range,
+            },
+            None => self.index.full_range(),
+        };
+        match self.index.seek_entry_in(target, key, range)? {
+            Some(entry) => {
+                let (start, end) = entry.value;
+                Ok(Some(BlockAt {
+                    handle: Handle::decode(&self.index.bytes()[start..end])?,
+                    number: None,
+                }))
+            }
+            None => Ok(None),
         }
+    }
+
+    /// What `block` says of `lookup`'s key: `Some(Some(..))` its newest
+    /// version at the snapshot (sequence, kind and the value's range),
+    /// `Some(None)` that the table has none, `None` that every entry is
+    /// before the target and the next block decides. `key` is scratch.
+    #[inline]
+    pub(crate) fn version_in(
+        &self,
+        block: &Block,
+        lookup: &key::LookupKey<'_>,
+        key: &mut Vec<u8>,
+    ) -> Result<Option<Option<Located>>> {
+        let Some(entry) = block.seek_entry(lookup.internal(), key)? else {
+            return Ok(None);
+        };
+        let found = key::parse(key).ok_or_else(|| Error::Corruption("bad key in table".into()))?;
+        Ok(Some(
+            (found.cf == lookup.cf && key::eq_bytes(found.user_key, lookup.user_key)).then_some(
+                Located {
+                    seq: found.seq,
+                    kind: found.kind,
+                    value: entry.value,
+                },
+            ),
+        ))
     }
 
     /// The end of a point read whose block holds nothing at or after the
     /// target: every version in it is newer than the snapshot, or the target
-    /// falls between two blocks. The next block's first entry decides. Rare
-    /// enough to go through iterators.
-    fn get_after_block(&self, lookup: &key::LookupKey<'_>) -> Result<Option<Version>> {
+    /// falls between two blocks. The next block's first entry decides.
+    fn get_after_block(
+        &self,
+        lookup: &key::LookupKey<'_>,
+        number: Option<usize>,
+        key: &mut Vec<u8>,
+    ) -> Result<Option<Version>> {
+        let Some(at) = self.next_block(lookup.internal(), number)? else {
+            return Ok(None);
+        };
+        let block = self.data_block_at(at.handle, true)?;
+        // Every entry of the next block is after the target: the search
+        // lands on its first.
+        Ok(self
+            .version_in(&block, lookup, key)?
+            .flatten()
+            .map(|found| found.version(&block)))
+    }
+
+    /// The data block after block `number`, or, its number unknown, after
+    /// the one the index gives for `target`; `None` past the last.
+    pub(crate) fn next_block(
+        &self,
+        target: &[u8],
+        number: Option<usize>,
+    ) -> Result<Option<BlockAt>> {
+        if let (Some(i), Some(fences)) = (number, &self.fences) {
+            if i + 1 >= fences.blocks() {
+                return Ok(None);
+            }
+            let (offset, len) = fences.handle(i + 1, BLOCK_TRAILER as u64);
+            return Ok(Some(BlockAt {
+                handle: Handle { offset, len },
+                number: Some(i + 1),
+            }));
+        }
         let mut index = self.index.iter();
-        index.seek(lookup.internal());
+        index.seek(target);
         index.status()?;
         if !index.valid() {
             return Ok(None);
@@ -548,35 +644,42 @@ impl TableReader {
             index.status()?;
             return Ok(None);
         }
-        let mut it = self.data_block(index.value_slice(), true)?.iter();
-        it.seek_to_first();
-        it.status()?;
-        if !it.valid() {
-            return Ok(None);
-        }
-        version_of(it.key(), lookup, || {
-            crate::memtable::detach(it.value(), it.block_size())
-        })
+        Ok(Some(BlockAt {
+            handle: Handle::decode(index.value_slice())?,
+            number: None,
+        }))
     }
 }
 
-/// The version `key` (an internal key found by a seek) is, if it is one of
-/// `lookup`'s key; `value` is called only then.
-fn version_of(
-    key: &[u8],
-    lookup: &key::LookupKey<'_>,
-    value: impl FnOnce() -> Bytes,
-) -> Result<Option<Version>> {
-    let found = key::parse(key).ok_or_else(|| Error::Corruption("bad key in table".into()))?;
-    Ok(
-        (found.cf == lookup.cf && key::eq_bytes(found.user_key, lookup.user_key)).then(|| {
-            Version {
-                seq: found.seq,
-                kind: found.kind,
-                value: value(),
-            }
-        }),
-    )
+/// A version a point read found in a data block: its sequence number and
+/// kind, and where its value lies in the block.
+#[derive(Clone, Copy)]
+pub(crate) struct Located {
+    pub seq: u64,
+    pub kind: Kind,
+    pub value: (usize, usize),
+}
+
+impl Located {
+    /// The version, its value handed out as a get does.
+    fn version(self, block: &Block) -> Version {
+        let (start, end) = self.value;
+        Version {
+            seq: self.seq,
+            kind: self.kind,
+            value: crate::memtable::detach_from(&block.bytes()[start..end], block.size(), || {
+                block.slice(start..end)
+            }),
+        }
+    }
+}
+
+/// A data block a point read is to search: where it lies, and its number
+/// among the table's blocks when the fences gave it.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockAt {
+    pub handle: Handle,
+    pub number: Option<usize>,
 }
 
 /// Keys up to this size stay in a thread's seek buffer between reads.
@@ -591,7 +694,7 @@ thread_local! {
 /// Run `f` with the thread's seek buffer, or a fresh one where it cannot be
 /// had (a read from a thread-local destructor, or one nested in another):
 /// those allocate, and nothing panics.
-fn with_seek_key<T>(f: impl FnOnce(&mut Vec<u8>) -> T) -> T {
+pub(crate) fn with_seek_key<T>(f: impl FnOnce(&mut Vec<u8>) -> T) -> T {
     let mut f = Some(f);
     let kept = SEEK_KEY.try_with(|cell| {
         let mut key = cell.try_borrow_mut().ok()?;
@@ -686,9 +789,9 @@ impl TableIter {
     }
 
     /// Walking forward into a block: find the next one in the cache and
-    /// start bringing it into the CPU's caches while this one is read. A
-    /// compaction, which reads blocks the cache mostly does not hold, does
-    /// not look.
+    /// start bringing all of it into the CPU's caches while this one is
+    /// read. A compaction, which reads blocks the cache mostly does not
+    /// hold, does not look.
     fn look_ahead(&mut self) {
         self.ahead = None;
         if !self.fill_cache {

@@ -58,8 +58,22 @@ solistore answers each of these with a design choice:
 - Column families created and dropped at run time.
 - Atomic write batches across column families: readers see a batch entirely
   or not at all.
-- `get` returns `Bytes`, so a block-cache hit is served without a copy.
-  `multi_get` is also available.
+- `get` returns `Bytes`: a slice of the cached block for a value that is
+  most of it, a copy for a small one, which would otherwise keep its
+  whole block alive.
+- `multi_get` reads its keys as one batch: in key order, each memtable and
+  each table once for all of them, a block shared by several keys once,
+  with the cache misses of different keys overlapping.
+  `multi_get_with` lends each value to a closure instead, borrowed from
+  its memtable or cached block, with no allocation or copy:
+
+  ```rust
+  db.multi_get_with(&docs, &keys, |i, value| {
+      if let Some(bytes) = value {
+          // The value of keys[i], valid during this call: decode or forward it.
+      }
+  })?;
+  ```
 - Bounded iterators in both directions, with RocksDB's `Start`, `End` and
   `From(key, direction)` modes; `From(k, Reverse)` is seek-for-prev.
 - Whole-range reads:
@@ -139,7 +153,8 @@ A storage engine is only as good as its crash behaviour, so most of the test
 code exercises failure paths:
 
 - **Model-based property tests.** These run random sequences against a
-  `BTreeMap` model: puts, deletes, range deletes, batches, gets, bounded
+  `BTreeMap` model: puts, deletes, range deletes, batches, gets,
+  `multi_get`s (owned and lent, live and through kept snapshots), bounded
   scans in both directions, flushes, compactions, reopens, column-family
   create and drop, and opening a checkpoint. Tiny memtables and files force
   every background path to run. Set `PROPTEST_CASES` to go deeper; 20,000
@@ -152,7 +167,8 @@ code exercises failure paths:
   exercise poisoning and group commit.
 - **Process kills.** The benchmark's `crash` test SIGKILLs a writer 100
   times mid-load and checks every acknowledged batch. Its `visibility` test
-  checks that no reader ever sees part of a batch.
+  checks that no reader ever sees part of a batch, through `get` and
+  through `multi_get`.
 - **Mutation testing.** Bugs are injected on purpose to check that the tests
   above catch them.
 - **Fuzzing.** `cargo-fuzz` targets feed garbage to every decoder: log
@@ -169,9 +185,9 @@ code exercises failure paths:
 - **Miri.** CI runs the tests of the memtable's skiplist and arena under
   Miri, the only `unsafe` in the crate besides one `sync_file_range` call
   (an FFI call Miri cannot run, which passes a file descriptor and two
-  offsets and no pointer) and a cache prefetch hint, which never faults
-  and is compiled out under Miri. They include concurrent inserts with readers,
-  at sizes scaled down for Miri.
+  offsets and no pointer) and the prefetch hints of `hint.rs`, which never
+  fault and are compiled out under Miri. They include concurrent inserts
+  with readers, at sizes scaled down for Miri.
 
 ## Benchmarks
 
@@ -286,6 +302,24 @@ as SoliDB's full scans and aggregations do (medians, ms a pass,
 | one thread, borrowed (`next_ref`; RocksDB's raw iterator) | 147 | 71 | 186 |
 | 8 threads, one snapshot, `split_points` | 23 | 15 | 34 |
 
+### Point reads
+
+`engine-bench point` reads the same documents by key, warm, with a 4 GiB
+cache: ns per document, medians of 5 interleaved runs
+(`bench/results/2026-11-08-point-reads`):
+
+| | solistore 0.3.0 | solistore now | RocksDB |
+|---|---:|---:|---:|
+| `get`, 1 thread | 1,088 | 685 | 1,643 |
+| `get`, 8 threads | 1,187 | 784 | 1,995 |
+| `multi_get` of 20, 1 thread | 1,086 | 608 | 1,460 |
+| `multi_get_with` of 20, 1 thread (values lent) | 1,084 | 493 | 1,466 |
+| `multi_get` of 20, 8 threads | 1,186 | 722 | 1,728 |
+| `get` of documents still in the memtable | 400 | 390 | 622 |
+
+0.3.0 has no `multi_get_with`, so its row is `multi_get`. RocksDB's is
+`batched_multi_get_cf`, which already returns pinned slices.
+
 ### Against SurrealKV
 
 SurrealKV 1.0.0 is in the same bench, with the budget the other engines
@@ -341,7 +375,8 @@ crates/solistore/src/
   memtable.rs     memtable over the skiplist, range tombstones
   skiplist.rs     concurrent skiplist with keys, values and links in one arena
   sst/            table format: blocks, bloom filters, block cache, reader/builder
-  version.rs      versions, super-versions (arc-swap), level iterators
+  version.rs      versions, super-versions (arc-swap), level iterators, batched gets
+  hint.rs         prefetch hints for point reads
   manifest.rs     version edits and recovery
   flush.rs        memtable → level 0
   compaction.rs   pickers, subcompactions, trivial moves
@@ -361,6 +396,10 @@ docs/             integration plan for SoliDB
 - [x] A migration tool from RocksDB data directories
   (`solidb-migrate-engine`, SoliDB 2.4).
 - [ ] A trial on real workloads, then removing RocksDB from SoliDB.
+- [ ] Block-cache hits without locked writes: a slot per block in each
+  table, read under an epoch guard. Estimated at 15–20% off a point
+  read, for one to two weeks of work
+  (`bench/results/2026-11-08-point-reads`).
 - [ ] Crash tests on NTFS.
 
 ## Licence

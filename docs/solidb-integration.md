@@ -32,7 +32,7 @@ Surveyed in `~/Work/soli/db` (file:line references are to that tree):
   | SoliDB uses | solistore |
   |---|---|
   | create/drop CF at run time, `list_cf` | `create_cf`, `drop_cf`, `cf_names` |
-  | get, pinned get, multi_get | `get` (zero-copy `Bytes`), `multi_get` |
+  | get, pinned get, multi_get | `get` (`Bytes`), `multi_get` (one batched read), `multi_get_with` (values lent, no copy) |
   | atomic batch across CFs, `sync` per write | `WriteBatch`, `WriteOptions { sync }` |
   | `delete_range` in a batch, then `compact_range` | same; reclaim measured at M7 |
   | bounded iterators, `From(k, Reverse)` as seek-for-prev | `iterator_opt` with the same modes |
@@ -171,6 +171,41 @@ aggregations:
 - Warm, one thread, 1M documents of ~430 B: 147 ms a pass -> 71 ms
   through `next_ref` (84 ms through the owned iterator); 8 threads over
   one snapshot 23 -> 15 ms (`bench/results/2026-11-08-scan`).
+
+Then (2026-11-08, `perf/point-reads`), for the documents a query fetches
+by key. The release is 0.3.1: nothing changes signature.
+
+- `multi_get` reads its keys as one batch instead of one by one: sorted
+  once (not at all when they arrive in order), each memtable and each
+  table read once for all of them, in stages (filters, then blocks, then
+  the seeks) so that the cache misses of different keys overlap, and a
+  block shared by consecutive keys read once.
+- `Db::multi_get_with(cf, keys, f)` and `Snapshot::multi_get_with` call
+  `f(i, Option<&[u8]>)` once per key, in the order of `keys`, with the
+  value borrowed from its memtable or cached block for the length of the
+  call; on an error `f` is not called. Two places in SoliDB can take it:
+  - `storage/kv/solistore.rs` `multi_get` turns each `Bytes` into a `Vec`
+    (`v.to_vec()`): two allocations and copies for a small document (one
+    into the `Bytes`, one out of it) where `multi_get_with` needs one,
+    straight from the block.
+  - `Kv::multi_get_pinned_cf` (`multi_get_pinned_ks`, read by
+    `collection/indexes.rs`) collects `Bytes`. A visitor over
+    `multi_get_with` would let the index paths decode each document where
+    it lies; RocksDB's side stays on `batched_multi_get_cf`.
+- A get finds its data block from fences kept per block (an 8-byte word
+  and an offset, ~12 bytes a block, ~200 KB per 64 MiB table, charged to
+  the cache budget) instead of walking the index, and searches the block
+  without rebuilding keys.
+- Warm, 1M documents of ~430 B, 4 GiB cache, ns a document, medians of 5
+  interleaved runs (`bench/results/2026-11-08-point-reads`):
+
+  | | 0.3.0 | 0.3.1 | RocksDB |
+  |---|---:|---:|---:|
+  | `get`, 1 thread | 1,088 | 685 | 1,643 |
+  | `get`, 8 threads | 1,187 | 784 | 1,995 |
+  | `multi_get` of 20, 1 thread | 1,086 | 608 | 1,460 |
+  | `multi_get_with` of 20, 1 thread | 1,084 (`multi_get`) | 493 | 1,466 |
+  | `multi_get` of 20, 8 threads | 1,186 | 722 | 1,728 |
 
 - `storage/kv/solistore.rs`: `Kv` over `solistore::Db`, behind a cargo
   feature `engine-solistore` (git dependency on

@@ -50,6 +50,18 @@ pub fn build(hashes: &[u64]) -> Vec<u8> {
     filter
 }
 
+/// Start fetching the line of `filter` that `hash` probes, for a
+/// [`may_contain`] soon after: a read probes one filter per level, and
+/// their lines can arrive together.
+#[inline]
+pub fn prefetch(filter: &[u8], hash: u64) {
+    let lines = filter.len().saturating_sub(1) / LINE_BYTES;
+    if lines > 0 {
+        let (line, _) = probes(hash, lines);
+        crate::hint::prefetch_line(filter.as_ptr().wrapping_add(line * LINE_BYTES));
+    }
+}
+
 /// `false` means the key is certainly absent. A filter this crate did not
 /// write (wrong length or probe count) answers `true`: no false negatives.
 pub fn may_contain(filter: &[u8], hash: u64) -> bool {
@@ -59,9 +71,21 @@ pub fn may_contain(filter: &[u8], hash: u64) -> bool {
     if num_probes != NUM_PROBES || lines.is_empty() || lines.len() % LINE_BYTES != 0 {
         return true;
     }
-    let (line, mut bits) = probes(hash, lines.len() / LINE_BYTES);
-    let base = line * LINE_BYTES;
-    bits.all(|bit| lines[base + (bit / 8) as usize] & (1 << (bit % 8)) != 0)
+    // `probes`, unrolled over a line of fixed size: no bounds check per
+    // probe. Every point read asks one filter per level.
+    let line = (((hash >> 32) * (lines.len() / LINE_BYTES) as u64) >> 32) as usize;
+    let line: &[u8; LINE_BYTES] = lines[line * LINE_BYTES..][..LINE_BYTES]
+        .try_into()
+        .expect("a whole line");
+    let mut h = hash as u32;
+    for _ in 0..NUM_PROBES {
+        let bit = h >> (32 - 9);
+        if line[(bit / 8) as usize] & (1 << (bit % 8)) == 0 {
+            return false;
+        }
+        h = h.wrapping_mul(0x9e37_79b9);
+    }
+    true
 }
 
 #[cfg(test)]

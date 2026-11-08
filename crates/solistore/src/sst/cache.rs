@@ -19,10 +19,34 @@ type Key = (u64, u64);
 #[derive(Clone)]
 struct BlockWeighter;
 
-impl Weighter<Key, Block> for BlockWeighter {
-    fn weight(&self, _key: &Key, block: &Block) -> u64 {
+impl Weighter<Key, Cached> for BlockWeighter {
+    fn weight(&self, _key: &Key, block: &Cached) -> u64 {
         // The bytes plus the entry's own bookkeeping.
-        block.size() as u64 + 64
+        block.0.size() as u64 + 64
+    }
+}
+
+/// A block as the cache holds it. The cache hands out a hit by cloning
+/// it, and the clone first starts fetching the block's entry headers
+/// ([`Block::prefetch_entries`]): whoever asked reads them at once.
+///
+/// The clone itself writes the block's reference count, which lives in an
+/// allocation of its own, likely a cache miss; a locked write lets no
+/// later load pass it, so the block's first line used to be fetched only
+/// once the count's was. Prefetches are not held back by it: issued
+/// first, these misses overlap. A point read then steps over the block's
+/// entries without waiting for each one in turn.
+///
+/// Only the headers, not the whole block: a batched read takes a dozen
+/// blocks in a row, and 64 lines for each filled the CPU's miss queues
+/// with lines nobody read.
+struct Cached(Block);
+
+impl Clone for Cached {
+    #[inline]
+    fn clone(&self) -> Self {
+        self.0.prefetch_entries();
+        Cached(self.0.clone())
     }
 }
 
@@ -71,7 +95,7 @@ impl Hasher for BlockKeyHasher {
 }
 
 pub struct BlockCache {
-    cache: Cache<Key, Block, BlockWeighter, BlockKeyHash>,
+    cache: Cache<Key, Cached, BlockWeighter, BlockKeyHash>,
     budget: u64,
     /// Index and filter bytes of open tables.
     pinned: std::sync::atomic::AtomicU64,
@@ -129,12 +153,14 @@ impl BlockCache {
         self.pinned.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The block, its entry headers already on their way to the CPU (see
+    /// [`Cached`]).
     pub fn get(&self, table: u64, offset: u64) -> Option<Block> {
-        self.cache.get(&(table, offset))
+        self.cache.get(&(table, offset)).map(|c| c.0)
     }
 
     pub fn insert(&self, table: u64, offset: u64, block: Block) {
-        self.cache.insert((table, offset), block);
+        self.cache.insert((table, offset), Cached(block));
     }
 
     /// Bytes held (RocksDB's `block-cache-usage`).

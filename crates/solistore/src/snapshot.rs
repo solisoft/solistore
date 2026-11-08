@@ -66,16 +66,33 @@ impl Snapshot {
         self.sv.get(cf.id(), key.as_ref(), self.seq)
     }
 
-    /// Several gets, as of the snapshot.
+    /// Several gets, as of the snapshot, in the order of `keys`: see
+    /// [`crate::Db::multi_get`].
     pub fn multi_get<K: AsRef<[u8]>>(
         &self,
         cf: &ColumnFamily,
         keys: &[K],
     ) -> Result<Vec<Option<Bytes>>> {
         cf.check()?;
-        keys.iter()
-            .map(|k| self.sv.get(cf.id(), k.as_ref(), self.seq))
-            .collect()
+        let mut out = vec![None; keys.len()];
+        self.sv.multi_get(cf.id(), keys, self.seq, |i, value| {
+            out[i] = value.map(|v| v.to_bytes())
+        })?;
+        Ok(out)
+    }
+
+    /// Several gets, as of the snapshot, the values lent to `f` in the
+    /// order of `keys`: see [`crate::Db::multi_get_with`].
+    pub fn multi_get_with<K: AsRef<[u8]>>(
+        &self,
+        cf: &ColumnFamily,
+        keys: &[K],
+        mut f: impl FnMut(usize, Option<&[u8]>),
+    ) -> Result<()> {
+        cf.check()?;
+        self.sv.multi_get(cf.id(), keys, self.seq, |i, value| {
+            f(i, value.as_ref().map(|v| v.bytes()))
+        })
     }
 
     /// An iterator over `cf` as of the snapshot.
