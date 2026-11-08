@@ -58,6 +58,12 @@ use crate::version::{by_smallest, table_name, SuperVersion, TableFile, Version, 
 /// batches past this, so one huge group cannot hold every writer up.
 pub const MAX_GROUP_BYTES: usize = 4 << 20;
 
+/// The write rate at the level-0 slowdown trigger, in WAL bytes a second;
+/// it falls by a fifth with each file over the trigger, to no less than
+/// [`MIN_SLOWDOWN_RATE`] (see `Inner::throttle`).
+const SLOWDOWN_RATE: u64 = 256 << 20;
+const MIN_SLOWDOWN_RATE: u64 = 4 << 20;
+
 /// A MANIFEST past this size is replaced by a snapshot of the state.
 const MANIFEST_ROLL_BYTES: u64 = 64 << 20;
 
@@ -89,7 +95,9 @@ pub struct Options {
     pub target_file_size: u64,
     /// Level-0 files that start a compaction into the base level.
     pub level0_compaction_trigger: usize,
-    /// Level-0 files at which each commit group is delayed by a millisecond.
+    /// Level-0 files at which writes slow down: each commit group waits
+    /// for its bytes at 256 MiB/s there, a fifth less with every file
+    /// more, so that writes settle at what compaction keeps up with.
     pub level0_slowdown_trigger: usize,
     /// Level-0 files at which writers wait for compaction.
     pub level0_stop_trigger: usize,
@@ -229,7 +237,7 @@ pub struct Stats {
     /// WAL fsyncs made by the eventual-mode syncer, on its interval or
     /// because `wal_bytes_per_sync` bytes were waiting. Counted once done.
     pub wal_background_fsyncs: u64,
-    /// Groups delayed 1 ms because level 0 passed the slowdown trigger.
+    /// Groups delayed because level 0 passed the slowdown trigger.
     pub l0_slowdowns: u64,
     /// Microseconds writers were stopped by level 0 at the stop trigger.
     pub l0_stop_micros: u64,
@@ -1806,7 +1814,12 @@ impl Inner {
     fn write_group(&self, group: &[Member]) -> Result<Written> {
         self.check()?;
         let mut commit = self.commit.lock();
-        self.throttle()?;
+        self.throttle(
+            group
+                .iter()
+                .map(|m| m.item.batch.size_in_bytes() as u64)
+                .sum(),
+        )?;
         // A switch leaves the old WAL's tail and the new name to the syncer:
         // have it run now, unless it is to keep to its interval.
         let mut wake_syncer = false;
@@ -1881,7 +1894,17 @@ impl Inner {
     /// Hold writes back while level 0 has more files than compaction keeps
     /// up with: a little past the slowdown trigger, entirely at the stop one.
     /// Reads slow down with every level-0 file, so this bounds them too.
-    fn throttle(&self) -> Result<()> {
+    /// Slow writes down as level 0 grows past the slowdown trigger, so
+    /// that they settle at what compaction keeps up with instead of
+    /// running at full speed into the stop trigger: each group waits for
+    /// its bytes at a rate that starts at [`SLOWDOWN_RATE`] and falls by a
+    /// fifth with every file over the trigger.
+    ///
+    /// It was a millisecond a group whatever its size: at 20 files, 32
+    /// writers on 4 cores went from ~300k inserts a second to ~18k (groups
+    /// of ~21), until one compaction of all of level 0 brought it back
+    /// down; and again every ten seconds (engine-bench `sustain`).
+    fn throttle(&self, group_bytes: u64) -> Result<()> {
         let l0 = self.sv.load().version.levels[0].len();
         if l0 >= self.l0_stop {
             let start = Instant::now();
@@ -1899,7 +1922,9 @@ impl Inner {
             }
         } else if l0 >= self.l0_slowdown {
             add(&self.counters.l0_slowdowns, 1);
-            std::thread::sleep(Duration::from_millis(1));
+            let over = (l0 - self.l0_slowdown).min(64) as i32;
+            let rate = (SLOWDOWN_RATE as f64 * 0.8f64.powi(over)).max(MIN_SLOWDOWN_RATE as f64);
+            std::thread::sleep(Duration::from_secs_f64(group_bytes as f64 / rate));
         }
         Ok(())
     }
