@@ -76,7 +76,7 @@ use crate::iter::{InternalIterator, MergingIterator};
 use crate::key::{self, Kind};
 use crate::memtable::{covering_seq, RangeTombstone};
 use crate::sst::{TableBuilder, TableIter, TableProps};
-use crate::version::{table_name, LevelIter, TableFile, Version, NUM_LEVELS};
+use crate::version::{table_name, LevelIter, Source, TableFile, Version, NUM_LEVELS};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -520,20 +520,20 @@ fn merge_range(
     lo: Option<&[u8]>,
     hi: Option<&[u8]>,
 ) -> Result<Vec<(u64, TableProps)>> {
-    let mut children: Vec<Box<dyn InternalIterator>> = Vec::new();
+    let mut children: Vec<Source> = Vec::new();
     if compaction.level == 0 {
         for f in &compaction.inputs {
-            children.push(Box::new(
+            children.push(Source::Table(
                 TableIter::new(f.reader()?.clone()).without_filling_cache(),
             ));
         }
     } else {
-        children.push(Box::new(
+        children.push(Source::Level(
             LevelIter::new(compaction.inputs.clone()).without_filling_cache(),
         ));
     }
     if !compaction.overlapping.is_empty() {
-        children.push(Box::new(
+        children.push(Source::Level(
             LevelIter::new(compaction.overlapping.clone()).without_filling_cache(),
         ));
     }
@@ -576,9 +576,9 @@ fn merge_range(
                 zeroed.clear();
                 zeroed.extend_from_slice(&k[..k.len() - key::TRAILER_LEN]);
                 zeroed.extend_from_slice(&key::trailer_bytes(0, parsed.kind));
-                out.add(parsed.cf, &zeroed, &merged.value(), &mut allocate)?;
+                out.add(parsed.cf, &zeroed, merged.value_slice(), &mut allocate)?;
             } else {
-                out.add(parsed.cf, k, &merged.value(), &mut allocate)?;
+                out.add(parsed.cf, k, merged.value_slice(), &mut allocate)?;
             }
         }
         merged.next();

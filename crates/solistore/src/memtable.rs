@@ -283,8 +283,13 @@ impl InternalIterator for MemIter {
     }
 
     fn value(&self) -> Bytes {
+        Bytes::copy_from_slice(self.value_slice())
+    }
+
+    #[inline]
+    fn value_slice(&self) -> &[u8] {
         // SAFETY: as in `next`.
-        Bytes::copy_from_slice(unsafe { self.mem.map.value(self.current()) })
+        unsafe { self.mem.map.value(self.current()) }
     }
 
     fn status(&self) -> Result<()> {

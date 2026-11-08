@@ -4,6 +4,10 @@
 //! directions, column family creation and drops, clean reopens and crashes
 //! (with torn tails). In `Full` durability every acknowledged write must
 //! survive a crash, so the database must equal the model after each one.
+//!
+//! Scans are read three ways (owned items, borrowed with `next_ref`, and
+//! the two interleaved), through snapshots taken earlier against the model
+//! as it was then, and cut at split points.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -11,7 +15,10 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 use solistore::fs::{FaultFs, Torn};
-use solistore::{Db, Direction, Durability, IteratorMode, Options, ReadOptions, WriteBatch};
+use solistore::Db;
+use solistore::{
+    DbIterator, Direction, Durability, IteratorMode, Options, ReadOptions, Snapshot, WriteBatch,
+};
 
 const CFS: [&str; 4] = ["default", "c1", "c2", "c3"];
 
@@ -34,6 +41,19 @@ enum Op {
     },
     CreateCf(usize),
     DropCf(usize),
+    /// Keep a snapshot (at most a few: the oldest goes).
+    TakeSnapshot,
+    /// Read through a kept snapshot: a scan, then a get.
+    ReadSnapshot {
+        which: usize,
+        cf: usize,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+        mode: Mode,
+        key: Vec<u8>,
+    },
+    /// Cut a column family at split points and scan the parts.
+    Split(usize, usize),
     Reopen,
     Flush,
     Crash(u64),
@@ -76,6 +96,10 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|(cf, lower, upper, mode)| Op::Scan { cf, lower, upper, mode }),
         1 => (1..CFS.len()).prop_map(Op::CreateCf),
         1 => (1..CFS.len()).prop_map(Op::DropCf),
+        1 => Just(Op::TakeSnapshot),
+        2 => (0..4usize, 0..CFS.len(), prop::option::of(key()), prop::option::of(key()), mode(), key())
+            .prop_map(|(which, cf, lower, upper, mode, key)| Op::ReadSnapshot { which, cf, lower, upper, mode, key }),
+        1 => (0..CFS.len(), 2..6usize).prop_map(|(cf, n)| Op::Split(cf, n)),
         1 => Just(Op::Reopen),
         1 => Just(Op::Flush),
         1 => any::<u64>().prop_map(Op::Crash),
@@ -170,6 +194,48 @@ fn open(fs: &FaultFs, write_buffer_size: usize) -> Db {
     Db::open(Path::new("/db"), opts).expect("open")
 }
 
+fn iterator_mode(mode: &Mode) -> IteratorMode<'_> {
+    match mode {
+        Mode::Start => IteratorMode::Start,
+        Mode::End => IteratorMode::End,
+        Mode::From(k, rev) => IteratorMode::From(
+            k,
+            if *rev {
+                Direction::Reverse
+            } else {
+                Direction::Forward
+            },
+        ),
+    }
+}
+
+/// Every row of an iterator, read `how`: 0 owned, 1 borrowed, 2 the two
+/// in turn.
+fn drain(mut it: DbIterator, how: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows = Vec::new();
+    for step in 0.. {
+        let row = if how == 1 || (how == 2 && step % 2 == 1) {
+            it.next_ref()
+                .map(|r| r.map(|(k, v)| (k.to_vec(), v.to_vec())))
+        } else {
+            it.next().map(|r| r.map(|(k, v)| (k.to_vec(), v.to_vec())))
+        };
+        match row {
+            Some(row) => rows.push(row.unwrap()),
+            None => return rows,
+        }
+    }
+    unreachable!()
+}
+
+/// A snapshot kept by the test, with the model at that moment and each
+/// column family's incarnation (a re-created family is another one).
+struct Kept {
+    snapshot: Snapshot,
+    model: Model,
+    incarnations: [u32; CFS.len()],
+}
+
 /// The whole database, read back through the public API.
 fn dump(db: &Db) -> Model {
     let mut model = Model {
@@ -197,6 +263,8 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
     // must never add to them.
     let mut torn_before = 0;
     let mut model = Model::new();
+    let mut kept: Vec<Kept> = Vec::new();
+    let mut incarnations = [0u32; CFS.len()];
 
     for op in ops {
         match op {
@@ -239,27 +307,95 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
                     lower_bound: lower.clone(),
                     upper_bound: upper.clone(),
                 };
-                let it_mode = match &mode {
-                    Mode::Start => IteratorMode::Start,
-                    Mode::End => IteratorMode::End,
-                    Mode::From(k, rev) => IteratorMode::From(
-                        k,
-                        if *rev {
-                            Direction::Reverse
-                        } else {
-                            Direction::Forward
-                        },
-                    ),
+                let want = model.scan(cf, &lower, &upper, &mode);
+                for how in 0..3 {
+                    let it = db
+                        .iterator_opt(&handle, opts.clone(), iterator_mode(&mode))
+                        .unwrap();
+                    prop_assert_eq!(drain(it, how), want.clone(), "{:?}, read {}", mode, how);
+                }
+            }
+            Op::TakeSnapshot => {
+                if kept.len() == 3 {
+                    kept.remove(0);
+                }
+                kept.push(Kept {
+                    snapshot: db.snapshot(),
+                    model: model.clone(),
+                    incarnations,
+                });
+            }
+            Op::ReadSnapshot {
+                which,
+                cf,
+                lower,
+                upper,
+                mode,
+                key,
+            } => {
+                let Some(k) = kept.get(which % kept.len().max(1)) else {
+                    continue;
                 };
-                let got: Vec<_> = db
-                    .iterator_opt(&handle, opts, it_mode)
-                    .unwrap()
-                    .map(|r| r.map(|(k, v)| (k.to_vec(), v.to_vec())).unwrap())
-                    .collect();
-                prop_assert_eq!(got, model.scan(cf, &lower, &upper, &mode), "{:?}", mode);
+                // The family must be the one the snapshot saw, still live:
+                // a dropped one refuses reads, a re-created one is new.
+                let Some(handle) = db.cf_handle(CFS[cf]) else {
+                    continue;
+                };
+                if !k.model.live.contains(&cf) || k.incarnations[cf] != incarnations[cf] {
+                    continue;
+                }
+                let opts = ReadOptions {
+                    lower_bound: lower.clone(),
+                    upper_bound: upper.clone(),
+                };
+                let it = k
+                    .snapshot
+                    .iterator_opt(&handle, opts, iterator_mode(&mode))
+                    .unwrap();
+                prop_assert_eq!(
+                    drain(it, which % 3),
+                    k.model.scan(cf, &lower, &upper, &mode),
+                    "snapshot scan {:?}",
+                    mode
+                );
+                let got = k.snapshot.get(&handle, &key).unwrap().map(|b| b.to_vec());
+                prop_assert_eq!(got, k.model.data.get(&(cf, key)).cloned(), "snapshot get");
+            }
+            Op::Split(cf, n) => {
+                let Some(handle) = db.cf_handle(CFS[cf]) else {
+                    continue;
+                };
+                // Keys are over a, b, c: [a, d) holds all but the empty one.
+                let cuts = db.split_points(&handle, b"a", b"d", n).unwrap();
+                prop_assert!(cuts.len() < n, "{} cuts for {} parts", cuts.len(), n);
+                prop_assert!(cuts.windows(2).all(|w| w[0] < w[1]), "{:?}", cuts);
+                prop_assert!(
+                    cuts.iter()
+                        .all(|c| c.as_slice() > b"a".as_slice() && c.as_slice() < b"d".as_slice()),
+                    "{:?}",
+                    cuts
+                );
+                let mut bounds = vec![b"a".to_vec()];
+                bounds.extend(cuts);
+                bounds.push(b"d".to_vec());
+                let snapshot = db.snapshot();
+                let mut parts = Vec::new();
+                for w in bounds.windows(2) {
+                    let opts = ReadOptions {
+                        lower_bound: Some(w[0].clone()),
+                        upper_bound: Some(w[1].clone()),
+                    };
+                    let it = snapshot
+                        .iterator_opt(&handle, opts, IteratorMode::Start)
+                        .unwrap();
+                    parts.extend(drain(it, 1));
+                }
+                let all = model.scan(cf, &Some(b"a".to_vec()), &Some(b"d".to_vec()), &Mode::Start);
+                prop_assert_eq!(parts, all);
             }
             Op::CreateCf(cf) => {
                 if model.live.insert(cf) {
+                    incarnations[cf] += 1;
                     db.create_cf(CFS[cf]).unwrap();
                 } else {
                     prop_assert!(db.create_cf(CFS[cf]).is_err());
@@ -276,6 +412,7 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
                 }
             }
             Op::Reopen => {
+                kept.clear();
                 drop(db);
                 db = open(&fs);
                 let torn = db.recovery_report().discarded_bytes;
@@ -292,6 +429,7 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
                 prop_assert_eq!(&dump(&db), &model, "a flush changed what is visible");
             }
             Op::Crash(seed) => {
+                kept.clear();
                 fs.crash(Torn::Seeded(seed));
                 drop(db);
                 db = open(&fs);
@@ -300,6 +438,7 @@ fn run(ops: Vec<Op>, buffer: usize) -> Result<(), TestCaseError> {
             }
         }
     }
+    kept.clear();
     drop(db);
     fs.crash(Torn::None);
     let db = open(&fs);

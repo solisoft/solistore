@@ -62,6 +62,13 @@ solistore answers each of these with a design choice:
   `multi_get` is also available.
 - Bounded iterators in both directions, with RocksDB's `Start`, `End` and
   `From(key, direction)` modes; `From(k, Reverse)` is seek-for-prev.
+- Whole-range reads:
+  - `Db::snapshot()`: one consistent view for any number of iterators
+    and gets, on any threads, released when dropped.
+  - `DbIterator::next_ref`: borrowed entries, with no allocation and no
+    reference count per entry walking forward.
+  - `split_points(cf, lo, hi, n)`: cuts of about equal size, read from
+    the table indexes, to scan a range on `n` threads.
 - Range deletes:
   - Kept at the version level rather than in tables.
   - A file wholly covered by a delete is dropped without being read.
@@ -160,7 +167,8 @@ code exercises failure paths:
 - **Miri.** CI runs the tests of the memtable's skiplist and arena under
   Miri, the only `unsafe` in the crate besides one `sync_file_range` call
   (an FFI call Miri cannot run, which passes a file descriptor and two
-  offsets and no pointer). They include concurrent inserts with readers,
+  offsets and no pointer) and a cache prefetch hint, which never faults
+  and is compiled out under Miri. They include concurrent inserts with readers,
   at sizes scaled down for Miri.
 
 ## Benchmarks
@@ -324,6 +332,7 @@ crates/solistore/src/
   flush.rs        memtable → level 0
   compaction.rs   pickers, subcompactions, trivial moves
   iter.rs         merging iterator and the user-facing iterator
+  snapshot.rs     snapshots: many reads at one sequence number
   fs.rs           filesystem trait: StdFs, and FaultFs for crash tests
 bench/            SoliDB-shaped benchmark against RocksDB
 docs/             integration plan for SoliDB

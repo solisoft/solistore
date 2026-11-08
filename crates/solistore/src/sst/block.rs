@@ -52,7 +52,7 @@ fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
 /// with the header's length. Keys in SoliDB's layout are short, so `shared`
 /// and `unshared` take one byte and `value_len` one or two; those cases skip
 /// the general varint loop.
-#[inline]
+#[inline(always)]
 fn entry_header(input: &[u8]) -> Option<(usize, usize, usize, usize)> {
     if input.len() >= 4 && input[0] < 0x80 && input[1] < 0x80 {
         let (shared, unshared) = (input[0] as usize, input[1] as usize);
@@ -182,19 +182,83 @@ impl Block {
     }
 
     pub fn iter(&self) -> BlockIter {
+        self.clone().into_iter_with(Vec::new())
+    }
+
+    /// A cursor over this block that builds its keys in `key`, the buffer
+    /// of a cursor over an earlier block: a scan allocates no key per
+    /// block.
+    pub fn into_iter_with(self, mut key: Vec<u8>) -> BlockIter {
+        key.clear();
         BlockIter {
-            block: self.clone(),
             offset: self.restarts,
             next_offset: self.restarts,
-            key: Vec::new(),
+            block: self,
+            key,
             value: (0, 0),
             corrupt: false,
         }
     }
 
+    /// The entries stored whole at the restart points, in order: every
+    /// `interval`-th entry of the block, read in place. A malformed one is
+    /// an error.
+    pub fn restart_entries(&self) -> impl Iterator<Item = Result<(&[u8], &[u8])>> + '_ {
+        let data = &self.data[..self.restarts];
+        (0..self.num_restarts).map(move |i| {
+            let at = self.restart_point(i);
+            let (shared, unshared, value_len, header) =
+                entry_header(data.get(at..).ok_or_else(corrupt)?).ok_or_else(corrupt)?;
+            if shared != 0 {
+                return Err(corrupt());
+            }
+            let key_start = at.checked_add(header).ok_or_else(corrupt)?;
+            let value_start = key_start.checked_add(unshared).ok_or_else(corrupt)?;
+            let value_end = value_start.checked_add(value_len).ok_or_else(corrupt)?;
+            Ok((
+                data.get(key_start..value_start).ok_or_else(corrupt)?,
+                data.get(value_start..value_end).ok_or_else(corrupt)?,
+            ))
+        })
+    }
+
     /// The block's bytes, which the value ranges below index into.
     pub fn bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Start bringing the whole block into the CPU's caches, for a walk
+    /// about to read it.
+    ///
+    /// Each cached block is its own allocation, and a walk reads one entry
+    /// every few hundred bytes, too few for the hardware prefetcher to
+    /// follow within 4 KiB: without this, a warm full scan spent most of
+    /// its time waiting for the memory of each next entry.
+    #[inline]
+    pub fn prefetch(&self) {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let (start, len) = (self.data.as_ptr(), self.data.len());
+            // SAFETY: a prefetch is a hint. It never faults and has no
+            // effect a program can observe besides timing; every address is
+            // inside a live slice anyway.
+            #[allow(unused_unsafe)]
+            let line =
+                |at: usize| unsafe { _mm_prefetch::<_MM_HINT_T0>(start.wrapping_add(at).cast()) };
+            let mut at = 0;
+            while at + 256 <= len {
+                line(at);
+                line(at + 64);
+                line(at + 128);
+                line(at + 192);
+                at += 256;
+            }
+            while at < len {
+                line(at);
+                at += 64;
+            }
+        }
     }
 
     /// A handle on part of the block, which keeps the whole block alive.
@@ -247,6 +311,7 @@ pub struct Entry {
 /// key in `key` from the one before it. Returns the value's range and where
 /// the next entry starts; `None`, with `key` untouched, if the entry is
 /// malformed.
+#[inline(always)]
 fn parse_entry(data: &[u8], at: usize, key: &mut Vec<u8>) -> Option<((usize, usize), usize)> {
     let (shared, unshared, value_len, header) = entry_header(data.get(at..)?)?;
     let key_start = at.checked_add(header)?;
@@ -272,16 +337,54 @@ pub struct BlockIter {
 }
 
 impl BlockIter {
+    #[inline]
     pub fn valid(&self) -> bool {
         self.offset < self.block.restarts
     }
 
+    #[inline]
     pub fn key(&self) -> &[u8] {
         &self.key
     }
 
     pub fn value(&self) -> Bytes {
         self.block.data.slice(self.value.0..self.value.1)
+    }
+
+    /// The value in place, without a handle on the block.
+    #[inline]
+    pub fn value_slice(&self) -> &[u8] {
+        &self.block.data[self.value.0..self.value.1]
+    }
+
+    /// The key buffer, for a cursor over the next block.
+    pub fn into_key(self) -> Vec<u8> {
+        self.key
+    }
+
+    /// Where the current entry starts in the block: which entry it is.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Where the entry after the current one starts.
+    pub fn next_offset(&self) -> usize {
+        self.next_offset
+    }
+
+    /// The value of the entry after the current one, read in place without
+    /// moving (its key is not rebuilt): an index looked at one block ahead.
+    pub fn peek_next_value(&self) -> Option<&[u8]> {
+        if !self.valid() {
+            return None;
+        }
+        let data = &self.block.data[..self.block.restarts];
+        let (_, unshared, value_len, header) = entry_header(data.get(self.next_offset..)?)?;
+        let start = self
+            .next_offset
+            .checked_add(header)?
+            .checked_add(unshared)?;
+        data.get(start..start.checked_add(value_len)?)
     }
 
     /// Size of the decoded block the values slice.
@@ -303,6 +406,7 @@ impl BlockIter {
     }
 
     /// Decode the entry at `next_offset`, building on the current key.
+    #[inline]
     fn parse_next(&mut self) -> bool {
         self.offset = self.next_offset;
         if self.offset >= self.block.restarts {
@@ -341,6 +445,7 @@ impl BlockIter {
         while self.parse_next() && self.next_offset < self.block.restarts {}
     }
 
+    #[inline]
     pub fn next(&mut self) {
         debug_assert!(self.valid());
         self.parse_next();

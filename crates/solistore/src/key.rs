@@ -17,7 +17,7 @@ use std::cmp::Ordering;
 /// start at 1, so 0 sorts after every real version of a key.
 pub const MAX_SEQ: u64 = (1 << 56) - 1;
 pub const TRAILER_LEN: usize = 8;
-const CF_LEN: usize = 4;
+pub const CF_LEN: usize = 4;
 pub const MIN_LEN: usize = CF_LEN + TRAILER_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -220,16 +220,77 @@ pub fn cf_and_user_key(key: &[u8]) -> &[u8] {
     }
 }
 
-fn trailer(key: &[u8]) -> u64 {
+/// The trailer (`seq << 8 | kind`) of an internal key; 0 for bytes too
+/// short to hold one.
+#[inline]
+pub fn trailer(key: &[u8]) -> u64 {
     key.len().checked_sub(TRAILER_LEN).map_or(0, |at| {
         u64::from_le_bytes(key[at..].try_into().expect("8 bytes"))
     })
 }
 
+/// Bytewise order, as `<[u8]>::cmp`, eight bytes at a time and inline.
+///
+/// Every step of a scan compares keys (the merge, the range bound, the
+/// versions of a key), and SoliDB's keys share long prefixes: a keyspace
+/// prefix, then `doc:`. `memcmp` behind a call cost more than the
+/// comparison itself on keys of 30-odd bytes.
+#[inline]
+pub fn cmp_bytes(a: &[u8], b: &[u8]) -> Ordering {
+    let n = a.len().min(b.len());
+    let (a, b, rest) = (&a[..n], &b[..n], a.len().cmp(&b.len()));
+    let word = |s: &[u8], at: usize| u64::from_be_bytes(s[at..at + 8].try_into().expect("8 bytes"));
+    if n < 8 {
+        for (x, y) in a.iter().zip(b) {
+            if x != y {
+                return x.cmp(y);
+            }
+        }
+        return rest;
+    }
+    let mut at = 0;
+    while at + 8 < n {
+        let (x, y) = (word(a, at), word(b, at));
+        if x != y {
+            return x.cmp(&y);
+        }
+        at += 8;
+    }
+    // The last eight bytes, overlapping the words already found equal:
+    // only the bytes past them can differ.
+    word(a, n - 8).cmp(&word(b, n - 8)).then(rest)
+}
+
+/// Byte equality, inline. Keys a scan compares for equality are mostly the
+/// same length and differ at the end (`doc:…41` against `doc:…42`): the
+/// last eight bytes go first.
+#[inline]
+pub fn eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len();
+    if n != b.len() {
+        return false;
+    }
+    if n < 8 {
+        return a == b;
+    }
+    let word = |s: &[u8], at: usize| u64::from_ne_bytes(s[at..at + 8].try_into().expect("8 bytes"));
+    if word(a, n - 8) != word(b, n - 8) {
+        return false;
+    }
+    let mut at = 0;
+    while at + 8 < n {
+        if word(a, at) != word(b, at) {
+            return false;
+        }
+        at += 8;
+    }
+    true
+}
+
+#[inline]
 pub fn compare(a: &[u8], b: &[u8]) -> Ordering {
     // The cf prefix is big-endian, so it sorts bytewise with the user key.
-    cf_and_user_key(a)
-        .cmp(cf_and_user_key(b))
+    cmp_bytes(cf_and_user_key(a), cf_and_user_key(b))
         .then_with(|| trailer(b).cmp(&trailer(a)))
         // Only a key shorter than a trailer ties with a different one
         // (`abc` and `abc` followed by a zero trailer); well-formed keys
@@ -452,6 +513,24 @@ mod tests {
             .iter()
             .filter(|k| k.len() < MIN_LEN)
             .all(|k| parse(k).is_none()));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        #[test]
+        fn cmp_bytes_and_eq_bytes_are_slice_order(
+            a in prop::collection::vec(prop::sample::select(vec![0u8, 1, b'a', 0x7f, 0x80, 0xff]), 0..40),
+            b in prop::collection::vec(prop::sample::select(vec![0u8, 1, b'a', 0x7f, 0x80, 0xff]), 0..40),
+        ) {
+            prop_assert_eq!(cmp_bytes(&a, &b), a.cmp(&b));
+            prop_assert_eq!(eq_bytes(&a, &b), a == b);
+            prop_assert!(eq_bytes(&a, &a.clone()));
+            // And on a shared prefix, the commonest case in a scan.
+            let (x, y) = ([&a[..], &b[..]].concat(), [&a[..], &a[..]].concat());
+            prop_assert_eq!(cmp_bytes(&x, &y), x.cmp(&y));
+            prop_assert_eq!(eq_bytes(&x, &y), x == y);
+        }
     }
 
     #[test]
