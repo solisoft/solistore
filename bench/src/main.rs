@@ -22,6 +22,7 @@
 //!   engine-bench crash      --engine rocks --dir <path> [--secs 3]
 //!   engine-bench visibility --engine rocks --dir <path> [--secs 15]
 //!   engine-bench scan       --engine rocks --dir <path> [--docs 1000000] [--cache-mb 512]
+//!   engine-bench point      --engine rocks --dir <path> [--docs 1000000] [--cache-mb 512]
 //!
 //! Every phase prints one JSON line with throughput, latency percentiles,
 //! RSS, CPU, bytes written to disk by the process and the data directory size.
@@ -111,6 +112,25 @@ trait Engine: Send + Sync {
     /// Engine counters as a JSON object, printed with every phase.
     fn stats(&self) -> String {
         String::new()
+    }
+    /// Point reads through handles taken once, for the point mode: one
+    /// reader per thread.
+    fn point_reader(&self) -> Box<dyn PointReader + '_> {
+        unimplemented!("point_reader")
+    }
+}
+
+/// Point reads of keys already under their collection prefix, so that
+/// the point mode times the engine's call and nothing around it.
+trait PointReader {
+    /// The value's length, if the key is there.
+    fn get(&self, key: &[u8]) -> Option<usize>;
+    /// Keys found and their value bytes, in one call.
+    fn multi_get(&self, keys: &[&[u8]]) -> (usize, usize);
+    /// The same, with the values borrowed where the engine can lend them
+    /// (RocksDB's `multi_get` already returns pinned slices).
+    fn multi_get_ref(&self, keys: &[&[u8]]) -> (usize, usize) {
+        self.multi_get(keys)
     }
 }
 
@@ -397,6 +417,43 @@ mod rocks {
                     .map(|h| h.join().unwrap())
                     .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
             })
+        }
+
+        fn point_reader(&self) -> Box<dyn PointReader + '_> {
+            Box::new(RocksPoint {
+                db: &self.db,
+                cf: self.db.cf_handle(SHARED).unwrap(),
+            })
+        }
+    }
+
+    /// SoliDB's reads: `get_pinned_cf`, and `batched_multi_get_cf` with
+    /// unsorted input (storage/kv/mod.rs).
+    struct RocksPoint<'a> {
+        db: &'a Db,
+        cf: Arc<rust_rocksdb::BoundColumnFamily<'a>>,
+    }
+
+    impl PointReader for RocksPoint<'_> {
+        fn get(&self, key: &[u8]) -> Option<usize> {
+            self.db
+                .get_pinned_cf(&self.cf, key)
+                .unwrap()
+                .map(|v| v.len())
+        }
+
+        fn multi_get(&self, keys: &[&[u8]]) -> (usize, usize) {
+            let mut out = (0, 0);
+            for value in self
+                .db
+                .batched_multi_get_cf(&self.cf, keys.iter().copied(), false)
+            {
+                if let Some(v) = value.unwrap() {
+                    out.0 += 1;
+                    out.1 += v.len();
+                }
+            }
+            out
         }
     }
 
@@ -724,6 +781,54 @@ mod soli {
                 self.db.live_table_bytes() >> 20,
                 s.largest_wal_bytes >> 20,
             )
+        }
+
+        fn point_reader(&self) -> Box<dyn PointReader + '_> {
+            Box::new(SoliPoint {
+                db: &self.db,
+                cf: &self.shared,
+            })
+        }
+    }
+
+    /// SoliDB's reads: `get`, and `multi_get` (storage/kv/mod.rs).
+    struct SoliPoint<'a> {
+        db: &'a Db,
+        cf: &'a ColumnFamily,
+    }
+
+    impl PointReader for SoliPoint<'_> {
+        fn get(&self, key: &[u8]) -> Option<usize> {
+            self.db.get(self.cf, key).unwrap().map(|v| v.len())
+        }
+
+        fn multi_get(&self, keys: &[&[u8]]) -> (usize, usize) {
+            let mut out = (0, 0);
+            for v in self
+                .db
+                .multi_get(self.cf, keys)
+                .unwrap()
+                .into_iter()
+                .flatten()
+            {
+                out.0 += 1;
+                out.1 += v.len();
+            }
+            out
+        }
+
+        #[cfg(feature = "point-api")]
+        fn multi_get_ref(&self, keys: &[&[u8]]) -> (usize, usize) {
+            let mut out = (0, 0);
+            self.db
+                .multi_get_with(self.cf, keys, |_, value| {
+                    if let Some(v) = value {
+                        out.0 += 1;
+                        out.1 += v.len();
+                    }
+                })
+                .unwrap();
+            out
         }
     }
 }
@@ -1704,6 +1809,50 @@ fn scan_document(n: u64, rng: &mut StdRng) -> Vec<u8> {
     .into_bytes()
 }
 
+/// The engine at `p.dir` holding the scan collection: `docs` documents
+/// loaded in batches of 100 (in random key order unless `--order seq`),
+/// flushed and settled, unless a run with the same `--docs` already did,
+/// so every binary reads the same tables.
+fn scan_collection(p: &Params) -> Arc<dyn Engine> {
+    std::fs::create_dir_all(&p.dir).unwrap();
+    let marker = p.dir.join(format!("scan-loaded-{}", p.docs));
+    let engine: Arc<dyn Engine> = Arc::from(open_engine(p));
+    *STATS_SOURCE.lock().unwrap() = Some(engine.clone());
+    if !marker.exists() {
+        engine.create_collection(SCAN_COLL);
+        load_documents(p, engine.as_ref(), "scan_load", p.docs, p.scan_random);
+        settle(engine.as_ref(), p, "scan_settle");
+        std::fs::write(&marker, b"").unwrap();
+    }
+    engine
+}
+
+/// Documents `0..docs` of the scan collection, in batches of 100 as an
+/// import would write them, on `p.threads` writers.
+fn load_documents(p: &Params, engine: &dyn Engine, name: &str, docs: u64, random: bool) {
+    let mut order: Vec<u64> = (0..docs).collect();
+    if random {
+        use rand::seq::SliceRandom;
+        order.shuffle(&mut StdRng::seed_from_u64(99));
+    }
+    let batches: Vec<&[u64]> = order.chunks(100).collect();
+    parallel_phase(p, name, docs, |t, tally| {
+        let mut rng = StdRng::seed_from_u64(50_000 + t);
+        for batch in batches.iter().skip(t as usize).step_by(p.threads as usize) {
+            let ops: Vec<Op> = batch
+                .iter()
+                .map(|&n| Op {
+                    coll: SCAN_COLL,
+                    key: doc_key(n),
+                    value: Some(scan_document(n, &mut rng)),
+                })
+                .collect();
+            tally.logical_bytes += ops.iter().map(Op::logical_bytes).sum::<u64>();
+            timed(&mut tally.lat, || engine.write(ops, false));
+        }
+    });
+}
+
 /// Whole-collection reads, as SoliDB's full scans and aggregations do them:
 /// `docs` documents of ~430 B in one collection (keys `doc:<n>`, under the
 /// 8-byte prefix), loaded in random key order unless `--order seq`, then
@@ -1719,38 +1868,7 @@ fn scan_document(n: u64, rng: &mut StdRng) -> Vec<u8> {
 /// The data directory is kept, marked as loaded, and reused by the next run
 /// with the same `--docs`: every binary then reads the same tables.
 fn scan(p: Params) {
-    std::fs::create_dir_all(&p.dir).unwrap();
-    let marker = p.dir.join(format!("scan-loaded-{}", p.docs));
-    let loaded = marker.exists();
-    let engine: Arc<dyn Engine> = Arc::from(open_engine(&p));
-    *STATS_SOURCE.lock().unwrap() = Some(engine.clone());
-    if !loaded {
-        engine.create_collection(SCAN_COLL);
-        let mut order: Vec<u64> = (0..p.docs).collect();
-        if p.scan_random {
-            use rand::seq::SliceRandom;
-            order.shuffle(&mut StdRng::seed_from_u64(99));
-        }
-        // Batches of 100 documents, as an import would write them.
-        let batches: Vec<&[u64]> = order.chunks(100).collect();
-        parallel_phase(&p, "scan_load", p.docs, |t, tally| {
-            let mut rng = StdRng::seed_from_u64(50_000 + t);
-            for batch in batches.iter().skip(t as usize).step_by(p.threads as usize) {
-                let ops: Vec<Op> = batch
-                    .iter()
-                    .map(|&n| Op {
-                        coll: SCAN_COLL,
-                        key: doc_key(n),
-                        value: Some(scan_document(n, &mut rng)),
-                    })
-                    .collect();
-                tally.logical_bytes += ops.iter().map(Op::logical_bytes).sum::<u64>();
-                timed(&mut tally.lat, || engine.write(ops, false));
-            }
-        });
-        settle(engine.as_ref(), &p, "scan_settle");
-        std::fs::write(&marker, b"").unwrap();
-    }
+    let engine = scan_collection(&p);
 
     // Cuts for the parallel scan where the engine does not choose its own:
     // the documents are numbered 0..docs, so equal counts are equal sizes.
@@ -1846,6 +1964,301 @@ fn scan(p: Params) {
     read_phase("get_1t", 1, 1);
     read_phase(&format!("get_{}t", p.threads), p.threads, 1);
     read_phase(&format!("multi_get_10_{}t", p.threads), p.threads, 10);
+}
+
+// ---------------------------------------------------------------- point reads
+
+/// The CPU's user-space instruction and cycle counters for the calling
+/// thread (Linux, with perf_event_paranoid at 2 or below; `None` elsewhere).
+#[cfg(target_os = "linux")]
+mod cpu {
+    /// `perf_event_attr` up to `config2` (PERF_ATTR_SIZE_VER1).
+    #[repr(C)]
+    #[derive(Default)]
+    struct Attr {
+        kind: u32,
+        size: u32,
+        config: u64,
+        sample_period: u64,
+        sample_type: u64,
+        read_format: u64,
+        flags: u64,
+        wakeup_events: u32,
+        bp_type: u32,
+        config1: u64,
+        config2: u64,
+    }
+
+    const DISABLED: u64 = 1;
+    const EXCLUDE_KERNEL: u64 = 1 << 5;
+    const EXCLUDE_HV: u64 = 1 << 6;
+    const IOC_ENABLE: u64 = 0x2400;
+    const IOC_DISABLE: u64 = 0x2401;
+    const HW_CPU_CYCLES: u64 = 0;
+    const HW_INSTRUCTIONS: u64 = 1;
+
+    pub struct Counters([i32; 2]);
+
+    fn open(config: u64) -> Option<i32> {
+        let attr = Attr {
+            size: std::mem::size_of::<Attr>() as u32,
+            config,
+            flags: DISABLED | EXCLUDE_KERNEL | EXCLUDE_HV,
+            ..Attr::default()
+        };
+        // SAFETY: a valid attribute struct of the size it declares; this
+        // thread (pid 0) on any CPU, no group, no flags.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_perf_event_open,
+                &attr as *const Attr,
+                0,
+                -1,
+                -1,
+                0,
+            )
+        };
+        (fd >= 0).then_some(fd as i32)
+    }
+
+    /// Start counting this thread's instructions and cycles.
+    pub fn start() -> Option<Counters> {
+        let instructions = open(HW_INSTRUCTIONS)?;
+        let Some(cycles) = open(HW_CPU_CYCLES) else {
+            // SAFETY: a descriptor this function opened.
+            unsafe { libc::close(instructions) };
+            return None;
+        };
+        for fd in [instructions, cycles] {
+            // SAFETY: a perf event descriptor; ENABLE takes no argument.
+            unsafe { libc::ioctl(fd, IOC_ENABLE as _, 0) };
+        }
+        Some(Counters([instructions, cycles]))
+    }
+
+    impl Counters {
+        /// Instructions and cycles since `start`.
+        pub fn stop(self) -> [u64; 2] {
+            let mut out = [0u64; 2];
+            for (fd, value) in self.0.iter().zip(&mut out) {
+                // SAFETY: descriptors `start` opened, read into a u64 as a
+                // counter without read_format reads.
+                unsafe {
+                    libc::ioctl(*fd, IOC_DISABLE as _, 0);
+                    libc::read(*fd, (value as *mut u64).cast(), 8);
+                    libc::close(*fd);
+                }
+            }
+            out
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod cpu {
+    pub struct Counters;
+
+    pub fn start() -> Option<Counters> {
+        None
+    }
+
+    impl Counters {
+        pub fn stop(self) -> [u64; 2] {
+            [0, 0]
+        }
+    }
+}
+
+/// How a point phase reads.
+#[derive(Clone, Copy, PartialEq)]
+enum Read {
+    Get,
+    Multi,
+    MultiRef,
+}
+
+struct PointPhase {
+    name: String,
+    threads: u64,
+    batch: usize,
+    read: Read,
+    seq: bool,
+}
+
+impl PointPhase {
+    fn new(name: impl Into<String>, threads: u64, batch: usize, read: Read, seq: bool) -> Self {
+        PointPhase {
+            name: name.into(),
+            threads,
+            batch,
+            read,
+            seq,
+        }
+    }
+}
+
+/// `calls` random reads of `batch` documents of `0..docs` per thread, on
+/// `threads` threads, keys built beforehand (a pool of up to 64k per
+/// thread, read in turn) and handles taken once per thread: what is
+/// measured is the engine's call. With `seq`, each call reads `batch`
+/// consecutive documents, as an index whose entries follow the key order
+/// would ask. Per thread, wall time and the CPU's counters cover the
+/// calls alone; one call in eight is timed for the latency percentiles.
+fn point_phase(p: &Params, engine: &dyn Engine, docs: u64, phase: &PointPhase) {
+    let PointPhase {
+        ref name,
+        threads,
+        batch,
+        read,
+        seq,
+    } = *phase;
+    let name = name.as_str();
+    if p.only.as_deref().is_some_and(|only| only != name) {
+        return;
+    }
+    let calls = (p.gets / threads / batch as u64).max(1);
+    let before = counters();
+    let results: Vec<(Vec<u32>, u64, Option<[u64; 2]>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    let reader = engine.point_reader();
+                    let mut rng = StdRng::seed_from_u64(70_000 + t);
+                    let groups = (calls as usize).min((1 << 16) / batch).max(1);
+                    let pool: Vec<Vec<u8>> = (0..groups)
+                        .flat_map(|_| {
+                            let start = rng.gen_range(0..docs - batch as u64 + 1);
+                            let keys: Vec<u64> = if seq {
+                                (start..start + batch as u64).collect()
+                            } else {
+                                (0..batch).map(|_| rng.gen_range(0..docs)).collect()
+                            };
+                            keys.into_iter()
+                                .map(|n| prefixed(SCAN_COLL, &doc_key(n)))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                    let refs: Vec<&[u8]> = pool.iter().map(|k| k.as_slice()).collect();
+                    let mut lat = Vec::with_capacity(calls as usize / 8 + 1);
+                    let (mut found, mut bytes) = (0usize, 0usize);
+                    let counters = cpu::start();
+                    let begin = Instant::now();
+                    for call in 0..calls as usize {
+                        let at = (call % groups) * batch;
+                        let keys = &refs[at..at + batch];
+                        let t0 = (call % 8 == 0).then(Instant::now);
+                        let (f, b) = match read {
+                            Read::Get => reader.get(keys[0]).map_or((0, 0), |len| (1, len)),
+                            Read::Multi => reader.multi_get(keys),
+                            Read::MultiRef => reader.multi_get_ref(keys),
+                        };
+                        if let Some(t0) = t0 {
+                            lat.push(t0.elapsed().as_nanos().min(u32::MAX as u128) as u32);
+                        }
+                        found += f;
+                        bytes += b;
+                    }
+                    let busy = begin.elapsed().as_nanos() as u64;
+                    let counted = counters.map(cpu::Counters::stop);
+                    assert_eq!(found, calls as usize * batch, "{name}: documents missing");
+                    assert!(bytes > 0);
+                    (lat, busy, counted)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let docs_read = calls * threads * batch as u64;
+    let busy_ns: u64 = results.iter().map(|r| r.1).sum();
+    let mut lat: Vec<u32> = results.iter().flat_map(|r| r.0.iter().copied()).collect();
+    lat.sort_unstable();
+    let per_doc = |v: u64| v as f64 / docs_read as f64;
+    let cpu = results.iter().map(|r| r.2).try_fold([0u64; 2], |acc, c| {
+        c.map(|c| [acc[0] + c[0], acc[1] + c[1]])
+    });
+    let mut phase = Phase::new(p, name);
+    phase.ops = docs_read;
+    phase.lat_us = lat.iter().map(|ns| ns / 1000).collect();
+    phase.extra = format!(
+        concat!(
+            r#","threads":{},"batch":{},"seq":{},"ns_per_doc":{:.1},"call_p50_ns":{},"call_p99_ns":{},"#,
+            r#""instr_per_doc":{:.0},"cycles_per_doc":{:.0}"#
+        ),
+        threads,
+        batch,
+        seq,
+        per_doc(busy_ns),
+        percentile(&lat, 0.50),
+        percentile(&lat, 0.99),
+        cpu.map_or(0.0, |c| per_doc(c[0])),
+        cpu.map_or(0.0, |c| per_doc(c[1])),
+    );
+    phase.print(before);
+}
+
+/// Point reads, warm, as SoliDB fetches the documents of a query:
+/// `get` one key at a time, and `multi_get` of 10 and 20 keys (RocksDB's
+/// `batched_multi_get_cf`, as SoliDB calls it), on one thread (a query at
+/// concurrency 1) and on `--threads`, over the scan mode's collection (and
+/// its data directory, which both modes share). Then the same reads of
+/// documents still in the memtable, on a fresh database next to it.
+///
+/// Every phase line has `ns_per_doc` (thread time per document read),
+/// the per-call latency percentiles in ns, and, on Linux, instructions
+/// and cycles per document from the CPU's counters.
+fn point(p: Params) {
+    let engine = scan_collection(&p);
+    // Every block into the cache.
+    let before = counters();
+    let mut warm = Phase::new(&p, "point_warm");
+    timed(&mut warm.lat_us, || {
+        engine.full_scan_ref(SCAN_COLL, SCAN_FROM, SCAN_TO)
+    });
+    warm.ops = p.docs;
+    warm.print(before);
+
+    let t = p.threads;
+    let phases = [
+        PointPhase::new("get_1t", 1, 1, Read::Get, false),
+        PointPhase::new(format!("get_{t}t"), t, 1, Read::Get, false),
+        PointPhase::new("multi_get_10_1t", 1, 10, Read::Multi, false),
+        PointPhase::new("multi_get_20_1t", 1, 20, Read::Multi, false),
+        PointPhase::new("multi_get_ref_10_1t", 1, 10, Read::MultiRef, false),
+        PointPhase::new("multi_get_ref_20_1t", 1, 20, Read::MultiRef, false),
+        PointPhase::new(format!("multi_get_10_{t}t"), t, 10, Read::Multi, false),
+        PointPhase::new(format!("multi_get_20_{t}t"), t, 20, Read::Multi, false),
+        PointPhase::new("multi_get_seq_20_1t", 1, 20, Read::Multi, true),
+    ];
+    for phase in &phases {
+        point_phase(&p, engine.as_ref(), p.docs, phase);
+    }
+    *STATS_SOURCE.lock().unwrap() = None;
+    drop(engine);
+
+    // Recently written documents: 100k (about 45 MB, one memtable for
+    // both engines), not flushed.
+    let mem = Params {
+        dir: p.dir.with_extension("mem"),
+        ..p.clone()
+    };
+    let docs = p.docs.min(100_000);
+    let _ = std::fs::remove_dir_all(&mem.dir);
+    std::fs::create_dir_all(&mem.dir).unwrap();
+    {
+        let engine: Arc<dyn Engine> = Arc::from(open_engine(&mem));
+        *STATS_SOURCE.lock().unwrap() = Some(engine.clone());
+        engine.create_collection(SCAN_COLL);
+        load_documents(&mem, engine.as_ref(), "mem_load", docs, true);
+        let phases = [
+            PointPhase::new("mem_get_1t", 1, 1, Read::Get, false),
+            PointPhase::new("mem_multi_get_20_1t", 1, 20, Read::Multi, false),
+        ];
+        for phase in &phases {
+            point_phase(&mem, engine.as_ref(), docs, phase);
+        }
+        *STATS_SOURCE.lock().unwrap() = None;
+    }
+    let _ = std::fs::remove_dir_all(&mem.dir);
 }
 
 // ---------------------------------------------------------------- sustained writes
@@ -2056,6 +2469,9 @@ fn crash(p: Params) {
 ///   visible to every thread;
 /// - atomic visibility: if a document is visible, the three index entries
 ///   written in the same batch are visible too.
+///
+/// Both through `get` and through `multi_get`, which reads its whole
+/// batch from one view of the memtables and tables.
 fn visibility(p: Params) {
     let _ = std::fs::remove_dir_all(&p.dir);
     std::fs::create_dir_all(&p.dir).unwrap();
@@ -2100,6 +2516,20 @@ fn visibility(p: Params) {
                     };
                     let n = t + k * writers;
                     let coll = p.coll_of(n);
+                    if acked && r >= 2 {
+                        // Half the readers also take every acknowledged
+                        // document of this writer nearby in the same
+                        // collection (about 30) in one batched read, which
+                        // takes its own view of memtables and tables.
+                        let batch: Vec<Vec<u8>> = (done.saturating_sub(64)..done)
+                            .map(|k| t + k * writers)
+                            .filter(|&m| p.coll_of(m) == coll)
+                            .map(doc_key)
+                            .collect();
+                        let found = engine.multi_get(coll, &batch);
+                        checked.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                        missing_acked.fetch_add((batch.len() - found) as u64, Ordering::Relaxed);
+                    }
                     checked.fetch_add(1, Ordering::Relaxed);
                     match engine.get(coll, &doc_key(n)) {
                         None if acked => {
@@ -2122,6 +2552,13 @@ fn visibility(p: Params) {
                                 format!("idx:city:{city}:{n:020}").into_bytes(),
                             ];
                             if keys.iter().any(|key| engine.get(coll, key).is_none()) {
+                                torn.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // The document and its entries again, in one
+                            // batched read: it must see what the gets saw.
+                            let mut entries = keys.to_vec();
+                            entries.push(doc_key(n));
+                            if engine.multi_get(coll, &entries) != entries.len() {
                                 torn.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -2153,7 +2590,10 @@ fn main() {
         "crash-child" => crash_child(params),
         "visibility" => visibility(params),
         "scan" => scan(params),
+        "point" => point(params),
         "sustain" => sustain(params),
-        other => panic!("unknown mode {other:?}: run | crash | visibility | scan"),
+        other => {
+            panic!("unknown mode {other:?}: run | crash | visibility | scan | point | sustain")
+        }
     }
 }
