@@ -6,10 +6,13 @@ publish = false
 description = "SoliDB-shaped storage-engine benchmark: RocksDB with SoliDB's prod profile against solistore"
 
 [features]
-default = ["rocks", "solistore", "surrealkv", "scan-api"]
+default = ["rocks", "solistore", "surrealkv", "scan-api", "point-api"]
 # solistore's snapshots, borrowed iteration and split points (0.2.2). Off,
 # the scan phases build against an older solistore, to measure it.
 scan-api = []
+# solistore's borrowed multi_get_with (0.3.1). Off, the point mode builds
+# against 0.3.0, to measure it.
+point-api = []
 # The baseline. Off, the benchmark builds without a C++ compiler.
 rocks = ["dep:rust-rocksdb"]
 solistore = ["dep:solistore"]
@@ -25,6 +28,10 @@ solistore = { path = "../crates/solistore", optional = true }
 rand = "0.8"
 surrealkv = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
+# The point mode reads the CPU's instruction and cycle counters per thread.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 # As in the server: jemalloc serves Rust and RocksDB's C++ alike, so RSS
