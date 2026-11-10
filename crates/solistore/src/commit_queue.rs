@@ -31,6 +31,11 @@ pub struct Ticket<T, S> {
     turn: Mutex<TicketTurn<S>>,
     /// `turn` was set: lets a waiting writer spin without its lock.
     signalled: AtomicBool,
+    /// This writer is next in line: the lead comes to it as soon as the
+    /// current group is done, so it spins for it instead of sleeping. Set,
+    /// with a wake-up, by the leader that takes the group before it, so the
+    /// wake-up overlaps that group's fsync instead of following it.
+    next: AtomicBool,
     cv: Condvar,
 }
 
@@ -49,6 +54,7 @@ impl<T, S> Ticket<T, S> {
             item,
             turn: Mutex::new(TicketTurn::Waiting),
             signalled: AtomicBool::new(false),
+            next: AtomicBool::new(false),
             cv: Condvar::new(),
         }
     }
@@ -59,22 +65,47 @@ impl<T, S> Ticket<T, S> {
         self.cv.notify_all();
     }
 
+    /// Tell a sleeping writer it is next in line: it wakes and spins.
+    fn mark_next(&self) {
+        if self.next.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        drop(self.turn.lock());
+        self.cv.notify_all();
+    }
+
     /// Wait for a leader's decision. A member of a group that will be
     /// fsynced (`long`) waits the whole fsync, tens of microseconds: it
     /// checks briefly and sleeps, where yielding through the wait, as an
     /// unsynced group's members still do, took the CPU the leader and
     /// every other thread needed (20–25% of it at 32 durable committers).
+    ///
+    /// The writer next in line spins whatever the group: the lead comes to
+    /// it the moment the group ahead is done, and a wake-up there would sit
+    /// on every group's critical path.
     fn wait_turn(&self, long: bool) -> TicketTurn<S> {
         let decided = || self.signalled.load(Ordering::Acquire);
-        if long {
+        let mut spun_as_next = false;
+        if long && !self.next.load(Ordering::Acquire) {
             spin_briefly(decided);
         } else {
+            spun_as_next = self.next.load(Ordering::Acquire);
             spin_until(decided);
         }
         let mut turn = self.turn.lock();
         loop {
             match std::mem::replace(&mut *turn, TicketTurn::Waiting) {
-                TicketTurn::Waiting => self.cv.wait(&mut turn),
+                TicketTurn::Waiting => {
+                    if self.next.load(Ordering::Acquire) && !spun_as_next {
+                        // Became next while asleep: spin for the lead.
+                        spun_as_next = true;
+                        drop(turn);
+                        spin_until(decided);
+                        turn = self.turn.lock();
+                        continue;
+                    }
+                    self.cv.wait(&mut turn);
+                }
                 decided => return decided,
             }
         }
@@ -180,7 +211,11 @@ impl<T, S: Clone> GroupQueue<T, S> {
         }
         self.queued.fetch_sub(group.len(), Ordering::Relaxed);
         self.last_group.store(group.len(), Ordering::Relaxed);
+        let next = queue.waiting.front().cloned();
         drop(queue);
+        if let Some(next) = next {
+            next.mark_next();
+        }
         debug_assert!(Arc::ptr_eq(&group[0], &me), "the leader heads its group");
         Turn::Lead(Leadership {
             queue: self,
@@ -212,21 +247,26 @@ impl<T, S: Clone> Leadership<'_, T, S> {
         mut slot: impl FnMut(usize, &Ticket<T, S>) -> S,
     ) -> (S, Vec<Arc<Ticket<T, S>>>) {
         let mut mine = None;
-        let mut queue = self.queue.state.lock();
+        let mut slots = Vec::with_capacity(self.group.len() - 1);
         for (i, ticket) in self.group.iter().enumerate() {
             let s = slot(i, ticket);
             if i == 0 {
                 mine = Some(s);
             } else {
-                ticket.signal(TicketTurn::Followed(s));
+                slots.push(s);
             }
         }
         // Only now: should `slot` panic, the drop still hands the leader's
-        // place on and tells every member (the queue lock, a local here, is
-        // released first by the unwinding).
+        // place on and tells every member.
         self.finished = true;
+        // The lead first, to a writer that is spinning for it: the next
+        // group starts while this one's members are being woken.
+        let mut queue = self.queue.state.lock();
         self.queue.hand_over(&mut queue);
         drop(queue);
+        for (ticket, s) in self.group[1..].iter().zip(slots) {
+            ticket.signal(TicketTurn::Followed(s));
+        }
         (
             mine.expect("the leader is in its own group"),
             std::mem::take(&mut self.group),
