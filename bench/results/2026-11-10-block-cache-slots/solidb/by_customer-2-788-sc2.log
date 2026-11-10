@@ -1,0 +1,6 @@
+[solidb] building the reference for 1000000 orders
+[solidb] checking every read against the reference
+[solidb] by_customer c=1 run 1: 25293.0 ops/s p50 39us p99 55us errors 0 wrong 0
+[solidb] by_customer c=1 run 2: 25213.0 ops/s p50 39us p99 55us errors 0 wrong 0
+[solidb] by_customer c=1 run 3: 25305.0 ops/s p50 39us p99 55us errors 0 wrong 0
+[solidb] done: /home/rocky/bench/results/read-797-b-788-sc2-1110-1723/by_customer-2-788-sc2.json

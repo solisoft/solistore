@@ -18,6 +18,9 @@ fuzzing = []
 arc-swap = "1"
 bytes = "1"
 crc32c = "0.6"
+# Epoch reclamation for the block cache's lock-free hits (sst/cache.rs):
+# pure Rust.
+crossbeam-epoch = "0.9"
 # Block-format LZ4, pure Rust. Without the default `safe-*` features it uses
 # its faster unchecked paths; input is checksummed before it is decoded.
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }

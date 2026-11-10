@@ -1,0 +1,13 @@
+phase                   solistore-eventual  instr     p50
+  ns per document (thread time), instructions per document, per-call p50 in ns
+get_1t                                 628   2944     591
+get_8t                                 770   2944     772
+multi_get_10_1t                        523   2816    5180
+multi_get_20_1t                        517   2722   10310
+multi_get_ref_10_1t                    434   2596    4328
+multi_get_ref_20_1t                    436   2512    8707
+multi_get_10_8t                        677   2817    6752
+multi_get_20_8t                        669   2725   13335
+multi_get_seq_20_1t                    198   2301    3947
+mem_get_1t                             308   2667     301
+mem_multi_get_20_1t                    278   2785    5531

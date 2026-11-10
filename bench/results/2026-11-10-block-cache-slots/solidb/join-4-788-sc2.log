@@ -1,0 +1,6 @@
+[solidb] building the reference for 1000000 orders
+[solidb] checking every read against the reference
+[solidb] join c=1 run 1: 13598.0 ops/s p50 73us p99 79us errors 0 wrong 0
+[solidb] join c=1 run 2: 13588.0 ops/s p50 73us p99 79us errors 0 wrong 0
+[solidb] join c=1 run 3: 13610.0 ops/s p50 73us p99 79us errors 0 wrong 0
+[solidb] done: /home/rocky/bench/results/read-797-b-788-sc2-1110-1723/join-4-788-sc2.json

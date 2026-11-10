@@ -120,6 +120,15 @@ jobs:
           components: miri, rust-src
       - run: cargo miri setup
       - run: cargo miri test -p solistore --lib -- skiplist memtable
+      # The block cache's slots, single-threaded tests. Tree Borrows:
+      # crossbeam-epoch's own list fails Stacked Borrows. Leaks ignored: a
+      # block retired to the epoch is still queued when the process exits.
+      # The race of readers against evictions is not run here (Miri stops
+      # in parking_lot's futex call); AddressSanitizer covers it, see
+      # bench/results/2026-11-10-block-cache-slots.
+      - run: cargo miri test -p solistore --lib -- sst::cache::tests::a_
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-ignore-leaks
 
   # The fuzz targets, built and run briefly from an empty corpus: a
   # decoder change that panics on garbage fails here. Long runs are by

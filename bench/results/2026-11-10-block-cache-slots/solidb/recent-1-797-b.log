@@ -1,0 +1,6 @@
+[solidb] building the reference for 1000000 orders
+[solidb] checking every read against the reference
+[solidb] recent c=1 run 1: 14744.0 ops/s p50 67us p99 72us errors 0 wrong 0
+[solidb] recent c=1 run 2: 14698.0 ops/s p50 67us p99 73us errors 0 wrong 0
+[solidb] recent c=1 run 3: 14734.0 ops/s p50 67us p99 72us errors 0 wrong 0
+[solidb] done: /home/rocky/bench/results/read-797-b-788-sc2-1110-1723/recent-1-797-b.json

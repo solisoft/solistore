@@ -303,7 +303,11 @@ impl SuperVersion {
                 }
             }
         }
-        let mut blocks: Vec<Block> = Vec::new();
+        // The data blocks the keys are found in: lent from their tables'
+        // slots under this guard where the cache holds them, which lasts
+        // until the values have been handed to `emit`.
+        let guard = crossbeam_epoch::pin();
+        let mut blocks: Vec<Held<'_>> = Vec::new();
         if missing > 0 {
             for p in probes.iter_mut().filter(|p| p.found.is_none()) {
                 p.hash = bloom::hash(p.lookup.id());
@@ -320,8 +324,15 @@ impl SuperVersion {
                         break;
                     }
                     if !run.is_empty() {
-                        missing -=
-                            Self::read_run(run, &order, &mut probes, &mut blocks, &mut todo, key)?;
+                        missing -= Self::read_run(
+                            run,
+                            &order,
+                            &mut probes,
+                            &mut blocks,
+                            &mut todo,
+                            key,
+                            &guard,
+                        )?;
                     }
                 }
                 Ok(())
@@ -340,7 +351,10 @@ impl SuperVersion {
                     kind: Kind::Put,
                     block,
                     value,
-                }) => (seq, ValueRef::Block(&blocks[block], value.0, value.1)),
+                }) => (
+                    seq,
+                    ValueRef::Block(blocks[block].block(), value.0, value.1),
+                ),
                 _ => {
                     emit(i, None);
                     continue;
@@ -360,13 +374,14 @@ impl SuperVersion {
     /// each block searched. A single get waits for one cache miss after
     /// another; here those of different keys are in flight together.
     /// Returns how many keys it found.
-    fn read_run<'r>(
+    fn read_run<'r, 'g>(
         run: &'r [Arc<TableFile>],
         order: &[u32],
         probes: &mut [Probe<'_, '_>],
-        blocks: &mut Vec<Block>,
+        blocks: &mut Vec<Held<'g>>,
         todo: &mut Vec<Todo<'r>>,
         key: &mut Vec<u8>,
+        guard: &'g crossbeam_epoch::Guard,
     ) -> Result<usize> {
         todo.clear();
         let (mut at, mut reader) = (0, None);
@@ -417,7 +432,7 @@ impl SuperVersion {
                     slot
                 }
                 _ => {
-                    blocks.push(t.reader.data_block_at(place.handle, true)?);
+                    blocks.push(Held::take(t.reader, &place, guard)?);
                     let slot = (blocks.len() - 1) as u32;
                     last = Some((table, place.handle.offset, slot));
                     slot
@@ -431,14 +446,14 @@ impl SuperVersion {
             };
             let p = &mut probes[t.probe as usize];
             let mut block = t.block as usize;
-            let mut located = t.reader.version_in(&blocks[block], &p.lookup, key)?;
+            let mut located = t.reader.version_in(blocks[block].block(), &p.lookup, key)?;
             if located.is_none() {
                 // Past every entry of its block: the next one's first
                 // entry decides.
                 if let Some(next) = t.reader.next_block(p.lookup.internal(), place.number)? {
-                    blocks.push(t.reader.data_block_at(next.handle, true)?);
+                    blocks.push(Held::take(t.reader, &next, guard)?);
                     block = blocks.len() - 1;
-                    located = t.reader.version_in(&blocks[block], &p.lookup, key)?;
+                    located = t.reader.version_in(blocks[block].block(), &p.lookup, key)?;
                 }
             }
             if let Some(Some(hit)) = located {
@@ -560,6 +575,31 @@ fn file_for<'a>(level: &'a [Arc<TableFile>], id: &[u8]) -> Option<&'a Arc<TableF
     level
         .get(at)
         .filter(|f| key::cf_and_user_key(&f.props.smallest) <= id)
+}
+
+/// A data block a batched read holds: lent from its table's slot for the
+/// length of the read's guard, or a handle of its own when the cache had
+/// to be asked (or filled).
+enum Held<'g> {
+    Lent(&'g Block),
+    Owned(Block),
+}
+
+impl<'g> Held<'g> {
+    fn take(reader: &TableReader, at: &BlockAt, guard: &'g crossbeam_epoch::Guard) -> Result<Self> {
+        match reader.lent_block(at, guard) {
+            Some(block) => Ok(Held::Lent(block)),
+            None => reader.data_block_for(at, true).map(Held::Owned),
+        }
+    }
+
+    #[inline]
+    fn block(&self) -> &Block {
+        match self {
+            Held::Lent(block) => block,
+            Held::Owned(block) => block,
+        }
+    }
 }
 
 /// A value a batched read found, borrowed from where it lies.

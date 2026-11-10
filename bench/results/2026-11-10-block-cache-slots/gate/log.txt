@@ -1,0 +1,67 @@
+    Finished `release` profile [optimized] target(s) in 3.48s
+== gate eventual
+crash: 20 runs, acked 1627916, lost 0, torn 0, max reopen 0.055s
+visibility: written 3579326, checked 74389082, missing_acked 0, torn 0
+PASS
+== gate full
+crash: 20 runs, acked 1627470, lost 0, torn 0, max reopen 0.092s
+visibility: written 2299109, checked 107297465, missing_acked 0, torn 0
+PASS
+== gate eventual, 2 MiB memtables
+crash: 20 runs, acked 2999998, lost 0, torn 0, max reopen 0.002s
+visibility: written 1065828, checked 105287118, missing_acked 0, torn 0
+PASS
+== quick base 1
+phase             solistore-eventual   p99           solistore   p99
+load                          799062    32              212880    56
+sync_commit_1t                 35282    27               54375    26
+sync_commit_8t                242317    45              250764    43
+get_uniform                  5001370     4             5041863     4
+get_hot                      9276036     1             9447595     1
+get_missing                 24015494     0            23999350     0
+scan_asc_100                   95802    99               97919    97
+scan_desc_100                  86049   120               86983   119
+update                        777147    67              190148    63
+mixed                         414432   165              282292   162
+hwm MB  solistore-eventual=906  solistore=893
+== quick blockcache 1
+phase             solistore-eventual   p99           solistore   p99
+load                          810457    29              224056    56
+sync_commit_1t                 41316    27               55608    26
+sync_commit_8t                270156    40              270638    40
+get_uniform                  5232720     4             5252405     4
+get_hot                      9553887     1             9703852     1
+get_missing                 18017144     0            23706174     0
+scan_asc_100                  101920    93              102030    92
+scan_desc_100                  90850   114               90786   113
+update                        774884    65              190764    63
+mixed                         420905   160              282509   160
+hwm MB  solistore-eventual=926  solistore=901
+== quick base 2
+phase             solistore-eventual   p99           solistore   p99
+load                          818631    29              201189    78
+sync_commit_1t                 34895    28               52999    27
+sync_commit_8t                236306    49              247485    42
+get_uniform                  5104120     4             5035836     4
+get_hot                      9454885     1             9390162     1
+get_missing                 23849416     0            23944325     0
+scan_asc_100                   96926    98               97957    97
+scan_desc_100                  86157   118               87615   118
+update                        771232    67              186336    64
+mixed                         414928   164              277118   164
+hwm MB  solistore-eventual=926  solistore=911
+== quick blockcache 2
+phase             solistore-eventual   p99           solistore   p99
+load                          810895    29              201394    57
+sync_commit_1t                 34422    28               53198    27
+sync_commit_8t                181090    53              247078    42
+get_uniform                  5272261     4             5205248     4
+get_hot                      9675708     1             9435485     1
+get_missing                 23466694     0            23512831     0
+scan_asc_100                   99702    94              101128    93
+scan_desc_100                  89730   116               90804   117
+update                        761314    66              184337    65
+mixed                         420621   160              280955   160
+hwm MB  solistore-eventual=943  solistore=898
+done /home/rocky/bench/results/solistore-gate-1110-1849
+ 18:57:44 up 47 days,  3:19, 10 users,  load average: 2.10, 2.28, 1.75

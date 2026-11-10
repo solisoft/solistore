@@ -24,13 +24,14 @@ use bytes::Bytes;
 
 use super::block::{Block, BlockBuilder, BlockIter, Fences, RESTART_INTERVAL};
 use super::bloom;
-use super::cache::BlockCache;
+use super::cache::{BlockCache, Slots};
 use crate::coding::{get_varint, put_varint};
 use crate::error::{Error, Result};
 use crate::fs::{RandomAccessFile, WritableFile};
 use crate::iter::InternalIterator;
 use crate::key::{self, Kind};
 use crate::memtable::Version;
+use crossbeam_epoch::Guard;
 
 pub const BLOCK_SIZE: usize = 4096;
 /// Index entries stored whole every this many; those between share their
@@ -320,6 +321,10 @@ pub struct TableReader {
     pinned: usize,
     /// The shared block cache and this table's number in it.
     cache: Option<(Arc<BlockCache>, u64)>,
+    /// One slot per data block, for point reads: a cached block is read
+    /// from its slot without touching the cache (see [`Slots`]). Only with
+    /// fences, which give a block's number.
+    slots: Option<Arc<Slots>>,
 }
 
 fn read_block(file: &dyn RandomAccessFile, handle: Handle) -> Result<Bytes> {
@@ -400,6 +405,7 @@ impl TableReader {
         let pinned = index.size() + filter.len() + fences.as_ref().map_or(0, Fences::size);
         Ok(TableReader {
             cache: None,
+            slots: None,
             file,
             index,
             fences,
@@ -411,6 +417,11 @@ impl TableReader {
 
     /// Serve data blocks through `cache`, where this table is `number`.
     pub fn with_cache(mut self, cache: Arc<BlockCache>, number: u64) -> Self {
+        if let Some(fences) = &self.fences {
+            let slots = Slots::new(fences.blocks());
+            self.pinned += slots.size();
+            self.slots = Some(slots);
+        }
         cache.charge(self.pinned as u64);
         self.cache = Some((cache, number));
         self
@@ -432,20 +443,48 @@ impl TableReader {
     /// A data block if the cache holds it; nothing is read.
     fn cached_block(&self, handle: Handle) -> Option<Block> {
         let (cache, number) = self.cache.as_ref()?;
-        cache.get(*number, handle.offset)
+        cache.get(*number, handle.offset, None)
+    }
+
+    /// The data block at `at` if the cache holds it and its number is
+    /// known, lent for as long as `guard`: one load, nothing written that
+    /// another thread reads.
+    #[inline]
+    pub(crate) fn lent_block<'g>(&self, at: &BlockAt, guard: &'g Guard) -> Option<&'g Block> {
+        self.slots.as_ref()?.lent(at.number?, guard)
+    }
+
+    /// [`Self::data_block_at`] for a point read, which knows the block's
+    /// number: a block it takes from the cache or puts there is also put in
+    /// its slot, for [`Self::lent_block`] to find next time.
+    pub(crate) fn data_block_for(&self, at: &BlockAt, fill: bool) -> Result<Block> {
+        let home = match (&self.slots, at.number) {
+            (Some(slots), Some(number)) => Some((slots, number)),
+            _ => None,
+        };
+        self.data_block_homed(at.handle, fill, home)
     }
 
     /// A data block, from the cache when it is there. `fill` says whether
     /// to keep a block read from disk: compactions read everything once
     /// and would only push out what readers need.
     pub(crate) fn data_block_at(&self, handle: Handle, fill: bool) -> Result<Block> {
+        self.data_block_homed(handle, fill, None)
+    }
+
+    fn data_block_homed(
+        &self,
+        handle: Handle,
+        fill: bool,
+        home: Option<(&Arc<Slots>, usize)>,
+    ) -> Result<Block> {
         if let Some((cache, number)) = &self.cache {
-            if let Some(block) = cache.get(*number, handle.offset) {
+            if let Some(block) = cache.get(*number, handle.offset, home) {
                 return Ok(block);
             }
             let block = Block::new(read_block(self.file.as_ref(), handle)?)?;
             if fill {
-                cache.insert(*number, handle.offset, block.clone());
+                cache.insert(*number, handle.offset, block.clone(), home);
             }
             return Ok(block);
         }
@@ -516,10 +555,20 @@ impl TableReader {
             let Some(at) = self.block_for(lookup.internal(), key)? else {
                 return Ok(None);
             };
-            let block = self.data_block_at(at.handle, true)?;
-            match self.version_in(&block, lookup, key)? {
-                Some(found) => Ok(found.map(|found| found.version(&block))),
-                None => self.get_after_block(lookup, at.number, key),
+            // From the block's slot when the cache holds it; the value is
+            // copied (or its bytes shared) before the guard goes.
+            let guard = crossbeam_epoch::pin();
+            let owned;
+            let block = match self.lent_block(&at, &guard) {
+                Some(block) => block,
+                None => {
+                    owned = self.data_block_for(&at, true)?;
+                    &owned
+                }
+            };
+            match self.version_in(block, lookup, key)? {
+                Some(found) => Ok(found.map(|found| found.version(block))),
+                None => self.get_after_block(lookup, at.number, key, &guard),
             }
         })
     }
@@ -560,10 +609,15 @@ impl TableReader {
         match self.index.seek_entry_in(target, key, range)? {
             Some(entry) => {
                 let (start, end) = entry.value;
-                Ok(Some(BlockAt {
-                    handle: Handle::decode(&self.index.bytes()[start..end])?,
-                    number: None,
-                }))
+                let handle = Handle::decode(&self.index.bytes()[start..end])?;
+                // The fences tied (tables of many collections do, on a
+                // collection's word) and the index decided: the block's
+                // number, which its cache slot goes by, from its offset.
+                let number = self
+                    .fences
+                    .as_ref()
+                    .and_then(|fences| fences.number_of(handle.offset));
+                Ok(Some(BlockAt { handle, number }))
             }
             None => Ok(None),
         }
@@ -603,17 +657,25 @@ impl TableReader {
         lookup: &key::LookupKey<'_>,
         number: Option<usize>,
         key: &mut Vec<u8>,
+        guard: &Guard,
     ) -> Result<Option<Version>> {
         let Some(at) = self.next_block(lookup.internal(), number)? else {
             return Ok(None);
         };
-        let block = self.data_block_at(at.handle, true)?;
+        let owned;
+        let block = match self.lent_block(&at, guard) {
+            Some(block) => block,
+            None => {
+                owned = self.data_block_for(&at, true)?;
+                &owned
+            }
+        };
         // Every entry of the next block is after the target: the search
         // lands on its first.
         Ok(self
-            .version_in(&block, lookup, key)?
+            .version_in(block, lookup, key)?
             .flatten()
-            .map(|found| found.version(&block)))
+            .map(|found| found.version(block)))
     }
 
     /// The data block after block `number`, or, its number unknown, after

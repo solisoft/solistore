@@ -619,6 +619,15 @@ impl Fences {
         self.words.len()
     }
 
+    /// The number of the data block that starts at `offset`. For a block
+    /// the index gave, where the fences tied: its slot in the block cache
+    /// goes by this number.
+    #[inline]
+    pub fn number_of(&self, offset: u64) -> Option<usize> {
+        let offset = u32::try_from(offset).ok()?;
+        self.offsets[..self.words.len()].binary_search(&offset).ok()
+    }
+
     /// Where data block `i` lies: its offset and length, trailer excluded
     /// (`trailer` bytes).
     pub fn handle(&self, i: usize, trailer: u64) -> (u64, u64) {

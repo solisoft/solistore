@@ -1,0 +1,7 @@
+[solidb] building the reference for 1000000 orders
+[solidb] loading 100000 customers
+[solidb] loading orders 0..100000 from 1 connection
+[solidb]   {"docs":100000,"loaders":1,"secs":0.526484398,"docs_per_sec":189939.0}
+[solidb] loading orders 100000..1000000 from 8 connections
+[solidb]   {"docs":900000,"loaders":8,"secs":1.904355014,"docs_per_sec":472601.0}
+[solidb] done: /home/rocky/bench/results/read-797-b-788-sc2-1110-1723/load-3-797-b.json
