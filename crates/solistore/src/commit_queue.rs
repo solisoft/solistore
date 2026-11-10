@@ -14,16 +14,71 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::Ordering;
 
-use crate::sync::{spin_until, Arc, AtomicBool, AtomicU64, AtomicUsize, Condvar, Mutex};
+use crate::sync::{
+    spin_briefly, spin_until, Arc, AtomicBool, AtomicU64, AtomicUsize, Condvar, Mutex,
+};
 
-/// One writer's place in the queue: its item, and the slot its group's
-/// leader fills in for it.
+/// One writer's place in the queue: its item, and what a leader decides
+/// for it — the slot its group's leader fills in, or the lead itself.
+///
+/// Each ticket is woken alone, by the leader that decides for it. A single
+/// condition variable for the whole queue woke every waiter on every
+/// commit; at 32 durable committers that herd cost more than the spinning
+/// it replaced, and stalled a run.
 pub struct Ticket<T, S> {
     pub item: T,
-    /// Set by the leader under the queue lock.
-    slot: Mutex<Option<S>>,
-    /// `slot` is set: lets a waiting writer spin without the queue lock.
-    ready: AtomicBool,
+    /// Set by a leader, under the queue lock.
+    turn: Mutex<TicketTurn<S>>,
+    /// `turn` was set: lets a waiting writer spin without its lock.
+    signalled: AtomicBool,
+    cv: Condvar,
+}
+
+enum TicketTurn<S> {
+    Waiting,
+    /// A leader took the item into its group and says this.
+    Followed(S),
+    /// The previous leader handed this writer the lead: its place was never
+    /// freed, so nobody else can take it meanwhile.
+    Lead,
+}
+
+impl<T, S> Ticket<T, S> {
+    fn new(item: T) -> Self {
+        Ticket {
+            item,
+            turn: Mutex::new(TicketTurn::Waiting),
+            signalled: AtomicBool::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn signal(&self, turn: TicketTurn<S>) {
+        *self.turn.lock() = turn;
+        self.signalled.store(true, Ordering::Release);
+        self.cv.notify_all();
+    }
+
+    /// Wait for a leader's decision. A member of a group that will be
+    /// fsynced (`long`) waits the whole fsync, tens of microseconds: it
+    /// checks briefly and sleeps, where yielding through the wait, as an
+    /// unsynced group's members still do, took the CPU the leader and
+    /// every other thread needed (20–25% of it at 32 durable committers).
+    fn wait_turn(&self, long: bool) -> TicketTurn<S> {
+        let decided = || self.signalled.load(Ordering::Acquire);
+        if long {
+            spin_briefly(decided);
+        } else {
+            spin_until(decided);
+        }
+        let mut turn = self.turn.lock();
+        loop {
+            match std::mem::replace(&mut *turn, TicketTurn::Waiting) {
+                TicketTurn::Waiting => self.cv.wait(&mut turn),
+                decided => return decided,
+            }
+        }
+    }
 }
 
 struct QueueState<T, S> {
@@ -33,10 +88,8 @@ struct QueueState<T, S> {
 
 pub struct GroupQueue<T, S> {
     state: Mutex<QueueState<T, S>>,
-    cv: Condvar,
-    /// Mirrors of the queue's state, readable while spinning.
+    /// Mirror of the queue's length, readable while spinning.
     queued: AtomicUsize,
-    leader_busy: AtomicBool,
     /// Members of the last group, to gather as many for the next one.
     last_group: AtomicUsize,
 }
@@ -69,9 +122,7 @@ impl<T, S> Default for GroupQueue<T, S> {
                 waiting: VecDeque::new(),
                 leader_active: false,
             }),
-            cv: Condvar::new(),
             queued: AtomicUsize::new(0),
-            leader_busy: AtomicBool::new(false),
             last_group: AtomicUsize::new(1),
         }
     }
@@ -94,39 +145,23 @@ impl<T, S: Clone> GroupQueue<T, S> {
         size: impl Fn(&T) -> usize,
         abandoned: &'a dyn Fn() -> S,
     ) -> Turn<'a, T, S> {
-        let me = Arc::new(Ticket {
-            item,
-            slot: Mutex::new(None),
-            ready: AtomicBool::new(false),
-        });
+        let me = Arc::new(Ticket::new(item));
         let mut queue = self.state.lock();
         queue.waiting.push_back(me.clone());
         self.queued.fetch_add(1, Ordering::Relaxed);
-        let mut spun = false;
-        loop {
-            if me.ready.load(Ordering::Acquire) {
-                let slot = me.slot.lock().take().expect("ready means set");
-                return Turn::Followed(slot, me);
+        let at_head = queue.waiting.len() == 1;
+        if at_head && !queue.leader_active {
+            queue.leader_active = true;
+        } else {
+            drop(queue);
+            match me.wait_turn(gather) {
+                TicketTurn::Followed(slot) => return Turn::Followed(slot, me),
+                // Handed the lead: `leader_active` stayed set, and this
+                // ticket is at the head.
+                TicketTurn::Lead => queue = self.state.lock(),
+                TicketTurn::Waiting => unreachable!("a decided turn"),
             }
-            let at_head = queue.waiting.front().is_some_and(|p| Arc::ptr_eq(p, &me));
-            if at_head && !queue.leader_active {
-                break;
-            }
-            if !spun {
-                // Most waits end within microseconds: spin before sleeping.
-                spun = true;
-                drop(queue);
-                spin_until(|| {
-                    me.ready.load(Ordering::Acquire) || !self.leader_busy.load(Ordering::Acquire)
-                });
-                queue = self.state.lock();
-                continue;
-            }
-            spun = false;
-            self.cv.wait(&mut queue);
         }
-        queue.leader_active = true;
-        self.leader_busy.store(true, Ordering::Release);
         let want = self.last_group.load(Ordering::Relaxed);
         if gather && queue.waiting.len() < want {
             drop(queue);
@@ -156,6 +191,18 @@ impl<T, S: Clone> GroupQueue<T, S> {
     }
 }
 
+impl<T, S> GroupQueue<T, S> {
+    /// A leader is done: the writer at the head leads next, woken alone,
+    /// the leader's place passed to it without ever being free. With
+    /// nobody waiting, the place is freed for the next writer to arrive.
+    fn hand_over(&self, queue: &mut QueueState<T, S>) {
+        match queue.waiting.front() {
+            Some(next) => next.signal(TicketTurn::Lead),
+            None => queue.leader_active = false,
+        }
+    }
+}
+
 impl<T, S: Clone> Leadership<'_, T, S> {
     /// Give each member `slot(index, ticket)`, free the leader's place for
     /// the next group, and return the leader's own slot with the group,
@@ -171,18 +218,15 @@ impl<T, S: Clone> Leadership<'_, T, S> {
             if i == 0 {
                 mine = Some(s);
             } else {
-                *ticket.slot.lock() = Some(s);
-                ticket.ready.store(true, Ordering::Release);
+                ticket.signal(TicketTurn::Followed(s));
             }
         }
-        // Only now: should `slot` panic, the drop still frees the leader's
-        // place and tells every member (the queue lock, a local here, is
+        // Only now: should `slot` panic, the drop still hands the leader's
+        // place on and tells every member (the queue lock, a local here, is
         // released first by the unwinding).
         self.finished = true;
-        queue.leader_active = false;
-        self.queue.leader_busy.store(false, Ordering::Release);
+        self.queue.hand_over(&mut queue);
         drop(queue);
-        self.queue.cv.notify_all();
         (
             mine.expect("the leader is in its own group"),
             std::mem::take(&mut self.group),
@@ -198,13 +242,10 @@ impl<T, S: Clone> Drop for Leadership<'_, T, S> {
         let slot = (self.abandoned)();
         let mut queue = self.queue.state.lock();
         for ticket in &self.group[1..] {
-            *ticket.slot.lock() = Some(slot.clone());
-            ticket.ready.store(true, Ordering::Release);
+            ticket.signal(TicketTurn::Followed(slot.clone()));
         }
-        queue.leader_active = false;
-        self.queue.leader_busy.store(false, Ordering::Release);
+        self.queue.hand_over(&mut queue);
         drop(queue);
-        self.queue.cv.notify_all();
     }
 }
 

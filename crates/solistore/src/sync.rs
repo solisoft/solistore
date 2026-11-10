@@ -124,3 +124,24 @@ pub fn spin_until(done: impl Fn() -> bool) -> bool {
     let _ = SPIN;
     done()
 }
+
+/// Check `done` for a few hundred nanoseconds without yielding, for a wait
+/// that will either end at once or last long enough to be slept through:
+/// waiting for a group that is being fsynced. Yielding through that wait,
+/// as [`spin_until`] does, held 20–25% of the CPU at 32 durable committers
+/// on 8 hardware threads, taken from the leader and every other thread.
+#[cfg(not(loom))]
+pub fn spin_briefly(done: impl Fn() -> bool) -> bool {
+    for _ in 0..64 {
+        if done() {
+            return true;
+        }
+        std::hint::spin_loop();
+    }
+    done()
+}
+
+#[cfg(loom)]
+pub fn spin_briefly(done: impl Fn() -> bool) -> bool {
+    done()
+}
