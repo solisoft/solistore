@@ -207,6 +207,32 @@ by key. The release is 0.3.1: nothing changes signature.
   | `multi_get_with` of 20, 1 thread | 1,084 (`multi_get`) | 493 | 1,466 |
   | `multi_get` of 20, 8 threads | 1,186 | 722 | 1,728 |
 
+Then (2026-11-11), for SoliDB's durable transactions (its cards #788, #797
+and #804). The release is 0.4.0: `Options` gained a field.
+
+- A cached block is read from a slot of its table, without the cache:
+  a point read whose block is cached takes no lock and writes nothing
+  another thread reads (`bench/results/2026-11-10-block-cache-slots`).
+- `Options::wal_allocate_ahead` (4 MiB, 0 for none): on Linux a WAL file
+  is `fallocate`d ahead of its writes. An fdatasync after an append that
+  grew the file took 32 µs on XFS over NVMe, 14.5 µs into blocks the file
+  already owned; a recycled WAL already has them, a new one did not. The
+  log's reader takes a tail of zeros of any length as the end of the log.
+- The leader of an fsynced group of three writers or more, and of at most
+  64 KiB, gives its place to the next group, inserts every member's batch
+  and publishes before it wakes them: each is woken once, to find its
+  write visible. With 32 durable committers on 8 CPUs, waiting for the
+  group's publication was 9% of the CPU.
+- `WriteBatch::append(other)`: two batches as one, written atomically with
+  one WAL record and one fsync. SoliDB's group committer gathers the
+  transaction commits of its connections with it instead of leaving each
+  connection's thread asleep through its group's fsync.
+- SoliDB's bank benchmark, 32 clients, every commit fsynced, in
+  containers: 77,700 -> 108,600 transfers a second in one request over
+  the day (PostgreSQL's function: 113,900), 51,800 -> 71,700 over five
+  round trips (PostgreSQL: 67,400), of which the group insert is 80,800
+  -> 86,400 and 53,400 -> 58,200.
+
 - `storage/kv/solistore.rs`: `Kv` over `solistore::Db`, behind a cargo
   feature `engine-solistore` (git dependency on
   github.com/solisoft/solistore, crates.io once published).

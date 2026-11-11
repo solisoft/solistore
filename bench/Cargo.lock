@@ -1077,7 +1077,7 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "solistore"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "bytes",
