@@ -1135,14 +1135,36 @@ fn a_wal_allocated_ahead_is_replayed_after_a_kill() {
                 .unwrap();
             written += 1;
         }
-        // The store as a kill would leave it now.
-        let image = tempfile::tempdir().unwrap();
-        for entry in std::fs::read_dir(dir.path()).unwrap() {
-            let entry = entry.unwrap();
-            if entry.file_name() != "LOCK" {
-                std::fs::copy(entry.path(), image.path().join(entry.file_name())).unwrap();
+        // The store as a kill would leave it now. Flushes and compactions
+        // add and remove files behind the writes: a copy taken file by file
+        // meanwhile is no state the store was ever in, so wait until the
+        // directory has stopped changing, and start over if it moves.
+        let listing = || {
+            let mut files: Vec<(std::ffi::OsString, u64)> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    Some((entry.file_name(), entry.metadata().ok()?.len()))
+                })
+                .filter(|(name, _)| name != "LOCK")
+                .collect();
+            files.sort();
+            files
+        };
+        let image = loop {
+            let before = listing();
+            std::thread::sleep(Duration::from_millis(100));
+            if listing() != before {
+                continue;
             }
-        }
+            let image = tempfile::tempdir().unwrap();
+            let copied = before.iter().all(|(name, _)| {
+                std::fs::copy(dir.path().join(name), image.path().join(name)).is_ok()
+            });
+            if copied && listing() == before {
+                break image;
+            }
+        };
         let copy = Db::open(image.path(), opts()).unwrap();
         assert_eq!(copy.recovery_report().discarded_bytes, 0, "round {round}");
         let cf = copy.default_cf();
