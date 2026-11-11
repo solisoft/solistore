@@ -1111,3 +1111,42 @@ fn a_synced_write_after_a_process_crash_survives_power_loss() {
     );
     assert_eq!(db.iterator(&cf, IteratorMode::Start).unwrap().count(), 101);
 }
+
+/// A WAL allocated ahead of its writes is read back whole after a kill
+/// (the directory as it is while the store runs), from a new WAL and from
+/// a reused one, and its zeros are not reported as lost writes.
+#[test]
+fn a_wal_allocated_ahead_is_replayed_after_a_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = || Options {
+        durability: Durability::Full,
+        // Small memtables: the WAL rotates, and a dead one is reused.
+        write_buffer_size: 64 << 10,
+        recycle_wal_files: 2,
+        wal_allocate_ahead: 32 << 10,
+        ..Options::default()
+    };
+    let db = Db::open(dir.path(), opts()).unwrap();
+    let cf = db.default_cf();
+    let mut written = 0u64;
+    for round in 0..6 {
+        for _ in 0..400 {
+            db.put(&cf, format!("k{written:08}"), [round as u8; 200])
+                .unwrap();
+            written += 1;
+        }
+        // The store as a kill would leave it now.
+        let image = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() != "LOCK" {
+                std::fs::copy(entry.path(), image.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let copy = Db::open(image.path(), opts()).unwrap();
+        assert_eq!(copy.recovery_report().discarded_bytes, 0, "round {round}");
+        let cf = copy.default_cf();
+        let found = copy.iterator(&cf, IteratorMode::Start).unwrap().count() as u64;
+        assert_eq!(found, written, "round {round}");
+    }
+}

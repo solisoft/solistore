@@ -119,9 +119,12 @@ pub fn read_records(data: &[u8], file_no: u32) -> Records<'_> {
     // A reused file ends where its new records do: what follows is a stale
     // record of the file's previous life (another file number) or zeros.
     // That is the end of the log, not a torn write.
-    let stale = rest.len() >= HEADER_LEN
-        && (rest[..HEADER_LEN].iter().all(|&b| b == 0)
-            || u32::from_le_bytes(rest[8..12].try_into().expect("4 bytes")) != file_no);
+    // Zeros are also what a WAL allocated ahead of its writes ends in,
+    // and there may be fewer of them than a header is long.
+    let zeros = !rest.is_empty() && rest.iter().take(HEADER_LEN).all(|&b| b == 0);
+    let stale = zeros
+        || (rest.len() >= HEADER_LEN
+            && u32::from_le_bytes(rest[8..12].try_into().expect("4 bytes")) != file_no);
     Records {
         records,
         discarded: if stale { 0 } else { rest.len() },
@@ -211,6 +214,29 @@ mod tests {
 #[cfg(test)]
 mod end_tests {
     use super::*;
+
+    /// A WAL allocated ahead of its writes ends in zeros, however few:
+    /// that is its end, and nothing was lost.
+    #[test]
+    fn zeros_after_the_last_record_are_the_end_of_the_log() {
+        let mut log = Vec::new();
+        encode_record(&mut log, 7, b"one");
+        encode_record(&mut log, 7, b"two");
+        for zeros in [1, 5, HEADER_LEN - 1, HEADER_LEN, 4096] {
+            let mut data = log.clone();
+            data.resize(log.len() + zeros, 0);
+            let read = read_records(&data, 7);
+            assert_eq!(read.records, vec![&b"one"[..], &b"two"[..]], "{zeros}");
+            assert_eq!(read.discarded, 0, "{zeros}");
+        }
+        // A record cut short before the zeros is still reported.
+        let mut data = log.clone();
+        data.truncate(log.len() - 2);
+        data.resize(log.len() + 4096, 0);
+        let read = read_records(&data, 7);
+        assert_eq!(read.records, vec![&b"one"[..]]);
+        assert!(read.discarded > 0);
+    }
 
     #[test]
     fn an_end_record_closes_the_log_whatever_follows() {

@@ -134,6 +134,13 @@ pub struct Options {
     /// Dead WAL files kept to be written over instead of creating new ones
     /// (RocksDB's `recycle_log_file_num`; SoliDB's profile sets 3).
     pub recycle_wal_files: usize,
+    /// Keep the WAL's blocks allocated this many bytes at a time ahead of
+    /// what is written to it (0: grow it write by write). An fsync of a WAL
+    /// that did not grow flushes its data and no file system metadata,
+    /// which halves it on XFS; a reused WAL has that already, until it
+    /// outgrows its previous life. The WAL then ends in zeros, up to this
+    /// many bytes of them.
+    pub wal_allocate_ahead: u64,
     /// In [`Durability::Eventual`], the background syncer also fsyncs the
     /// WAL as soon as this many bytes wait for it, not only every
     /// `sync_interval`. A synced write, or a crash, then finds at most
@@ -177,6 +184,7 @@ impl Default for Options {
             // reused file keeps the largest size it ever reached, and three of
             // them came to ~300 MB on the benchmark's disk measure.
             recycle_wal_files: 1,
+            wal_allocate_ahead: 4 << 20,
             wal_bytes_per_sync: 1 << 20,
         }
     }
@@ -210,6 +218,7 @@ impl fmt::Debug for Options {
             .field("block_cache_size", &self.block_cache_size)
             .field("bytes_per_sync", &self.bytes_per_sync)
             .field("recycle_wal_files", &self.recycle_wal_files)
+            .field("wal_allocate_ahead", &self.wal_allocate_ahead)
             .field("wal_bytes_per_sync", &self.wal_bytes_per_sync)
             .finish()
     }
@@ -406,6 +415,7 @@ struct Inner {
     /// Numbers of dead WAL files kept for reuse, and how many to keep.
     recycled_wals: Mutex<Vec<u64>>,
     recycle_wal_files: usize,
+    wal_allocate_ahead: u64,
     /// The WAL being written, for the eventual-mode syncer.
     current_wal: Mutex<Arc<WalFile>>,
     /// What must be durable before the current WAL may be fsynced.
@@ -652,6 +662,7 @@ impl Db {
         // The MANIFEST's install syncs the directory, which makes the new
         // WAL's name durable too, and the deletions above.
         let wal_file = fs.create(&dir.join(wal_name(wal_no)))?;
+        wal_file.allocate_ahead(opts.wal_allocate_ahead);
         let mut header = Vec::new();
         log::encode_header(&mut header, file_no_u32(wal_no)?, last_seq);
         wal_file.append(&header)?;
@@ -742,6 +753,7 @@ impl Db {
             queue: GroupQueue::default(),
             recycled_wals: Mutex::new(recycled),
             recycle_wal_files: opts.recycle_wal_files,
+            wal_allocate_ahead: opts.wal_allocate_ahead,
             current_wal: Mutex::new(wal),
             barrier: Mutex::new(SyncBarrier::default()),
             wal_bytes_per_sync: opts.wal_bytes_per_sync,
@@ -2009,6 +2021,7 @@ impl Inner {
                 None => self.io(|| Ok(self.fs.create(&new_path)?))?,
             }
         };
+        file.allocate_ahead(self.wal_allocate_ahead);
         // Everything up to `last_seq` is in older WALs or tables.
         let mut header = Vec::new();
         log::encode_header(&mut header, file_no_u32(number)?, commit.last_seq);
