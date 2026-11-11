@@ -83,6 +83,23 @@ impl WriteBatch {
         }
     }
 
+    /// Add `other`'s operations after this batch's own: the two are then
+    /// written as one batch, atomically and with one WAL record. For a
+    /// caller that gathers the commits of several writers itself.
+    pub fn append(&mut self, other: WriteBatch) {
+        if self.count == 0 {
+            *self = other;
+            return;
+        }
+        self.ops.extend_from_slice(&other.ops);
+        self.count += other.count;
+        for cf in other.cfs {
+            if !self.cfs.iter().any(|c| c.id() == cf.id()) {
+                self.cfs.push(cf);
+            }
+        }
+    }
+
     /// Number of operations (each takes one sequence number).
     pub fn len(&self) -> u32 {
         self.count
@@ -221,6 +238,38 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Two batches appended are the batch of their operations in order,
+    /// over the column families of both.
+    #[test]
+    fn appended_batches_are_one_batch_of_both() {
+        let (c1, c2) = (
+            ColumnFamily::for_tests(1, "a"),
+            ColumnFamily::for_tests(2, "b"),
+        );
+        let mut whole = WriteBatch::new();
+        whole.put(&c1, b"k1", b"v1");
+        whole.delete(&c2, b"k2");
+        whole.put(&c1, b"k3", b"v3");
+
+        let mut first = WriteBatch::new();
+        first.put(&c1, b"k1", b"v1");
+        let mut second = WriteBatch::new();
+        second.delete(&c2, b"k2");
+        second.put(&c1, b"k3", b"v3");
+        first.append(second);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first.ops_bytes(), whole.ops_bytes());
+        assert_eq!(first.size_in_bytes(), whole.size_in_bytes());
+        assert_eq!(first.column_families().len(), 2);
+
+        // Onto an empty batch, and of an empty batch.
+        let mut empty = WriteBatch::new();
+        empty.append(first);
+        assert_eq!(empty.ops_bytes(), whole.ops_bytes());
+        empty.append(WriteBatch::new());
+        assert_eq!(empty.len(), 3);
     }
 
     #[test]
