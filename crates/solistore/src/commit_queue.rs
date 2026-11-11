@@ -143,6 +143,8 @@ pub struct Leadership<'a, T, S: Clone> {
     queue: &'a GroupQueue<T, S>,
     pub group: Vec<Arc<Ticket<T, S>>>,
     abandoned: &'a dyn Fn() -> S,
+    /// The leader's place went to the next group already ([`Self::hand_on`]).
+    handed_on: bool,
     finished: bool,
 }
 
@@ -221,6 +223,7 @@ impl<T, S: Clone> GroupQueue<T, S> {
             queue: self,
             group,
             abandoned,
+            handed_on: false,
             finished: false,
         })
     }
@@ -239,6 +242,18 @@ impl<T, S> GroupQueue<T, S> {
 }
 
 impl<T, S: Clone> Leadership<'_, T, S> {
+    /// Free the leader's place for the next group now, with this group's
+    /// members still waiting: for a leader that has more to do for them
+    /// (it inserts their batches) and wants them woken once, to find it
+    /// done, while the next group is already being written.
+    pub fn hand_on(&mut self) {
+        if !self.handed_on {
+            self.handed_on = true;
+            let mut queue = self.queue.state.lock();
+            self.queue.hand_over(&mut queue);
+        }
+    }
+
     /// Give each member `slot(index, ticket)`, free the leader's place for
     /// the next group, and return the leader's own slot with the group,
     /// whose first ticket is the leader's own.
@@ -261,9 +276,7 @@ impl<T, S: Clone> Leadership<'_, T, S> {
         self.finished = true;
         // The lead first, to a writer that is spinning for it: the next
         // group starts while this one's members are being woken.
-        let mut queue = self.queue.state.lock();
-        self.queue.hand_over(&mut queue);
-        drop(queue);
+        self.hand_on();
         for (ticket, s) in self.group[1..].iter().zip(slots) {
             ticket.signal(TicketTurn::Followed(s));
         }
@@ -284,7 +297,9 @@ impl<T, S: Clone> Drop for Leadership<'_, T, S> {
         for ticket in &self.group[1..] {
             ticket.signal(TicketTurn::Followed(slot.clone()));
         }
-        self.queue.hand_over(&mut queue);
+        if !self.handed_on {
+            self.queue.hand_over(&mut queue);
+        }
         drop(queue);
     }
 }
@@ -499,6 +514,47 @@ mod loom_tests {
                             Turn::Followed(slot, _) => slot,
                         };
                         assert_eq!(slot.0, id, "a slot meant for another writer");
+                    })
+                })
+                .collect();
+            for w in writers {
+                w.join().unwrap();
+            }
+            let mut handled = handled.lock().clone();
+            handled.sort();
+            assert_eq!(handled, vec![0, 1, 2]);
+        });
+    }
+
+    /// A leader that gives its place on before telling its members: the
+    /// next group may start meanwhile, every item is still handled once,
+    /// every member is told, and a member only wakes once its leader has
+    /// done the work it took on for it.
+    #[test]
+    fn a_leader_that_hands_on_early_still_tells_every_member() {
+        model(|| {
+            let q: Arc<GroupQueue<u32, u32>> = Arc::new(GroupQueue::default());
+            let handled = Arc::new(Mutex::new(Vec::new()));
+            let writers: Vec<_> = (0..3u32)
+                .map(|id| {
+                    let (q, handled) = (q.clone(), handled.clone());
+                    thread::spawn(move || {
+                        let abandoned = || u32::MAX;
+                        let slot = match q.enter(id, false, 2, |_| 1, &abandoned) {
+                            Turn::Lead(mut lead) => {
+                                lead.hand_on();
+                                handled.lock().extend(lead.group.iter().map(|t| t.item));
+                                lead.finish(|_, t| t.item).0
+                            }
+                            Turn::Followed(slot, _) => {
+                                assert!(
+                                    handled.lock().contains(&id),
+                                    "woken before its leader was done"
+                                );
+                                slot
+                            }
+                        };
+                        assert_eq!(slot, id, "a slot meant for another writer");
                     })
                 })
                 .collect();

@@ -508,6 +508,8 @@ enum Slot {
     /// The leader of a group it inserts alone, with each member's first
     /// sequence number.
     InsertAll(Arc<Group>, Vec<u64>),
+    /// In the WAL, in the memtable and visible: nothing left to do.
+    Done,
     Failed(Error),
 }
 
@@ -519,12 +521,28 @@ enum Slot {
 /// benchmark, and spent most of its off-CPU time waiting for publication.
 const MAX_PARALLEL_INSERT: usize = 8;
 
+/// An fsynced group of at most this many bytes is inserted by its leader
+/// before its members are woken. They slept through the fsync, so each
+/// insert done by its own writer is a wake-up, a few microseconds of work
+/// and a second wait, for the group's slowest member: on 8 cores with 32
+/// durable committers, 9% of the CPU went to writers spinning for their
+/// group's publication. The leader has given its place to the next group
+/// by then, so its inserts overlap that group's fsync; past this size they
+/// would outlast it, and the members insert in parallel as before. So do
+/// the two writers of a group of two: there the second one waited for the
+/// leader's two inserts where it did its own meanwhile (4 µs of 118 at four
+/// committers).
+const LEADER_INSERTS_SYNCED: usize = 64 << 10;
+
 /// What a leader's WAL write hands back: the group, each member's first
 /// sequence number, and whether the syncer is due (see `wal_bytes_per_sync`).
 struct Written {
     group: Arc<Group>,
     firsts: Vec<u64>,
     wake_syncer: bool,
+    /// The group was fsynced, and is small enough for its leader to insert
+    /// (see [`LEADER_INSERTS_SYNCED`]).
+    leader_inserts_first: bool,
 }
 
 /// A commit group after its WAL write: its members insert in parallel, and
@@ -1805,8 +1823,24 @@ impl Inner {
         );
         let (slot, me) = match turn {
             Turn::Followed(slot, me) => (slot, me),
-            Turn::Lead(lead) => {
+            Turn::Lead(mut lead) => {
                 let written = self.write_group(&lead.group);
+                if let Ok(w) = &written {
+                    if w.leader_inserts_first && lead.group.len() > 2 {
+                        // The next group starts; this one's members wake
+                        // to find their writes visible.
+                        lead.hand_on();
+                        for (member, &first) in lead.group.iter().zip(&w.firsts) {
+                            apply(&w.group.mem, member.item.batch.ops(), first, |_| true);
+                        }
+                        self.publisher.publish(w.group.first, w.group.last);
+                        lead.finish(|_, _| Slot::Done);
+                        if w.wake_syncer {
+                            self.wake_syncer();
+                        }
+                        return Ok(());
+                    }
+                }
                 let leader_inserts = lead.group.len() > MAX_PARALLEL_INSERT;
                 let (slot, members) = lead.finish(|i, _| match &written {
                     Ok(w) if leader_inserts => {
@@ -1841,6 +1875,7 @@ impl Inner {
         };
         match slot {
             Slot::Failed(e) => Err(e),
+            Slot::Done => Ok(()),
             Slot::Insert(group, first) => {
                 self.insert_and_publish(&me.item.batch, &group, first);
                 Ok(())
@@ -1903,6 +1938,7 @@ impl Inner {
             wal.dirty.store(true, Ordering::Release);
             wake_syncer |= self.sync_due(wal);
         }
+        let buf_len = buf.len();
         if buf.capacity() > 2 * MAX_GROUP_BYTES {
             *buf = Vec::new();
         }
@@ -1921,6 +1957,7 @@ impl Inner {
             }),
             firsts,
             wake_syncer,
+            leader_inserts_first: sync && buf_len <= LEADER_INSERTS_SYNCED,
         })
     }
 

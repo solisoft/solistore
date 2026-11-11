@@ -1150,3 +1150,50 @@ fn a_wal_allocated_ahead_is_replayed_after_a_kill() {
         assert_eq!(found, written, "round {round}");
     }
 }
+
+/// The leader of an fsynced group inserts its members' batches and wakes
+/// them afterwards: each writer still returns with its own write readable,
+/// whichever of them led.
+#[test]
+fn a_durable_writer_reads_its_write_whoever_inserted_it() {
+    let fs = FaultFs::new();
+    fs.set_sync_delay(Duration::from_micros(200));
+    let db = Db::open(
+        "/db",
+        Options {
+            fs: Arc::new(fs.clone()),
+            durability: Durability::Full,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let cf = db.default_cf();
+    let (threads, per_thread) = (16u64, 200u64);
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let (db, cf) = (&db, &cf);
+            scope.spawn(move || {
+                for i in 0..per_thread {
+                    let key = format!("{t}:{i}");
+                    let mut batch = WriteBatch::default();
+                    batch.put(cf, &key, i.to_be_bytes());
+                    batch.put(cf, format!("{key}:twin"), b"t");
+                    db.write(batch).unwrap();
+                    assert_eq!(
+                        db.get(cf, &key).unwrap().as_deref(),
+                        Some(&i.to_be_bytes()[..]),
+                        "{key} not readable by its writer"
+                    );
+                }
+            });
+        }
+    });
+    fs.crash(Torn::None);
+    drop(db);
+    let db = open(&fs);
+    let count = db
+        .iterator(&db.default_cf(), IteratorMode::Start)
+        .unwrap()
+        .count() as u64;
+    assert_eq!(count, 2 * threads * per_thread);
+}
