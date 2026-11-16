@@ -452,7 +452,7 @@ impl SkipList {
         if height > top {
             top = self.height.fetch_max(height, Relaxed).max(height);
         }
-        if hint.list != self as *const SkipList {
+        if !std::ptr::eq(hint.list, self) {
             *hint = Hint {
                 list: self as *const SkipList,
                 prev: [self.head.as_ptr(); MAX_HEIGHT],
