@@ -507,8 +507,8 @@ impl SkipList {
         }
         // For a larger key, the node just linked is the nearest known
         // predecessor at its levels, and what was found at the others.
-        for level in 0..top.max(height) {
-            hint.prev[level] = if level < height { node } else { prev[level] };
+        for (level, held) in hint.prev.iter_mut().enumerate().take(top.max(height)) {
+            *held = if level < height { node } else { prev[level] };
         }
         true
     }
