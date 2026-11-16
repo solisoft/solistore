@@ -317,6 +317,22 @@ pub struct Cursor(NonNull<Node>);
 unsafe impl Send for Cursor {}
 unsafe impl Sync for Cursor {}
 
+/// Where the last key of a run of inserts went (see
+/// [`SkipList::insert_hinted`]).
+pub struct Hint {
+    list: *const SkipList,
+    prev: [*mut Node; MAX_HEIGHT],
+}
+
+impl Default for Hint {
+    fn default() -> Self {
+        Hint {
+            list: ptr::null(),
+            prev: [ptr::null_mut(); MAX_HEIGHT],
+        }
+    }
+}
+
 /// A concurrent, insert-only skiplist of distinct internal keys, ordered by
 /// [`key::compare`].
 pub struct SkipList {
@@ -412,6 +428,87 @@ impl SkipList {
                     }
                 }
             }
+        }
+        true
+    }
+
+    /// [`SkipList::insert`] for a writer that inserts several keys in a
+    /// row, as a batch does: `hint` remembers, per level, the last node
+    /// found before the key just inserted, and the search for the next key
+    /// starts there when that node is still before it. Keys that arrive in
+    /// increasing order — a batch of generated keys, a bulk load — are
+    /// then linked after a step or two per level instead of a descent from
+    /// the head through a list of millions; a key that goes backward is
+    /// searched as [`SkipList::insert`] searches it.
+    ///
+    /// A hint is for one list: it holds nodes of the list it was last used
+    /// with.
+    pub fn insert_hinted(&self, key_parts: &[&[u8]], value: &[u8], hint: &mut Hint) -> bool {
+        let height = random_height();
+        let node = new_node(&self.arena, height, key_parts, value).0.as_ptr();
+        // SAFETY: `node` was just initialised and is not yet shared.
+        let key = unsafe { key_of(node) };
+        let mut top = self.height.load(Relaxed);
+        if height > top {
+            top = self.height.fetch_max(height, Relaxed).max(height);
+        }
+        if !std::ptr::eq(hint.list, self) {
+            *hint = Hint {
+                list: self as *const SkipList,
+                prev: [self.head.as_ptr(); MAX_HEIGHT],
+            };
+        }
+        let head = self.head.as_ptr();
+        let mut prev = [head; MAX_HEIGHT];
+        let mut next = [ptr::null_mut(); MAX_HEIGHT];
+        let mut x = head;
+        for level in (0..top).rev() {
+            // The hinted node is at this level (it was found, or linked,
+            // there) and is never removed: it can start the search if it is
+            // before `key`, and is worth it if it is past `x`.
+            let hinted = hint.prev[level];
+            if hinted != head && hinted != x {
+                // SAFETY: a published node of this list.
+                let at = unsafe { key_of(hinted) };
+                if key::compare(at, key) == Ordering::Less
+                    && (x == head || key::compare(unsafe { key_of(x) }, at) == Ordering::Less)
+                {
+                    x = hinted;
+                }
+            }
+            let (p, n) = self.find_splice(key, x, level);
+            prev[level] = p;
+            next[level] = n;
+            x = p;
+        }
+        for level in 0..height {
+            loop {
+                if level == 0 && self.equals(next[0], key) {
+                    return false;
+                }
+                // SAFETY: as in `insert`.
+                unsafe {
+                    link(node, level).store(next[level], Relaxed);
+                    match link(prev[level], level).compare_exchange(
+                        next[level],
+                        node,
+                        Release,
+                        Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(_) => {
+                            let (p, n) = self.find_splice(key, prev[level], level);
+                            prev[level] = p;
+                            next[level] = n;
+                        }
+                    }
+                }
+            }
+        }
+        // For a larger key, the node just linked is the nearest known
+        // predecessor at its levels, and what was found at the others.
+        for (level, held) in hint.prev.iter_mut().enumerate().take(top.max(height)) {
+            *held = if level < height { node } else { prev[level] };
         }
         true
     }
@@ -643,6 +740,74 @@ mod tests {
             .collect();
         assert_eq!(got, want);
         assert_eq!(key(&list, list.last().unwrap()), ik(n - 1));
+    }
+
+    /// Hinted inserts build the list plain inserts build, whatever the
+    /// order the keys arrive in: increasing runs, a run that goes backward,
+    /// keys between those of another writer, a hint that changes list.
+    #[test]
+    fn hinted_inserts_build_the_same_list() {
+        let n = scaled(6000, 400);
+        // Runs of increasing keys, each starting below the end of the last;
+        // every third key left to a plain insert that runs between them.
+        let order: Vec<u32> = (0..n)
+            .map(|i| {
+                let run = i / 97;
+                (run * 7919 % 61) * 100 + i % 97
+            })
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let (hinted, plain) = (SkipList::new(), SkipList::new());
+        let other = SkipList::new();
+        let mut hint = Hint::default();
+        for (at, &i) in order.iter().enumerate() {
+            let fresh = seen.insert(i);
+            assert_eq!(plain.insert(&[&ik(i)], b"v"), fresh);
+            let done = if at % 3 == 2 {
+                hinted.insert(&[&ik(i)], b"v")
+            } else {
+                hinted.insert_hinted(&[&ik(i)], b"v", &mut hint)
+            };
+            assert_eq!(done, fresh, "key {i}");
+            if at % 500 == 499 {
+                // The hint goes to another list and comes back.
+                assert!(other.insert_hinted(&[&ik(at as u32)], b"", &mut hint));
+            }
+        }
+        let keys = |list: &SkipList| list.iter().map(|(k, _)| k.to_vec()).collect::<Vec<_>>();
+        assert_eq!(keys(&hinted), keys(&plain));
+        assert_eq!(keys(&hinted).len(), seen.len());
+        for level in 0..hinted.levels() {
+            let at: Vec<&[u8]> = hinted.level_keys(level).collect();
+            assert!(at
+                .windows(2)
+                .all(|w| key::compare(w[0], w[1]) == Ordering::Less));
+        }
+    }
+
+    /// Writers inserting increasing runs with hints, all at once: every key
+    /// is there, in order.
+    #[test]
+    fn hinted_inserts_from_several_threads() {
+        let list = Arc::new(SkipList::new());
+        let per = scaled(4000, 200);
+        let threads: Vec<_> = (0..4u32)
+            .map(|t| {
+                let list = list.clone();
+                std::thread::spawn(move || {
+                    let mut hint = Hint::default();
+                    for i in 0..per {
+                        assert!(list.insert_hinted(&[&ik(i * 4 + t)], b"", &mut hint));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let got: Vec<Vec<u8>> = list.iter().map(|(k, _)| k.to_vec()).collect();
+        let want: Vec<Vec<u8>> = (0..per * 4).map(ik).collect();
+        assert_eq!(got, want);
     }
 
     /// Each level is an ordered subset of the one below, level 0 is every

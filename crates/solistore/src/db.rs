@@ -1547,18 +1547,50 @@ fn tidy(change: &mut VersionChange) {
     change.sv.version = Arc::new(version);
 }
 
+/// Entries from which a batch is applied in key order (see `apply`).
+const SORTED_APPLY: usize = 16;
+
 /// Apply decoded ops to a memtable, numbering them from `first_seq`.
 fn apply(mem: &Memtable, ops: Vec<BatchOp<'_>>, first_seq: u64, live: impl Fn(u32) -> bool) {
-    // Each entry is written once, straight into its skiplist node.
-    for (seq, op) in (first_seq..).zip(&ops) {
-        match *op {
-            BatchOp::Put { cf, key, value } if live(cf) => {
-                mem.insert_entry(cf, key, seq, Kind::Put, value)
+    // Each entry is written once, straight into its skiplist node. The
+    // entries of a batch of some size go in by increasing key, each
+    // searched from where the one before went (`insert_hinted`): a list of
+    // millions is then descended once per batch rather than once per
+    // entry. Sorting costs comparisons on keys that sit side by side in
+    // the batch; the descents it replaces miss the cache at every level.
+    // An entry keeps the sequence number of its place in the batch.
+    if ops.len() >= SORTED_APPLY {
+        let mut order: Vec<u32> = (0..ops.len() as u32).collect();
+        let place = |i: u32| match ops[i as usize] {
+            BatchOp::Put { cf, key, .. } | BatchOp::Delete { cf, key } => Some((cf, key)),
+            BatchOp::DeleteRange { .. } => None,
+        };
+        order.retain(|i| place(*i).is_some());
+        order.sort_unstable_by(|a, b| place(*a).cmp(&place(*b)).then(a.cmp(b)));
+        let mut hint = crate::skiplist::Hint::default();
+        for i in order {
+            let seq = first_seq + u64::from(i);
+            match ops[i as usize] {
+                BatchOp::Put { cf, key, value } if live(cf) => {
+                    mem.insert_entry_hinted(cf, key, seq, Kind::Put, value, &mut hint)
+                }
+                BatchOp::Delete { cf, key } if live(cf) => {
+                    mem.insert_entry_hinted(cf, key, seq, Kind::Delete, b"", &mut hint)
+                }
+                _ => {}
             }
-            BatchOp::Delete { cf, key } if live(cf) => {
-                mem.insert_entry(cf, key, seq, Kind::Delete, b"")
+        }
+    } else {
+        for (seq, op) in (first_seq..).zip(&ops) {
+            match *op {
+                BatchOp::Put { cf, key, value } if live(cf) => {
+                    mem.insert_entry(cf, key, seq, Kind::Put, value)
+                }
+                BatchOp::Delete { cf, key } if live(cf) => {
+                    mem.insert_entry(cf, key, seq, Kind::Delete, b"")
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
     let mut last = 0;
