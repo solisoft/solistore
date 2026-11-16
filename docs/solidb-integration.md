@@ -248,6 +248,18 @@ and #804). The release is 0.4.0: `Options` gained a field.
 - CI: the `test` job runs twice, once per engine. A failure in one is a
   failure.
 
+Then (2026-11-16), for SoliDB's bulk loads (its card #874). The release is
+0.4.1: nothing public changed.
+
+- A batch of 16 entries or more is applied to the memtable in key order,
+  each entry searched from where the one before went
+  (`SkipList::insert_hinted`): one descent of the list per batch instead
+  of one per entry. `SkipList::insert` was 22% of the processor of a load
+  of 8.64 million points into SoliDB (8 connections, batches of 5,000
+  documents, a 2 GB write buffer); that load went from 1.19 to 1.41
+  million points a second. An entry keeps the sequence number of its
+  place in the batch.
+
 ### S3 — Moving existing data
 
 **Done** (SoliDB `feat/storage-kv`, 942074d5): `solidb-migrate-engine`
