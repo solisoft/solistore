@@ -19,7 +19,7 @@ use parking_lot::RwLock;
 use crate::error::Result;
 use crate::iter::InternalIterator;
 use crate::key::{self, Kind};
-use crate::skiplist::{Cursor, SkipList};
+use crate::skiplist::{Cursor, Hint, SkipList};
 
 /// What a range tombstone counts toward the write buffer on top of its
 /// bounds. Entries count exactly what their skiplist node takes.
@@ -143,6 +143,24 @@ impl Memtable {
         self.map.insert(
             &[&cf.to_be_bytes(), key, &key::trailer_bytes(seq, kind)],
             value,
+        );
+    }
+
+    /// [`Self::insert_entry`] for the entries of one batch, which often
+    /// come in key order: see [`SkipList::insert_hinted`].
+    pub fn insert_entry_hinted(
+        &self,
+        cf: u32,
+        key: &[u8],
+        seq: u64,
+        kind: Kind,
+        value: &[u8],
+        hint: &mut Hint,
+    ) {
+        self.map.insert_hinted(
+            &[&cf.to_be_bytes(), key, &key::trailer_bytes(seq, kind)],
+            value,
+            hint,
         );
     }
 
