@@ -342,3 +342,15 @@ directories and keeps the RocksDB one as a backup. 1.47M entries took
   NTFS, 20 process kills: recovery is checked there, power loss is not.
   `start_writeback` is still nothing on Windows (an optimisation, off by
   default).
+
+Then (2026-11-17), for SoliDB's counter fields (its card #943). The release
+is 0.4.2 (0.4.1 was never published).
+
+- `Db::write_unsynced` applies a batch and returns once it is visible,
+  without an fsync, whatever the durability; it is durable once a later
+  `sync_wal`, or a later write that waits for its fsync, has returned.
+  SoliDB numbers a document under a per-collection lock: in
+  `Durability::Full` the write was fsynced under that lock and the inserts
+  waiting shared nothing (455 a second whatever the clients). It now
+  writes unsynced under the lock and syncs outside it: 3,482 a second
+  from 32 clients, against 3,552 for a collection without a counter.

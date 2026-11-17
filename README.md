@@ -107,7 +107,10 @@ solistore answers each of these with a design choice:
 | `Durability::Eventual { sync_interval }` | it reached the OS; a background thread fsyncs every interval, and as soon as `wal_bytes_per_sync` (1 MiB) waits | loses nothing | loses at most `sync_interval` of acknowledged writes, never a write without every later one |
 
 In either mode, a write with `WriteOptions { sync: true }` waits for its own
-fsync. An fsync failure poisons the database, which then refuses further
+fsync, and `Db::write_unsynced` waits for none: that write is durable once a
+later `Db::sync_wal`, or a later write that waits for its fsync, has
+returned. It is for a caller that holds a lock of its own across the write
+and would otherwise hold it across the fsync. An fsync failure poisons the database, which then refuses further
 writes rather than retrying (see "fsyncgate").
 
 ## Quick start

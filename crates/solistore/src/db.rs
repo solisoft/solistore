@@ -492,6 +492,9 @@ struct CommitState {
 struct Pending {
     batch: WriteBatch,
     sync: bool,
+    /// Written without an fsync of its own even in [`Durability::Full`]
+    /// (see [`Db::write_unsynced`]).
+    unsynced: bool,
 }
 
 /// A writer's place in the commit queue (with `loom`, its `Arc` is loom's).
@@ -1274,7 +1277,29 @@ impl Db {
         for cf in batch.column_families() {
             cf.check()?;
         }
-        self.inner().commit(batch, opts.sync)
+        self.inner().commit(batch, opts.sync, false)
+    }
+
+    /// Apply a batch atomically and return once it is visible to readers,
+    /// without waiting for an fsync, whatever the database's
+    /// [`Durability`]. The write is durable once a later [`Db::sync_wal`],
+    /// or any later write that waits for its fsync, has returned: the log
+    /// is synced up to a point, so a power loss never takes this write
+    /// without taking every later one.
+    ///
+    /// For a caller that holds a lock of its own across the write and
+    /// would otherwise hold it across the fsync: it writes under the lock,
+    /// releases it, and calls [`Db::sync_wal`] before it acknowledges, an
+    /// fsync that the callers waiting behind it can share. In
+    /// [`Durability::Eventual`] this is [`Db::write`].
+    pub fn write_unsynced(&self, batch: WriteBatch) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        for cf in batch.column_families() {
+            cf.check()?;
+        }
+        self.inner().commit(batch, false, true)
     }
 
     /// Fsync the WAL now: everything acknowledged so far becomes durable.
@@ -1838,16 +1863,21 @@ impl Inner {
 
     // ------------------------------------------------------------ commit
 
-    fn commit(&self, batch: WriteBatch, sync: bool) -> Result<()> {
+    fn commit(&self, batch: WriteBatch, sync: bool, unsynced: bool) -> Result<()> {
         // Only reached by unwinding out of the WAL write: the members learn
         // the database is poisoned.
         let abandoned = || {
             self.poison();
             Slot::Failed(self.poisoned_error())
         };
-        let gather = self.durability == Durability::Full || sync;
+        let sync = sync || (self.durability == Durability::Full && !unsynced);
+        let gather = sync;
         let turn = self.queue.enter(
-            Pending { batch, sync },
+            Pending {
+                batch,
+                sync,
+                unsynced,
+            },
             gather,
             MAX_GROUP_BYTES,
             |p| p.batch.size_in_bytes(),
@@ -1955,7 +1985,13 @@ impl Inner {
             return Err(Error::InvalidArgument("sequence numbers exhausted".into()));
         }
 
-        let sync = self.durability == Durability::Full || group.iter().any(|m| m.item.sync);
+        // A member written unsynced asks for no fsync, and gets the one a
+        // member of its group asked for.
+        let sync = group.iter().any(|m| m.item.sync);
+        debug_assert!(
+            sync || self.durability != Durability::Full || group.iter().all(|m| m.item.unsynced),
+            "full durability: only a group written unsynced goes without an fsync"
+        );
         self.io(|| Ok(wal.file.append(buf)?))?;
         // Release: whoever reads this count reads it after the bytes were
         // appended, and may fsync them as counted (see `sync_wal_file`).
