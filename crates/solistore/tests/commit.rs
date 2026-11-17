@@ -1219,3 +1219,175 @@ fn a_durable_writer_reads_its_write_whoever_inserted_it() {
         .count() as u64;
     assert_eq!(count, 2 * threads * per_thread);
 }
+
+/// Full durability, where every write fsyncs: one written with
+/// `write_unsynced` does not, and is durable once `sync_wal` has returned.
+#[test]
+fn an_unsynced_write_waits_for_no_fsync_and_a_wal_sync_covers_it() {
+    let fs = FaultFs::new();
+    let db = open(&fs);
+    let cf = db.default_cf();
+    db.put(&cf, b"synced", b"v").unwrap();
+
+    let before = fs.sync_count();
+    for i in 0..50u32 {
+        let mut batch = WriteBatch::new();
+        batch.put(&cf, i.to_be_bytes(), b"v");
+        db.write_unsynced(batch).unwrap();
+        // Visible at once, as any write.
+        assert!(db.get(&cf, i.to_be_bytes()).unwrap().is_some());
+    }
+    assert_eq!(fs.sync_count(), before, "an unsynced write fsynced");
+    db.sync_wal().unwrap();
+    assert!(fs.sync_count() > before);
+
+    // Written after the sync and never covered: may go, alone.
+    let mut batch = WriteBatch::new();
+    batch.put(&cf, 50u32.to_be_bytes(), b"v");
+    db.write_unsynced(batch).unwrap();
+
+    fs.crash(Torn::None);
+    drop(db);
+    let db = open(&fs);
+    let cf = db.default_cf();
+    assert!(db.get(&cf, b"synced").unwrap().is_some());
+    for i in 0..50u32 {
+        assert!(
+            db.get(&cf, i.to_be_bytes()).unwrap().is_some(),
+            "write {i} was covered by the sync and is gone"
+        );
+    }
+}
+
+/// Full durability: an ordinary write that follows unsynced ones fsyncs
+/// them with itself.
+#[test]
+fn a_write_after_unsynced_ones_makes_them_durable() {
+    let fs = FaultFs::new();
+    let db = open(&fs);
+    let cf = db.default_cf();
+    for i in 0..20u32 {
+        let mut batch = WriteBatch::new();
+        batch.put(&cf, i.to_be_bytes(), b"v");
+        db.write_unsynced(batch).unwrap();
+    }
+    db.put(&cf, 20u32.to_be_bytes(), b"v").unwrap();
+    fs.crash(Torn::None);
+    drop(db);
+    let db = open(&fs);
+    let cf = db.default_cf();
+    for i in 0..=20u32 {
+        assert!(db.get(&cf, i.to_be_bytes()).unwrap().is_some(), "{i}");
+    }
+}
+
+/// Full durability with the memtable switching every few writes, all of
+/// them unsynced: a `sync_wal` makes every write before it durable,
+/// whatever WAL it landed in, and a crash keeps a prefix of the writes.
+#[test]
+fn a_wal_sync_carries_unsynced_writes_across_memtable_switches() {
+    for seed in 0..200u64 {
+        let fs = FaultFs::new();
+        fs.set_sync_delay(Duration::from_millis(5));
+        let opts = Options {
+            fs: Arc::new(fs.clone()),
+            max_immutable_memtables: 32,
+            durability: Durability::Full,
+            write_buffer_size: 4 << 10,
+            target_file_size: 16 << 10,
+            ..Options::default()
+        };
+        let db = Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+        let cf = db.default_cf();
+        let unsynced = |i: u32| {
+            let mut batch = WriteBatch::new();
+            batch.put(&cf, i.to_be_bytes(), [i as u8; 48]);
+            db.write_unsynced(batch).unwrap();
+        };
+        let before = 300 + (seed as u32 * 37) % 400;
+        for i in 0..before {
+            unsynced(i);
+        }
+        db.sync_wal().unwrap();
+        for i in before..before + 200 {
+            unsynced(i);
+        }
+
+        let torn = if seed % 2 == 0 {
+            Torn::None
+        } else {
+            Torn::Seeded(seed)
+        };
+        fs.crash(torn);
+        drop(db);
+        let db = Db::open(
+            "/db",
+            Options {
+                fs: Arc::new(fs.process()),
+                ..opts
+            },
+        )
+        .unwrap();
+        let cf = db.default_cf();
+        let keys: Vec<u32> = db
+            .iterator(&cf, IteratorMode::Start)
+            .unwrap()
+            .map(|r| u32::from_be_bytes(r.unwrap().0[..].try_into().unwrap()))
+            .collect();
+        assert!(
+            keys.len() as u32 >= before,
+            "seed {seed}: lost a write the sync covered ({} kept of {before})",
+            keys.len()
+        );
+        assert_eq!(
+            keys,
+            (0..keys.len() as u32).collect::<Vec<_>>(),
+            "seed {seed}: not a prefix"
+        );
+    }
+}
+
+/// Writers that write unsynced under a lock of their own, then sync
+/// outside it before they acknowledge: nothing acknowledged is lost.
+#[test]
+fn writers_that_write_under_a_lock_and_sync_outside_it_lose_nothing() {
+    let fs = FaultFs::new();
+    fs.set_sync_delay(Duration::from_micros(500));
+    let db = open(&fs);
+    let cf = db.default_cf();
+    let lock = std::sync::Mutex::new(0u64);
+    let (threads, per_thread) = (8u64, 50u64);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let (db, cf, lock) = (&db, &cf, &lock);
+            scope.spawn(move || {
+                for _ in 0..per_thread {
+                    {
+                        let mut next = lock.lock().unwrap();
+                        let mut batch = WriteBatch::new();
+                        batch.put(cf, next.to_be_bytes(), b"v");
+                        db.write_unsynced(batch).unwrap();
+                        *next += 1;
+                    }
+                    db.sync_wal().unwrap();
+                }
+            });
+        }
+    });
+    let commits = threads * per_thread;
+    fs.crash(Torn::None);
+    drop(db);
+    let db = open(&fs);
+    let count = db
+        .iterator(&db.default_cf(), IteratorMode::Start)
+        .unwrap()
+        .count() as u64;
+    assert_eq!(count, commits, "every write was followed by a sync");
+}
